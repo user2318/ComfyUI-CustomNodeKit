@@ -1118,8 +1118,7 @@ class SDPoseDrawKeypointsV2:
                 "max_frames": ("INT", {"default": 2500, "min": 1, "max": 5000, "step": 1}),
                 "mouth_mode": (["draw_all", "no_draw", "inner_lip_only"], {"default": "draw_all"}),
                 "enable_yaw_thickness": ("BOOLEAN", {"default": False, "tooltip": "开启后根据偏航角动态调整骨骼粗细：正面(0°/±180°)最粗，侧面(±90°)最细"}),
-                "yaw_thickness_min": ("INT", {"default": 1, "min": 1, "max": 20, "step": 1, "tooltip": "侧面(±90°)时的最细粗细"}),
-                "yaw_thickness_max": ("INT", {"default": 8, "min": 1, "max": 20, "step": 1, "tooltip": "正面(0°/±180°)时的最粗粗细"}),
+                "yaw_thickness_min": ("INT", {"default": 1, "min": 1, "max": 20, "step": 1, "tooltip": "侧面(±90°)时的最细粗细，自动受 stick_width 约束（不会高于 stick_width）"}),
             },
             "optional": {
                 "yaw_angles": ("FLOAT", { "tooltip": "来自 SDPoseEstimateYawSimple/Advanced 的 yaw_array，用于动态调整骨骼粗细和遮挡顺序" }),
@@ -1135,7 +1134,6 @@ class SDPoseDrawKeypointsV2:
              mouth_mode="draw_all",
              enable_yaw_thickness=False,
              yaw_thickness_min=1,
-             yaw_thickness_max=8,
              yaw_angles=None):
         if not keypoints:
             return (torch.zeros((1, 64, 64, 3), dtype=torch.float32),)
@@ -1164,12 +1162,15 @@ class SDPoseDrawKeypointsV2:
                     cur_yaw = float(yaw_angles)
 
             # 根据偏航角动态调整骨骼粗细
+            # stick_width 作为偏航角调整的上限，yaw_thickness_min 作为下限
+            # 约束: 下限不能高于上限，若高于则同步为上限
             cur_stick_width = stick_width
             if enable_yaw_thickness and isinstance(cur_yaw, (int, float)):
                 yaw_val = float(cur_yaw)
+                effective_min = min(yaw_thickness_min, stick_width)
                 ratio = abs(math.cos(math.radians(yaw_val)))
-                cur_stick_width = int(yaw_thickness_min + (yaw_thickness_max - yaw_thickness_min) * ratio)
-                cur_stick_width = max(yaw_thickness_min, min(yaw_thickness_max, cur_stick_width))
+                cur_stick_width = int(effective_min + (stick_width - effective_min) * ratio)
+                cur_stick_width = max(effective_min, min(stick_width, cur_stick_width))
             
             for person_idx in range(len(frame.get("people", []))):
                 kp, sc = get_keypoint_arrays(frame, person_idx)
