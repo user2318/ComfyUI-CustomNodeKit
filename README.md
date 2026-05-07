@@ -100,7 +100,6 @@ pip install -r requirements.txt
 - `numpy` — 数值计算
 - `colorsys` — 颜色空间转换（Python 标准库）
 - `tqdm` — 进度条显示
-- `opencv-python` (可选) — 用于面部连线绘制（无 OpenCV 时自动回退到内置绘制器）
 - `ffmpeg` — 视频合成（需要系统安装 ffmpeg 命令行工具）
 
 ---
