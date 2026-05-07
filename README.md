@@ -57,7 +57,6 @@ pip install -r requirements.txt
 | **Load SDPose JSON** | `SDPose` | 加载 JSON 姿态文件，支持按目标帧率自动抽帧/补帧（线性插值或复制） |
 | **Slice SDPose Keypoints** | `SDPose` | 对姿态序列进行时间切片（按起始帧与帧数截取） |
 | **Concat SDPose Keypoints** | `SDPose` | 将两段姿态序列前后拼接 |
-| **Align Face Scale (SDPose)** | `SDPose` | 将目标人物的面部五官比例对齐到参考人物，支持全局缩放 + 独立调整眼/鼻/嘴/轮廓，带平滑边界权重 |
 | **Estimate Yaw (Simple)** | `SDPose` | 简化版偏航角估计，从姿态关键点推算人物朝向角度（核心参数：置信度阈值、是否解缠、肩部权重） |
 | **Estimate Yaw (Advanced)** | `SDPose` | 完整版偏航角估计，可调节所有底层参数（平滑窗口、EMA alpha、角度限制、侧向校准等），并输出详细调试表格 |
 | **Resize SDPose Keypoints** | `SDPose` | 缩放姿态关键点坐标并更新画布尺寸，支持保持宽高比、智能裁剪（基于关键点包围盒） |
@@ -89,7 +88,7 @@ pip install -r requirements.txt
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
-| **Custom Context** | `Context` | 自定义上下文节点，用于传递和组合工作流上下文信息 |
+| **WAN Context Windows (Manual)** | `context` | 针对 WAN-Animate 视频模型特化的上下文窗口节点。将长视频拆分为滑动窗口逐段采样，支持参考帧前缀（prefix_frames）、FreeNoise 噪声混洗、多种调度策略（均匀/静态/循环/批处理）与融合模式（金字塔/线性重叠/相对加权），解决显存限制下的长视频生成问题 |
 
 ---
 
@@ -128,14 +127,6 @@ pip install -r requirements.txt
               [Resize Keypoints] → 统一尺寸
                       ↓
               [Draw Keypoints V2] → 可视化图像
-```
-
-### 3. 面部五官比例对齐
-
-```
-[源姿态序列] → Align Face Scale
-[参考姿态]   →    ↓
-              [对齐后的姿态序列] → Draw Keypoints
 ```
 
 ---
