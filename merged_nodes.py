@@ -35,7 +35,7 @@ class IndexSelectorNode:
                     "default": "",
                     "hidden": True          # 隐藏输入控件，仅显示连接点
                 }),
-                "index": ("INT", {"default": 0, "min": 0, "max": 10, "step": 1}),
+                "index": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
             },
         }
 
