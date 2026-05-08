@@ -139,6 +139,38 @@ app.registerExtension({
                 .pc-btn.danger:hover {
                     background: #b04a4a;
                 }
+                .pc-stats-bar {
+                    display: flex;
+                    gap: 14px;
+                    font-size: 12px;
+                    color: #aaa;
+                    padding: 4px 14px;
+                    flex-shrink: 0;
+                }
+                .pc-stats-bar span {
+                    white-space: nowrap;
+                }
+                .pc-stats-bar .pc-stat-label {
+                    color: #888;
+                }
+                .pc-path-row .pc-index {
+                    color: #666;
+                    font-size: 11px;
+                    min-width: 26px;
+                    text-align: right;
+                    flex-shrink: 0;
+                    user-select: none;
+                }
+                .pc-path-row.file-path .pc-path-text {
+                    color: #6ecf8a;
+                }
+                .pc-path-row.folder-path .pc-path-text {
+                    color: #cfb96e;
+                }
+                .pc-path-row.file-path.selected .pc-path-text,
+                .pc-path-row.folder-path.selected .pc-path-text {
+                    color: #ddd;
+                }
             `;
             document.head.appendChild(style);
         }
@@ -153,6 +185,17 @@ app.registerExtension({
                 this._create();
             }
 
+            // 判断路径是否为文件（含扩展名）或文件夹
+            _getPathType(text) {
+                if (!text || text.trim() === '') return 'empty';
+                // 取路径最后一段
+                const lastPart = text.replace(/[\\/]$/, '').split(/[\\/]/).pop();
+                // 如果含有 . 且不是以 . 开头（排除 .git 这类），认为是文件
+                const dotIndex = lastPart.lastIndexOf('.');
+                if (dotIndex > 0 && dotIndex < lastPart.length - 1) return 'file';
+                return 'folder';
+            }
+
             _create() {
                 this.overlay = document.createElement('div');
                 this.overlay.className = 'pc-modal-overlay';
@@ -165,6 +208,11 @@ app.registerExtension({
                 header.className = 'pc-modal-header';
                 header.innerHTML = '<span>路径管理</span><span title="关闭" id="pc-close-btn">✕</span>';
                 this.modal.appendChild(header);
+
+                // ---- stats bar ----
+                this.statsBar = document.createElement('div');
+                this.statsBar.className = 'pc-stats-bar';
+                this.modal.appendChild(this.statsBar);
 
                 // ---- body (path list) ----
                 this.body = document.createElement('div');
@@ -218,11 +266,36 @@ app.registerExtension({
             // ---------- 渲染路径列表 ----------
             _render() {
                 this.body.innerHTML = '';
+
+                // 计算统计
+                let fileCount = 0, folderCount = 0;
+                this.paths.forEach(item => {
+                    const type = this._getPathType(item.text);
+                    if (type === 'file') fileCount++;
+                    else if (type === 'folder') folderCount++;
+                });
+                // 更新统计栏
+                this.statsBar.innerHTML = `
+                    <span><span class="pc-stat-label">总计:</span> ${this.paths.length}</span>
+                    <span style="color:#6ecf8a"><span class="pc-stat-label">文件:</span> ${fileCount}</span>
+                    <span style="color:#cfb96e"><span class="pc-stat-label">文件夹:</span> ${folderCount}</span>
+                `;
+
                 this.paths.forEach((item, idx) => {
+                    const pathType = this._getPathType(item.text);
+
                     const row = document.createElement('div');
                     row.className = 'pc-path-row';
+                    if (pathType === 'file') row.classList.add('file-path');
+                    else if (pathType === 'folder') row.classList.add('folder-path');
                     if (idx === this.selectedIndex) row.classList.add('selected');
                     row.dataset.index = idx;
+
+                    // 索引号（仅显示）
+                    const indexSpan = document.createElement('span');
+                    indexSpan.className = 'pc-index';
+                    indexSpan.textContent = String(idx + 1);
+                    row.appendChild(indexSpan);
 
                     // 拖动手柄
                     const handle = document.createElement('span');
@@ -233,7 +306,7 @@ app.registerExtension({
                     // 路径文本
                     const textSpan = document.createElement('span');
                     textSpan.className = 'pc-path-text';
-                    if (item.text === '') {
+                    if (pathType === 'empty') {
                         textSpan.classList.add('empty');
                         textSpan.textContent = '(空行)';
                     } else {
@@ -298,6 +371,18 @@ app.registerExtension({
 
                     this.body.appendChild(row);
                 });
+
+                // 动态高度控制
+                const rowCount = this.paths.length;
+                if (rowCount === 0) {
+                    this.body.style.maxHeight = 'none';
+                } else if (rowCount <= 15) {
+                    // 少于等于15条：自适应高度，不设 maxHeight
+                    this.body.style.maxHeight = 'none';
+                } else {
+                    // 超过15条：固定高度，出现滚动条
+                    this.body.style.maxHeight = `${15 * 34 + 16}px`;
+                }
 
                 // 如果没有行，显示提示
                 if (this.paths.length === 0) {

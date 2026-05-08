@@ -39,8 +39,8 @@ class IndexSelectorNode:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("selected_path", "file_name")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("selected_path", "file_name", "last_folder")
     FUNCTION = "select_by_index"
     CATEGORY = "Custom Nodes"
     OUTPUT_NODE = False
@@ -50,11 +50,25 @@ class IndexSelectorNode:
         if index < 0 or index >= len(parts):
             selected = ""
             file_name = ""
+            last_folder = ""
         else:
             selected = parts[index]
             basename = os.path.basename(selected)
             file_name = os.path.splitext(basename)[0] if selected else ""
-        return (selected, file_name)
+
+            # 计算最后一级文件夹名
+            last_folder = ""
+            if selected:
+                # 判断是文件还是文件夹：末段含扩展名则为文件
+                dot_index = basename.rfind('.')
+                if dot_index > 0 and dot_index < len(basename) - 1:
+                    # 文件：取其父目录的 basename
+                    parent_dir = os.path.dirname(selected)
+                    last_folder = os.path.basename(parent_dir)
+                else:
+                    # 文件夹或无扩展名：取自身 basename
+                    last_folder = basename
+        return (selected, file_name, last_folder)
 
 
 # 后端路由：文件/文件夹选择接口（支持多选）
