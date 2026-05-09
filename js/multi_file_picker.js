@@ -171,6 +171,30 @@ app.registerExtension({
                 .pc-path-row.folder-path.selected .pc-path-text {
                     color: #ddd;
                 }
+
+                /* ---- 自定义 tooltip ---- */
+                .pc-custom-tooltip {
+                    position: fixed;
+                    z-index: 10001;
+                    background: #1a1a1a;
+                    border: 1px solid #555;
+                    border-radius: 6px;
+                    padding: 8px 12px;
+                    max-width: 500px;
+                    max-height: 200px;
+                    overflow-y: auto;
+                    word-break: break-all;
+                    white-space: pre-wrap;
+                    font-size: 12px;
+                    line-height: 1.5;
+                    color: #e0e0e0;
+                    box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+                    pointer-events: none;
+                    display: none;
+                }
+                .pc-custom-tooltip.visible {
+                    display: block;
+                }
             `;
             document.head.appendChild(style);
         }
@@ -245,12 +269,14 @@ app.registerExtension({
 
                 // ---- events ----
                 header.querySelector('#pc-close-btn').addEventListener('click', () => this._close());
-                this.overlay.addEventListener('click', (e) => {
-                    if (e.target === this.overlay) this._close();
-                });
                 document.addEventListener('keydown', this._keyHandler = (e) => {
                     if (e.key === 'Escape') this._close();
                 });
+
+                // ---- 创建自定义 tooltip 元素 ----
+                this.tooltipEl = document.createElement('div');
+                this.tooltipEl.className = 'pc-custom-tooltip';
+                this.overlay.appendChild(this.tooltipEl);
 
                 this._render();
             }
@@ -334,6 +360,27 @@ app.registerExtension({
                         this._render();
                     });
 
+                    // ---------- 自定义 tooltip 悬浮显示 ----------
+                    // 只在路径内容不为空且文本被截断时显示自定义 tooltip
+                    row.addEventListener('mouseenter', (e) => {
+                        if (pathType === 'empty') return;
+                        // 判断文本是否被截断：scrollWidth > clientWidth
+                        if (textSpan.scrollWidth > textSpan.clientWidth) {
+                            this.tooltipEl.textContent = item.text;
+                            this.tooltipEl.classList.add('visible');
+                            this._positionTooltip(e);
+                        }
+                    });
+                    row.addEventListener('mousemove', (e) => {
+                        if (this.tooltipEl.classList.contains('visible')) {
+                            this._positionTooltip(e);
+                        }
+                    });
+                    row.addEventListener('mouseleave', () => {
+                        this.tooltipEl.classList.remove('visible');
+                        this.tooltipEl.textContent = '';
+                    });
+
                     // ---------- 拖拽排序（原生 Drag & Drop） ----------
                     row.draggable = true;
                     row.addEventListener('dragstart', (e) => {
@@ -391,6 +438,38 @@ app.registerExtension({
                     emptyMsg.textContent = '暂无路径，请点击下方按钮添加';
                     this.body.appendChild(emptyMsg);
                 }
+            }
+
+            // ---------- 定位 tooltip ----------
+            _positionTooltip(e) {
+                const tooltip = this.tooltipEl;
+                if (!tooltip) return;
+
+                const padding = 12; // 鼠标与 tooltip 的间距
+                let left = e.clientX + padding;
+                let top = e.clientY + padding;
+
+                // 获取 tooltip 尺寸（每次需要重新获取，因为内容可能变化）
+                const rect = tooltip.getBoundingClientRect();
+                const tooltipW = rect.width;
+                const tooltipH = rect.height;
+                const viewW = window.innerWidth;
+                const viewH = window.innerHeight;
+
+                // 水平溢出处理：如果右边超出视口，则显示在鼠标左侧
+                if (left + tooltipW > viewW - 10) {
+                    left = e.clientX - tooltipW - padding;
+                }
+                // 垂直溢出处理：如果底部超出视口，则显示在鼠标上方
+                if (top + tooltipH > viewH - 10) {
+                    top = e.clientY - tooltipH - padding;
+                }
+                // 防止溢出到左侧或顶部（鼠标太靠边缘时）
+                if (left < 5) left = 5;
+                if (top < 5) top = 5;
+
+                tooltip.style.left = left + 'px';
+                tooltip.style.top = top + 'px';
             }
 
             _clearDragOver() {

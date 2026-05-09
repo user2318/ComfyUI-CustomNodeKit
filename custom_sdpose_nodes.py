@@ -650,9 +650,9 @@ class SDPoseSaveJson:
             },
             "optional": {
                 "fps": ("FLOAT", {"default": 0, "min": 0, "max": 120, "step": 1,
-                                  "tooltip": "若 >0，将 fps 写入 JSON 头部；=0 则存为裸数组（兼容旧版）"}),
+                                  "tooltip": "若 >0，将 fps 写入 JSON 头部；=0 则存为裸数组（兼容旧版）" }),
                 "overwrite": ("BOOLEAN", {"default": True,
-                                          "tooltip": "True=覆盖上次文件（向后兼容）；False=自动递增编号不覆盖"}),
+                                          "tooltip": "True=覆盖上次文件（向后兼容）；False=自动递增编号不覆盖" }),
             }
         }
     RETURN_TYPES = ()
@@ -700,6 +700,10 @@ class SDPoseLoadJson:
                     "default": "interpolate",
                     "tooltip": "仅升帧（补帧）时有效：interpolate=线性插值，duplicate=复制最近帧"
                 }),
+                "fix_empty_frames": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "启用后，自动检测并修复 people 为空的帧，用前后有效帧插值填充，消除黑帧"
+                }),
             }
         }
 
@@ -708,7 +712,7 @@ class SDPoseLoadJson:
     FUNCTION = "load"
     CATEGORY = "SDPose"
 
-    def load(self, json_path, target_fps=0, interp_method="interpolate"):
+    def load(self, json_path, target_fps=0, interp_method="interpolate", fix_empty_frames=False):
         if not os.path.exists(json_path):
             raise FileNotFoundError(f"JSON file not found: {json_path}")
         with open(json_path, 'r', encoding='utf-8') as f:
@@ -749,6 +753,10 @@ class SDPoseLoadJson:
                     result = self._upsample_duplicate(frames, ratio, json_fps)
         else:
             result = frames
+
+        # 自动修复空帧
+        if fix_empty_frames:
+            result = self._fix_empty_frames(result)
 
         frame_count = len(result)
         # 计算 effective_fps
@@ -874,6 +882,102 @@ class SDPoseLoadJson:
             out.append(interp_frame)
         return out
 
+    @staticmethod
+    def _fix_empty_frames(frames):
+        """
+        扫描帧列表中 people 为空的帧，用前后有效帧的插值数据填充。
+        返回修复后的新列表（不影响原列表）。
+        """
+        n = len(frames)
+        if n == 0:
+            return frames
+
+        # 判断帧是否有效：people 非空，且其中至少有一个关键点坐标非零
+        def _is_valid(frame):
+            people = frame.get("people", [])
+            if not people:
+                return False
+            for person in people:
+                for key, val in person.items():
+                    if key.endswith("_keypoints_2d") and isinstance(val, list) and len(val) > 0:
+                        for i in range(0, len(val), 3):
+                            x = val[i]
+                            y = val[i+1] if i+1 < len(val) else 0.0
+                            if x > 0 or y > 0:
+                                return True
+            return False
+
+        valid_flags = [_is_valid(f) for f in frames]
+
+        # 全部有效或全部无效 → 无需修复
+        if all(valid_flags) or not any(valid_flags):
+            return frames[:]
+
+        result = []
+        for i in range(n):
+            if valid_flags[i]:
+                result.append(frames[i])
+                continue
+
+            # 向前找最近有效帧
+            left_idx = i - 1
+            while left_idx >= 0 and not valid_flags[left_idx]:
+                left_idx -= 1
+
+            # 向后找最近有效帧
+            right_idx = i + 1
+            while right_idx < n and not valid_flags[right_idx]:
+                right_idx += 1
+
+            if left_idx >= 0 and right_idx < n:
+                # 双侧都有有效帧 → 线性插值
+                total_gap = right_idx - left_idx
+                alpha = (i - left_idx) / total_gap
+                left_frame = frames[left_idx]
+                right_frame = frames[right_idx]
+
+                if SDPoseLoadJson._is_abrupt_jump(left_frame, right_frame):
+                    fixed = right_frame if alpha > 0.5 else left_frame
+                else:
+                    fixed = {
+                        "canvas_width": left_frame["canvas_width"],
+                        "canvas_height": left_frame["canvas_height"],
+                        "people": []
+                    }
+                    max_people = max(
+                        len(left_frame.get("people", [])),
+                        len(right_frame.get("people", []))
+                    )
+                    for p_idx in range(max_people):
+                        left_person = left_frame["people"][p_idx] if p_idx < len(left_frame["people"]) else {}
+                        right_person = right_frame["people"][p_idx] if p_idx < len(right_frame["people"]) else {}
+                        new_person = {}
+                        all_keys = set(list(left_person.keys()) + list(right_person.keys()))
+                        for key in all_keys:
+                            left_val = left_person.get(key, [])
+                            right_val = right_person.get(key, [])
+                            if key.endswith("_keypoints_2d") and isinstance(left_val, list) and isinstance(right_val, list):
+                                max_len = max(len(left_val), len(right_val))
+                                l_arr = np.array(left_val + [0.0] * (max_len - len(left_val)), dtype=np.float32)
+                                r_arr = np.array(right_val + [0.0] * (max_len - len(right_val)), dtype=np.float32)
+                                interpolated = l_arr * (1.0 - alpha) + r_arr * alpha
+                                new_person[key] = interpolated.tolist()
+                            else:
+                                new_person[key] = left_val if left_val else right_val
+                        fixed["people"].append(new_person)
+                result.append(fixed)
+            elif left_idx >= 0:
+                # 仅左侧有效 → 复制
+                result.append(frames[left_idx])
+            elif right_idx < n:
+                # 仅右侧有效 → 复制
+                result.append(frames[right_idx])
+            else:
+                # 不会发生，但保留原帧
+                result.append(frames[i])
+
+        return result
+
 # ==================== 重采样（抽帧/补帧） ====================
 class SDPoseResampleKeypoints:
     """
@@ -901,6 +1005,12 @@ class SDPoseResampleKeypoints:
                     "default": "interpolate",
                     "tooltip": "仅升帧（补帧）时有效：interpolate=线性插值，duplicate=复制最近帧"
                 }),
+            },
+            "optional": {
+                "fix_empty_frames": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "启用后，自动检测并修复 people 为空的帧，用前后有效帧插值填充，消除黑帧"
+                }),
             }
         }
 
@@ -909,25 +1019,31 @@ class SDPoseResampleKeypoints:
     FUNCTION = "resample"
     CATEGORY = "SDPose"
 
-    def resample(self, pose_keypoints, input_fps=0, output_fps=0, interp_method="interpolate"):
+    def resample(self, pose_keypoints, input_fps=0, output_fps=0, interp_method="interpolate", fix_empty_frames=False):
         if not isinstance(pose_keypoints, list) or len(pose_keypoints) == 0:
             return (pose_keypoints, 0.0)
 
         if input_fps <= 0 or output_fps <= 0 or len(pose_keypoints) <= 1:
-            return (pose_keypoints, 0.0)
-
-        ratio = input_fps / output_fps
-        if abs(ratio - 1.0) < 1e-6:
-            result = pose_keypoints[:]
-        elif ratio > 1.0:
-            result = self._downsample(pose_keypoints, ratio, input_fps)
+            result = pose_keypoints
         else:
-            if interp_method == "interpolate":
-                result = self._upsample_interpolate(pose_keypoints, ratio, input_fps)
+            ratio = input_fps / output_fps
+            if abs(ratio - 1.0) < 1e-6:
+                result = pose_keypoints[:]
+            elif ratio > 1.0:
+                result = self._downsample(pose_keypoints, ratio, input_fps)
             else:
-                result = self._upsample_duplicate(pose_keypoints, ratio, input_fps)
+                if interp_method == "interpolate":
+                    result = self._upsample_interpolate(pose_keypoints, ratio, input_fps)
+                else:
+                    result = self._upsample_duplicate(pose_keypoints, ratio, input_fps)
 
-        return (result, float(output_fps))
+        # 自动修复空帧
+        if fix_empty_frames:
+            result = SDPoseLoadJson._fix_empty_frames(result)
+
+        if output_fps > 0 and input_fps > 0 and len(pose_keypoints) > 1:
+            return (result, float(output_fps))
+        return (result, 0.0)
 
     @staticmethod
     def _downsample(frames, ratio, json_fps):
@@ -1305,10 +1421,10 @@ def _compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
             side_candidates.append((shldr_raw, hip_raw, cur_dist, nose_neck_x))
 
             if nose_neck_x is not None and abs(nose_neck_x) < 3.0 and cur_dist > 1e-6:
-                if shoulder_valid and shldr_raw < 0:
+                if shoulder_valid and shldr_raw is not None and shldr_raw < 0:
                     front_shoulder_ratios.append(abs(shldr_raw) / cur_dist)
-                if hip_valid:
-                    hip_raw_abs = abs(hip_raw) if hip_raw is not None else 0.0
+                if hip_valid and hip_raw is not None:
+                    hip_raw_abs = abs(hip_raw)
                     if hip_raw_abs > 0:
                         front_hip_ratios.append(hip_raw_abs / cur_dist)
 
@@ -1807,9 +1923,11 @@ class SDPoseResizeKeypoints:
                         if key.endswith("_keypoints_2d") and isinstance(value, list):
                             for i in range(0, len(value), 3):
                                 c = value[i+2] if i+2 < len(value) else 0.0
-                                if c > 0.0:
-                                    all_x.append(value[i])
-                                    all_y.append(value[i+1])
+                                x = value[i]
+                                y = value[i+1]
+                                if c > 0.0 and x > 0 and y > 0:
+                                    all_x.append(x)
+                                    all_y.append(y)
             if not all_x:
                 pass
             else:
@@ -1910,7 +2028,6 @@ class SDPoseResizeKeypoints:
 
         return (result_frames,)
     
-
 
 # ==================== 更新节点映射 ====================
 NODE_CLASS_MAPPINGS = {
