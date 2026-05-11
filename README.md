@@ -11,12 +11,16 @@
   - [视频工具](#视频工具)
   - [交互式工具](#交互式工具)
   - [通用工具](#通用工具)
+  - [图像批次工具](#图像批次工具)
   - [上下文工具](#上下文工具)
 - [复杂节点详解](#复杂节点详解)
   - [WanAnimateToVideoCustom](#wananimatetovideocustom)
   - [Custom Context Windows (Manual)](#custom-context-windows-manual)
   - [Reference Image Selector](#reference-image-selector)
   - [SDPose 空帧修复](#sdpose-空帧修复)
+  - [Folder Image Loader](#folder-image-loader)
+  - [Image Batch Concat](#image-batch-concat)
+  - [Image Batch Resize](#image-batch-resize)
 - [依赖](#依赖)
 - [使用示例](#使用示例)
 - [许可证](#许可证)
@@ -89,6 +93,14 @@ pip install -r requirements.txt
 | **Index Selector** | `Utility` | 根据索引从列表中选取元素，支持 `last_folder` 输出 |
 | **Path Validator** | `Utility` | 验证文件路径是否存在 |
 | **Integer Aligner** | `Utility` | 将整数对齐到目标步长的倍数 |
+
+### 图像批次工具
+
+| 节点名 | 类别 | 说明 |
+|--------|------|------|
+| **Folder Image Loader** | `image` | 从文件夹按文件名升序载入图片批次，支持跳过、数量限制与尺寸同步 |
+| **Image Batch Concat** | `image` | 将两个图像批次拼接，任意一路无输入时透传另一路 |
+| **Image Batch Resize** | `image` | 缩放图像批次到指定宽高，可选按方向裁剪保持宽高比 |
 
 ### 上下文工具
 
@@ -308,6 +320,105 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 
 - 在姿态数据来源不够稳定的情况下建议开启
 - 配合 `Estimate Yaw` 节点使用时可有效避免因空帧导致的角度跳变
+
+---
+
+### Folder Image Loader
+
+从指定文件夹按文件名升序读取图片批次。遇到路径错误、文件夹为空等情况不会抛出异常，仅输出空结果并在控制台打印警告。
+
+#### 参数说明
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `folder_path` | STRING | ✅ | 图片文件夹路径，支持绝对路径或相对于 ComfyUI 根目录的相对路径 |
+| `size_mode` | 枚举 | ✅ | `resize_to_first`：所有图片缩放至第一张的尺寸；`filter_same_size`：仅加载与第一张尺寸相同的图片 |
+| `skip_first_n` | INT | ✅ | 跳过前 N 张图片（默认 0） |
+| `load_count` | INT | ✅ | 最多加载 N 张图片（0=不限制，加载全部） |
+
+#### 输出
+
+| 输出 | 类型 | 说明 |
+|------|------|------|
+| `images` | IMAGE | 载入的图片批次。路径无效或无图片时输出 None |
+| `count` | INT | 实际载入的图片数量。异常情况输出 0 |
+
+#### 容错行为
+
+- 文件夹路径为空 → 输出 `(None, 0)`，控制台打印警告
+- 文件夹不存在 → 输出 `(None, 0)`，控制台打印警告
+- 文件夹内无图片 → 输出 `(None, 0)`，控制台打印警告
+- 跳过数超过图片总数 → 输出 `(None, 0)`，控制台打印警告
+- 单张图片读取失败 → 跳过该图，继续加载其余图片
+
+---
+
+### Image Batch Concat
+
+将两个图像批次沿 batch 维度拼接（images_b 追加到 images_a 后方）。一路或两路无输入时，透传有输入的那一路；两路都无输入时输出 None。
+
+#### 参数说明
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `images_a` | IMAGE | ❌ | 第一个图像批次 |
+| `images_b` | IMAGE | ❌ | 第二个图像批次，拼接到 images_a 后方 |
+
+#### 输出
+
+| 输出 | 类型 | 说明 |
+|------|------|------|
+| `images` | IMAGE | 拼接后的图像批次。仅一路有输入时透传该路；两路均无输入时输出 None |
+
+#### 典型工作流
+
+```
+[FolderImageLoader A] → images_a ─┐
+[FolderImageLoader B] → images_b ─┤
+                                   ↓
+                          Image Batch Concat
+                                   ↓
+                              images (合并批次)
+```
+
+---
+
+### Image Batch Resize
+
+将图像批次缩放到指定宽高。可选择按方向裁剪以保持宽高比。输入无效时输出 None。
+
+#### 参数说明
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `width` | INT | ✅ | 目标宽度（默认 512） |
+| `height` | INT | ✅ | 目标高度（默认 512） |
+| `crop_mode` | 枚举 | ✅ | 裁剪模式。`disabled`=直接拉伸；`center`/`top`/`bottom`/`left`/`right`=先等比缩放至覆盖目标再按方向裁剪 |
+| `images` | IMAGE | ❌ | 输入图像批次。无输入时输出 None |
+
+#### 输出
+
+| 输出 | 类型 | 说明 |
+|------|------|------|
+| `images` | IMAGE | 缩放后的图像批次。输入无效时输出 None |
+
+#### 缩放算法
+
+统一使用 Pillow 的 LANCZOS 算法，兼顾缩小和放大的高质量效果。
+
+#### 裁剪模式图解
+
+```
+原图 1920×1080 → 目标 512×512
+disabled：直接拉伸，画面变形
+center：  等比缩放到 911×512，左右各裁 199px
+top：     等比缩放到 911×512，裁底部 399px
+bottom：  等比缩放到 911×512，裁顶部 399px
+left：    等比缩放到 512×288，裁右侧 176px（需再放大到 512×512）
+right：   等比缩放到 512×288，裁左侧 176px（需再放大到 512×512）
+```
+
+> 裁剪模式始终先缩放至覆盖目标尺寸（取 max 缩放比），再按方向裁剪多余内容，保证最终输出尺寸精确等于目标宽高。
 
 ---
 
