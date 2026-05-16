@@ -49,7 +49,8 @@ if (!window.__interactiveCropStyleInjected) {
         }
         .crop-thumbnails img.active { border-color: #4af; }
         .crop-path-btns {
-            display: flex; gap: 2px; margin-top: 2px;
+            display: flex; gap: 2px; margin-top: 0;
+            height: fit-content;
         }
         .crop-path-btns button {
             height: 24px; padding: 2px 8px; font-size: 12px;
@@ -84,20 +85,23 @@ app.registerExtension({
                 nodeIdWidget.value = Date.now().toString(36) + Math.random().toString(36).substr(2, 6);
             }
 
-            // 统一 path 控件
+            // 统一 path 控件 + 打开裁剪器按钮（放在同一个容器内，消除 widget 间间距）
             const pathWidget = this.widgets.find(w => w.name === "path");
             if (pathWidget) {
                 const btnContainer = document.createElement("div");
-                btnContainer.className = "crop-path-btns";
+                btnContainer.style.cssText = "display:flex;flex-direction:column;gap:2px;margin:0;padding:0;height:fit-content;";
+
+                // 第一行：三个路径按钮
+                const row1 = document.createElement("div");
+                row1.style.cssText = "display:flex;gap:2px;";
 
                 const dirBtn = document.createElement("button");
                 dirBtn.textContent = "选择目录";
                 dirBtn.onclick = async () => {
                     try {
-                        const resp = await fetch("/multi_file_picker/select", {
+                        const resp = await fetch("/interactive_crop/select_folder", {
                             method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ mode: "directory" })
+                            headers: { "Content-Type": "application/json" }
                         });
                         const data = await resp.json();
                         if (data.path) {
@@ -106,6 +110,7 @@ app.registerExtension({
                         }
                     } catch (e) { alert("失败: " + e); }
                 };
+                dirBtn.style.cssText = "flex:1;height:24px;padding:2px 8px;font-size:12px;background:var(--comfy-input-bg,#222);color:var(--input-text,white);border:1px solid var(--border-color,#444);border-radius:3px;cursor:pointer;";
 
                 const multiFileBtn = document.createElement("button");
                 multiFileBtn.textContent = "多选文件";
@@ -124,6 +129,7 @@ app.registerExtension({
                         }
                     } catch (e) { alert("选择失败: " + e); }
                 };
+                multiFileBtn.style.cssText = "flex:1;height:24px;padding:2px 8px;font-size:12px;background:var(--comfy-input-bg,#222);color:var(--input-text,white);border:1px solid var(--border-color,#444);border-radius:3px;cursor:pointer;";
 
                 const clearParamsBtn = document.createElement("button");
                 clearParamsBtn.textContent = "清空参数";
@@ -137,24 +143,43 @@ app.registerExtension({
                     if (targetSizeWidget) targetSizeWidget.value = "";
                     app.graph.setDirtyCanvas(true, true);
                 };
+                clearParamsBtn.style.cssText = "flex:1;height:24px;padding:2px 8px;font-size:12px;background:var(--comfy-input-bg,#222);color:var(--input-text,white);border:1px solid var(--border-color,#444);border-radius:3px;cursor:pointer;";
 
-                btnContainer.appendChild(dirBtn);
-                btnContainer.appendChild(multiFileBtn);
-                btnContainer.appendChild(clearParamsBtn);
+                row1.appendChild(dirBtn);
+                row1.appendChild(multiFileBtn);
+                row1.appendChild(clearParamsBtn);
+
+                // 第二行：打开裁剪器按钮
+                const cropBtn = document.createElement("button");
+                cropBtn.textContent = "✂ 打开裁剪器";
+                cropBtn.onclick = () => { this.openCropUI(); };
+                cropBtn.style.cssText = "height:24px;padding:2px 8px;font-size:12px;background:var(--comfy-input-bg,#222);color:var(--input-text,white);border:1px solid var(--border-color,#444);border-radius:3px;cursor:pointer;";
+
+                btnContainer.appendChild(row1);
+                btnContainer.appendChild(cropBtn);
 
                 const inputEl = pathWidget.inputEl || pathWidget.element?.querySelector("input");
                 if (inputEl) {
-                    inputEl.style.marginBottom = "2px";
-                    inputEl.parentNode.insertBefore(btnContainer, inputEl.nextSibling);
+                    inputEl.style.marginBottom = "0";
+                    // 将 input + 按钮包裹进同一个容器，使节点底部跟随按钮高度
+                    const wrapper = document.createElement("div");
+                    wrapper.style.cssText = "display:flex;flex-direction:column;gap:2px;height:fit-content;";
+                    const parent = inputEl.parentNode;
+                    parent.insertBefore(wrapper, inputEl);
+                    wrapper.appendChild(inputEl);
+                    wrapper.appendChild(btnContainer);
                 } else {
                     this.addDOMWidget("path_actions", "custom", btnContainer, { serialize: false });
                 }
-            }
 
-            // “打开裁剪器”按钮（显示文本为 ✂ 打开裁剪器）
-            this.addWidget("button", "open_crop_btn", "✂ 打开裁剪器", () => {
-                this.openCropUI();
-            }, { serialize: false });
+                // 修复外层 dom-widget size-full 包裹层的高度（避免撑出空隙）
+                setTimeout(() => {
+                    const outer = btnContainer.closest(".size-full");
+                    if (outer) {
+                        outer.style.cssText = (outer.style.cssText || "") + ";height:fit-content !important;";
+                    }
+                }, 0);
+            }
 
             this._cropParamsWidget = this.widgets.find(w => w.name === "crop_params");
             this._nodeIdWidget = nodeIdWidget;

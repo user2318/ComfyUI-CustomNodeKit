@@ -122,42 +122,6 @@ async def select_file(request):
         return web.json_response({"error": str(e)}, status=500)
 
 
-class IntegerSnapNode:
-    """整数对齐节点：将输入值修正到 start + k*step 的最接近值，等距时选离 start 更近的。"""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "start": ("INT", {"default": 0, "step": 1, "tooltip": "对齐基准值，对齐后的值将为 start + k*step"}),
-                "step": ("INT", {"default": 1, "min": 1, "step": 1, "tooltip": "对齐步长，必须大于等于1"}),
-                "value": ("INT", {"default": 0, "step": 1, "tooltip": "需要对齐的原始值，将被修正到最近的 start + k*step"}),
-            },
-        }
-
-    RETURN_TYPES = ("INT",)
-    RETURN_NAMES = ("snapped",)
-    FUNCTION = "snap"
-    CATEGORY = "utils"
-
-    def snap(self, start, step, value):
-        k = (value - start) // step
-        lower = start + k * step
-        upper = lower + step
-
-        dist_lower = abs(lower - value)
-        dist_upper = abs(upper - value)
-
-        if dist_lower < dist_upper:
-            snapped = lower
-        elif dist_upper < dist_lower:
-            snapped = upper
-        else:
-            # 等距，选绝对值较小的
-            snapped = lower if abs(lower) <= abs(upper) else upper
-        return (snapped,)
-
-
 class PathValidatorNode:
     """
     自动判断文件/文件夹的路径验证与操作节点
@@ -574,7 +538,6 @@ NODE_CLASS_MAPPINGS = {
     "PathCollectorNode": PathCollectorNode,
     "IndexSelectorNode": IndexSelectorNode,
     "PathValidatorNode": PathValidatorNode,
-    "IntegerSnapNode": IntegerSnapNode,
     "FolderImageLoaderNode": FolderImageLoaderNode,
     "ImageBatchConcatNode": ImageBatchConcatNode,
     "ImageBatchResizeNode": ImageBatchResizeNode,
@@ -584,7 +547,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PathCollectorNode": "路径收集器",
     "IndexSelectorNode": "索引选择器",
     "PathValidatorNode": "路径验证器",
-    "IntegerSnapNode": "Integer Snap",
     "FolderImageLoaderNode": "文件夹图像载入器",
     "ImageBatchConcatNode": "图像批次合并",
     "ImageBatchResizeNode": "图像批次缩放",

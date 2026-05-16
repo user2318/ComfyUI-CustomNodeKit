@@ -256,7 +256,7 @@ class InteractiveBatchCrop:
             return (result,)
 
 
-# ============= 路由（不变） =============
+# ============= 路由 =============
 @PromptServer.instance.routes.get("/interactive_crop/get_image_by_path")
 async def get_image_by_path(request):
     import base64
@@ -387,20 +387,28 @@ async def get_tensor_preview(request):
     b64 = base64.b64encode(buf.getvalue()).decode()
     return web.json_response({"image": f"data:image/png;base64,{b64}", "total": batch.shape[0]})
 
-# ==============================
-# 节点注册
-# ==============================
-NODE_CLASS_MAPPINGS = {
-    "InteractiveBatchCrop": InteractiveBatchCrop,
-}
+# ============= InteractiveBatchCrop 专属单选目录路由 =============
+@PromptServer.instance.routes.post("/interactive_crop/select_folder")
+async def select_folder(request):
+    """只弹窗选择单个目录（单选），不循环多选"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "InteractiveBatchCrop": "交互式批量裁剪",
-}
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        root.lift()
+        root.focus_force()
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+        dir_path = filedialog.askdirectory(title="选择图片文件夹")
+        root.destroy()
 
+        return web.json_response({"path": dir_path if dir_path else ""})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
+# ============= 多选文件路由（共享给其他节点） =============
 @PromptServer.instance.routes.post("/interactive_crop/select_files")
 async def select_files(request):
     try:
@@ -417,3 +425,17 @@ async def select_files(request):
         return web.json_response({"paths": paths_str, "count": len(file_paths)})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
+
+
+# ==============================
+# 节点注册
+# ==============================
+NODE_CLASS_MAPPINGS = {
+    "InteractiveBatchCrop": InteractiveBatchCrop,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "InteractiveBatchCrop": "交互式批量裁剪",
+}
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

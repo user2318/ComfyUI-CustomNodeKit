@@ -67,7 +67,7 @@ app.registerExtension({
                     opacity: 0.5;
                 }
                 .pc-path-row.drag-over {
-                    border-bottom: 2px solid #4a9eff;
+                    border-top: 2px solid #4a9eff;
                 }
                 .pc-path-row.selected {
                     outline: 2px solid #4a9eff;
@@ -252,8 +252,9 @@ app.registerExtension({
                 const insertFileBtn = this._makeBtn('插入文件', () => this._insertFiles());
                 const insertDirBtn = this._makeBtn('插入目录', () => this._insertDir());
                 const insertEmptyBtn = this._makeBtn('插入空行', () => this._insertEmptyLine());
+                const dedupeBtn = this._makeBtn('去重', () => this._dedupe());
                 const clearAllBtn = this._makeBtn('清空', () => this._clearAll(), 'danger');
-                leftBtns.append(insertFileBtn, insertDirBtn, insertEmptyBtn, clearAllBtn);
+                leftBtns.append(insertFileBtn, insertDirBtn, insertEmptyBtn, dedupeBtn, clearAllBtn);
 
                 const rightBtns = document.createElement('div');
                 rightBtns.className = 'pc-right-btns';
@@ -408,7 +409,7 @@ app.registerExtension({
                         if (this.dragIndex !== -1 && this.dragIndex !== idx) {
                             const [moved] = this.paths.splice(this.dragIndex, 1);
                             // 计算插入位置：拖拽到下方
-                            const targetIdx = idx > this.dragIndex ? idx : idx;
+                            const targetIdx = idx > this.dragIndex ? idx - 1 : idx;
                             this.paths.splice(targetIdx, 0, moved);
                             this.selectedIndex = targetIdx;
                         }
@@ -508,7 +509,7 @@ app.registerExtension({
                     const resp = await fetch('/multi_file_picker/select', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ mode: 'directory', multi: false })
+                        body: JSON.stringify({ mode: 'directory', multi: true })
                     });
                     const result = await resp.json();
                     const paths = result.paths || [];
@@ -522,6 +523,25 @@ app.registerExtension({
 
             _insertEmptyLine() {
                 this._insertAt(this.selectedIndex, ['']);
+            }
+
+            // ---------- 去重 ----------
+            _dedupe() {
+                const before = this.paths.length;
+                const seen = new Set();
+                this.paths = this.paths.filter(item => {
+                    const text = (item.text || '').trim();
+                    if (text === '') return true; // 空行不参与去重
+                    if (seen.has(text)) return false;
+                    seen.add(text);
+                    return true;
+                });
+                if (this.selectedIndex >= this.paths.length) {
+                    this.selectedIndex = this.paths.length - 1;
+                }
+                const removed = before - this.paths.length;
+                console.log(`[路径管理] 去重完成：移除 ${removed} 条重复路径`);
+                this._render();
             }
 
             // ---------- 清空 ----------
@@ -553,28 +573,10 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             const result = onNodeCreated?.apply(this);
 
-            // 找到多行文本框 widget
             const pathsWidget = this.widgets.find(w => w.name === 'paths');
             if (!pathsWidget) return result;
 
-            // 按钮容器 - 覆盖掉默认的 widget 显示
-            const buttonContainer = document.createElement('div');
-            buttonContainer.style.cssText = 'display: flex; gap: 4px; margin: 2px 0; height: 26px;';
-
-            const createBtn = (text, cls = '') => {
-                const btn = document.createElement('button');
-                btn.textContent = text;
-                btn.className = `comfy-btn ${cls}`;
-                btn.style.cssText = 'flex: 1; font-size: 11px; padding: 0 6px; height: 24px; line-height: 1; border-radius: 2px;';
-                return btn;
-            };
-
-            const manageBtn = createBtn('路径管理', 'primary');
-            const clearBtn = createBtn('清空', 'danger');
-            buttonContainer.append(manageBtn, clearBtn);
-            this.addDOMWidget('button_container', 'buttons', buttonContainer, { serialize: false });
-
-            // ---------- 打开管理弹窗（弹出后在里面执行插入文件/目录操作） ----------
+            // ---------- 打开管理弹窗 ----------
             const openManager = () => {
                 const existingText = pathsWidget.value || '';
                 const trimmed = existingText.trim();
@@ -585,33 +587,69 @@ app.registerExtension({
                 });
             };
 
-            manageBtn.addEventListener('click', openManager);
+            // ---------- 创建并排按钮 ----------
+            const btnContainer = document.createElement('div');
+            btnContainer.style.cssText = 'display:flex;gap:2px;height:fit-content;';
 
-            // ---------- 清空 ----------
-            clearBtn.addEventListener('click', () => {
+            const mgrBtn = document.createElement('button');
+            mgrBtn.textContent = '路径管理';
+            mgrBtn.style.cssText = 'flex:1;height:24px;padding:2px 8px;font-size:12px;background:var(--comfy-input-bg,#222);color:var(--input-text,white);border:1px solid var(--border-color,#444);border-radius:3px;cursor:pointer;';
+            mgrBtn.onclick = openManager;
+
+            const clearBtn = document.createElement('button');
+            clearBtn.textContent = '清空';
+            clearBtn.style.cssText = 'flex:1;height:24px;padding:2px 8px;font-size:12px;background:var(--comfy-input-bg,#222);color:var(--input-text,white);border:1px solid var(--border-color,#444);border-radius:3px;cursor:pointer;';
+            clearBtn.onclick = () => {
                 pathsWidget.value = '';
                 app.graph.setDirtyCanvas(true, true);
-            });
+            };
 
-            // ---------- 双击多行文本框也弹出管理弹窗 ----------
-            // 延迟等 widget 渲染完成
-            setTimeout(() => {
+            btnContainer.appendChild(mgrBtn);
+            btnContainer.appendChild(clearBtn);
+
+            // ---------- textarea 样式 + 将按钮包裹进 widget ----------
+            const styleTextarea = () => {
                 const textarea = pathsWidget.inputEl || pathsWidget.element?.querySelector('textarea');
-                if (textarea) {
-                    textarea.style.minHeight = '60px';
-                    textarea.placeholder = '每行一个路径，或点击按钮选择';
-
-                    textarea.addEventListener('dblclick', () => {
-                        const existingText = pathsWidget.value || '';
-                        const trimmed = existingText.trim();
-                        const items = trimmed ? trimmed.split('\n').map(t => ({ text: t })) : [];
-                        new PathManagerModal(items, (finalTexts) => {
-                            pathsWidget.value = finalTexts.join('\n');
-                            app.graph.setDirtyCanvas(true, true);
-                        });
-                    });
+                if (!textarea) {
+                    setTimeout(styleTextarea, 50);
+                    return;
                 }
-            }, 100);
+                textarea.style.cssText = 'width:100%;box-sizing:border-box;min-height:50px;resize:none;background:var(--comfy-input-bg,#222);color:var(--input-text,white);border:1px solid var(--border-color,#444);border-radius:3px;outline:none;';
+                textarea.placeholder = '每行一个路径，或点击按钮选择';
+                textarea.addEventListener('dblclick', openManager);
+
+                // 将 textarea + 按钮包裹在同一个容器中（使按钮高度计入节点尺寸）
+                const wrapper = document.createElement('div');
+                wrapper.style.cssText = 'display:flex;flex-direction:column;gap:2px;height:100%;width:100%;box-sizing:border-box;';
+                textarea.parentNode.insertBefore(wrapper, textarea);
+                wrapper.appendChild(textarea);
+                wrapper.appendChild(btnContainer);
+
+                // 用 ResizeObserver 监听节点 DOM 的尺寸变化，动态调整 textarea 高度
+                // 当用户拉伸节点时，节点 DOM 的 offsetHeight 一定会变化，这是最可靠的信号
+                const ro = new ResizeObserver(() => {
+                    // 节点 DOM 元素是 this.el（LiteGraph 为节点创建的 div）
+                    const nodeEl = this.el;
+                    if (!nodeEl || !nodeEl.isConnected) return;
+                    // 精确计算 wrapper 顶部相对于节点顶部的偏移量（标题栏 + 上方 padding，动态适应各种主题）
+                    const wrapperTop = wrapper.getBoundingClientRect().top;
+                    const nodeTop = nodeEl.getBoundingClientRect().top;
+                    const offsetTop = wrapperTop - nodeTop;
+                    const btnH = btnContainer.offsetHeight;
+                    const nodeH = nodeEl.offsetHeight;
+                    textarea.style.height = Math.max(50, nodeH - offsetTop - btnH - 2) + 'px';
+                });
+                ro.observe(this.el);
+
+                // 设置 widget 的 computeSize，保证节点最小高度合理
+                pathsWidget.computeSize = function(width) {
+                    const textareaMinHeight = 50;   // textarea min-height
+                    const gap = 2;                   // wrapper gap
+                    const btnHeight = 26;             // 按钮占用高度 (24px content + border/padding)
+                    return [width, textareaMinHeight + gap + btnHeight];
+                };
+            };
+            requestAnimationFrame(() => setTimeout(styleTextarea, 0));
 
             return result;
         };

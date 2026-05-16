@@ -335,16 +335,32 @@ class KeypointDraw:
         self.fillConvexPoly(canvas, polygon, BODY_COLORS[limb_idx % len(BODY_COLORS)])
 
     # ---------- 辅助方法: 绘制手部(指定索引范围) ----------
-    def _draw_hands_range(self, canvas, keypoints, scores, threshold, hand_start, hand_end, hand_point_size, eps, W, H):
-        """绘制指定索引范围的手部骨骼和圆点"""
+    def _draw_hands_range(self, canvas, keypoints, scores, threshold, hand_start, hand_end, hand_point_size, eps, W, H, hand_scale=1.0):
+        """绘制指定索引范围的手部骨骼和圆点。hand_scale 控制手部缩放（1.0=原始大小），手腕点保持不动。"""
         if len(keypoints) < hand_end:
             return
+        # 手腕锚点（手部关键点索引0，即 hand_start）
+        wrist_x, wrist_y = keypoints[hand_start][0], keypoints[hand_start][1]
+        
+        # 如果 hand_scale != 1.0，先计算缩放后的位置
+        if abs(hand_scale - 1.0) > 1e-6:
+            scaled_kps = keypoints.copy()
+            for i in range(hand_start + 1, hand_end):
+                if scores is not None and i < len(scores) and scores[i] < threshold:
+                    continue
+                ox, oy = keypoints[i][0], keypoints[i][1]
+                if ox > eps and oy > eps:
+                    scaled_kps[i][0] = wrist_x + (ox - wrist_x) * hand_scale
+                    scaled_kps[i][1] = wrist_y + (oy - wrist_y) * hand_scale
+        else:
+            scaled_kps = keypoints
+        
         for ie, edge in enumerate(HAND_EDGES):
             idx1, idx2 = hand_start + edge[0], hand_start + edge[1]
             if scores is not None and (scores[idx1] < threshold or scores[idx2] < threshold):
                 continue
-            x1,y1 = int(keypoints[idx1][0]), int(keypoints[idx1][1])
-            x2,y2 = int(keypoints[idx2][0]), int(keypoints[idx2][1])
+            x1,y1 = int(scaled_kps[idx1][0]), int(scaled_kps[idx1][1])
+            x2,y2 = int(scaled_kps[idx2][0]), int(scaled_kps[idx2][1])
             if x1>eps and y1>eps and x2>eps and y2>eps and 0<=x1<W and 0<=y1<H and 0<=x2<W and 0<=y2<H:
                 r,g,b = colorsys.hsv_to_rgb(ie/len(HAND_EDGES), 1.0, 1.0)
                 color = (int(r*255), int(g*255), int(b*255))
@@ -352,7 +368,7 @@ class KeypointDraw:
         for i in range(hand_start, hand_end):
             if scores is not None and i < len(scores) and scores[i] < threshold:
                 continue
-            x,y = int(keypoints[i][0]), int(keypoints[i][1])
+            x,y = int(scaled_kps[i][0]), int(scaled_kps[i][1])
             if x>eps and y>eps and 0<=x<W and 0<=y<H:
                 self.circle(canvas, (x,y), hand_point_size, (0,0,255))
 
@@ -366,7 +382,7 @@ class KeypointDraw:
     def draw_wholebody_keypoints(self, canvas, keypoints, scores=None, threshold=0.3,
                                  draw_body=True, draw_feet=True, draw_face=True, draw_hands=True,
                                  stick_width=4, face_point_size=3, hand_point_size=4,
-                                 yaw=None):
+                                 yaw=None, hand_scale=1.0):
         H, W = canvas.shape[:2]
         eps = 0.01
 
@@ -405,14 +421,14 @@ class KeypointDraw:
         # 后侧手
         if draw_hands:
             if bottom_side == "left" and len(keypoints) >= 134:
-                self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H)
+                self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H, hand_scale)
             elif bottom_side == "right" and len(keypoints) >= 113:
-                self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H)
+                self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H, hand_scale)
             elif bottom_side == "both":
                 if len(keypoints) >= 113:
-                    self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H)
+                    self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H, hand_scale)
                 if len(keypoints) >= 134:
-                    self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H)
+                    self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H, hand_scale)
 
         # 后侧脚
         if draw_feet and len(keypoints) >= 24:
@@ -478,9 +494,9 @@ class KeypointDraw:
         # 前侧手
         if draw_hands:
             if top_side == "left" and len(keypoints) >= 134:
-                self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H)
+                self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H, hand_scale)
             elif top_side == "right" and len(keypoints) >= 113:
-                self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H)
+                self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H, hand_scale)
 
         # 前侧脚
         if draw_feet and len(keypoints) >= 24:
@@ -1238,6 +1254,8 @@ class SDPoseDrawKeypointsV2:
             },
             "optional": {
                 "yaw_angles": ("FLOAT", { "tooltip": "来自 SDPoseEstimateYawSimple/Advanced 的 yaw_array，用于动态调整骨骼粗细和遮挡顺序" }),
+                "hand_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01,
+                                         "tooltip": "手部骨骼缩放比例，1.0=原始大小。对手部骨骼（从手腕向外）进行缩放，手腕位置保持不动避免错位"}),
             },
         }
 
@@ -1250,7 +1268,8 @@ class SDPoseDrawKeypointsV2:
              mouth_mode="draw_all",
              enable_yaw_thickness=False,
              yaw_thickness_min=1,
-             yaw_angles=None):
+             yaw_angles=None,
+             hand_scale=1.0):
         if not keypoints:
             return (torch.zeros((1, 64, 64, 3), dtype=torch.float32),)
 
@@ -1315,7 +1334,8 @@ class SDPoseDrawKeypointsV2:
                     stick_width=cur_stick_width,
                     face_point_size=face_point_size,
                     hand_point_size=hand_point_size,
-                    yaw=cur_yaw
+                    yaw=cur_yaw,
+                    hand_scale=hand_scale
                 )
 
             pose_outputs.append(canvas)

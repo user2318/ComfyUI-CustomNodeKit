@@ -53,7 +53,7 @@ function showAngleMapCanvas(pointCount, existingAngles, onConfirm) {
             <button id="angle-cancel-btn">❌ 取消</button>
             <button id="angle-reset-btn">🔄 重置均匀分布</button>
             <span style="margin-left:8px;color:#888;">
-                底部=0°(正面) 顶部=±180°(背面) 左=-90° 右=90°
+                蓝点=人物脸部朝向 — 底部=正面 顶部=背面 左=-90°(脸朝左) 右=90°(脸朝右)
             </span>
             <span id="angle-count-label" style="color:#aaa; margin-left:8px;">点数: ${pointCount}</span>
         </div>
@@ -79,13 +79,13 @@ function showAngleMapCanvas(pointCount, existingAngles, onConfirm) {
         return a;
     };
 
-    // 初始化点（逆时针均匀分布，0° 在底部）
+    // 初始化点（顺时针均匀分布，0° 在底部，人物朝向）
     let points = [];
     if (existingAngles && existingAngles.length === pointCount) {
         points = existingAngles.map(a => normalizeAngle(a));
     } else {
         for (let i = 0; i < pointCount; i++) {
-            points.push(normalizeAngle(i * (360 / pointCount)));
+            points.push(normalizeAngle(-i * (360 / pointCount)));
         }
     }
 
@@ -142,10 +142,10 @@ function showAngleMapCanvas(pointCount, existingAngles, onConfirm) {
         ctx.fillStyle = "#666";
         ctx.font = "12px Arial";
         ctx.textAlign = "center";
-        ctx.fillText("0° (正面)", cx, cy + ry + 20);
-        ctx.fillText("±180° (背面)", cx, cy - ry - 10);
-        ctx.fillText("-90°", cx - rx - 25, cy + 4);
-        ctx.fillText("+90°", cx + rx + 25, cy + 4);
+        ctx.fillText("正面 (0°)", cx, cy + ry + 20);
+        ctx.fillText("背面 (±180°)", cx, cy - ry - 10);
+        ctx.fillText("脸朝左 (-90°)", cx - rx - 25, cy + 4);
+        ctx.fillText("脸朝右 (+90°)", cx + rx + 25, cy + 4);
 
         // 画连接线
         for (let i = 0; i < points.length; i++) {
@@ -232,10 +232,10 @@ function showAngleMapCanvas(pointCount, existingAngles, onConfirm) {
         overlay.remove();
     };
 
-    // 重置按钮（0° 在底部，逆时针均匀分布）
+    // 重置按钮（0° 在底部，顺时针均匀分布，人物朝向）
     document.getElementById("angle-reset-btn").onclick = () => {
         for (let i = 0; i < pointCount; i++) {
-            points[i] = normalizeAngle(i * (360 / pointCount));
+            points[i] = normalizeAngle(-i * (360 / pointCount));
         }
         draw();
     };
@@ -258,6 +258,7 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== "ReferenceImageSelector") return;
 
+        // 保存原始的 onNodeCreated
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const result = onNodeCreated?.apply(this, arguments);
@@ -266,22 +267,22 @@ app.registerExtension({
             const angleMapWidget = this.widgets.find(w => w.name === "angle_map");
             if (angleMapWidget) {
                 const btnContainer = document.createElement("div");
-                btnContainer.style.cssText = "display:flex; gap:2px; margin-top:2px;";
+                btnContainer.style.cssText = "display:flex; gap:2px;";
 
                 const openBtn = document.createElement("button");
                 openBtn.textContent = "🎯 角度映射";
                 openBtn.style.cssText =
                     "height:24px; padding:2px 10px; font-size:12px;" +
                     "background:var(--comfy-input-bg,#222); color:var(--input-text,white);" +
-                    "border:1px solid var(--border-color,#444); border-radius:3px; cursor:pointer; flex:1;";
+                    "border:1px solid var(--border-color,#444); border-radius:3px; cursor:pointer; flex:2;";
                 openBtn.onclick = () => { this.openAngleMapUI(); };
 
                 const clearBtn = document.createElement("button");
-                clearBtn.textContent = "清空";
+                clearBtn.textContent = "清空参数";
                 clearBtn.style.cssText =
                     "height:24px; padding:2px 8px; font-size:12px;" +
                     "background:#a33; color:white;" +
-                    "border:none; border-radius:3px; cursor:pointer;";
+                    "border:none; border-radius:3px; cursor:pointer; flex:1;";
                 clearBtn.onclick = () => {
                     angleMapWidget.value = "";
                     app.graph.setDirtyCanvas(true, true);
@@ -292,8 +293,27 @@ app.registerExtension({
 
                 const inputEl = angleMapWidget.inputEl || angleMapWidget.element?.querySelector("input");
                 if (inputEl && inputEl.parentNode) {
-                    inputEl.style.marginBottom = "2px";
-                    inputEl.parentNode.insertBefore(btnContainer, inputEl.nextSibling);
+                    inputEl.style.marginBottom = "0";
+                    // 将 input + 按钮包裹进同一个容器，使节点底部跟随按钮高度
+                    const wrapper = document.createElement("div");
+                    wrapper.style.cssText = "display:flex; flex-direction:column; gap:2px; height:fit-content;width:100%;";
+                    const parent = inputEl.parentNode;
+                    // 用 wrapper 完全替换旧的 p-comfy-text-input 容器，避免空容器占用空间
+                    parent.parentNode.replaceChild(wrapper, parent);
+                    wrapper.appendChild(inputEl);
+                    wrapper.appendChild(btnContainer);
+
+                    // 修复外层所有包裹层的高度，min-height 是造成空隙的主要原因
+                    setTimeout(() => {
+                        let el = wrapper.parentElement;
+                        while (el) {
+                            const cls = el.className || "";
+                            if (cls.includes("size-full") || cls.includes("dom-widget")) {
+                                el.style.cssText = (el.style.cssText || "") + ";height:fit-content !important;min-height:0 !important;";
+                            }
+                            el = el.parentElement;
+                        }
+                    }, 0);
                 } else {
                     try {
                         this.addDOMWidget("angle_map_actions", "custom", btnContainer, { serialize: false });
@@ -303,7 +323,37 @@ app.registerExtension({
                 }
             }
 
+            // 延迟设置节点大小，确保所有 widgets 已初始化
+            setTimeout(() => {
+                if (this.widgets) {
+                    this.setSize([this.size[0], this.computeSize()[1]]);
+                }
+            }, 50);
+
             return result;
+        };
+
+        // 重写 computeSize：紧凑计算节点高度，消除底部多余空隙
+        nodeType.prototype.computeSize = function (out) {
+            // 获取 widgets 数量（不计入我们插入的 DOM widget）
+            const rowHeight = 28; // 每行 widget 的标准高度
+            const buttonHeight = 28; // 按钮行高度
+            const gap = 4; // 元件之间的间距
+
+            // 计算需要计数的 widget 行数（排除 type 为 "button" 的 widget）
+            let widgetRows = 0;
+            if (this.widgets) {
+                for (const w of this.widgets) {
+                    // 跳过自定义 DOM widget 和 button 类型
+                    if (w.type === "button" || w.name === "angle_map_actions") continue;
+                    widgetRows++;
+                }
+            }
+
+            // 计算标准高度：widget行数 * 行高 + 按钮行
+            const totalHeight = widgetRows * rowHeight + buttonHeight + gap * 2;
+
+            return [this.size ? this.size[0] : 300, totalHeight];
         };
 
         // 尝试从已连接的参考图输入获取张数
@@ -386,22 +436,22 @@ app.registerExtension({
             const angleMapWidget = this.widgets.find(w => w.name === "angle_map");
             if (angleMapWidget) {
                 const btnContainer = document.createElement("div");
-                btnContainer.style.cssText = "display:flex; gap:2px; margin-top:2px;";
+                btnContainer.style.cssText = "display:flex; gap:2px;";
 
                 const openBtn = document.createElement("button");
                 openBtn.textContent = "🎯 角度映射";
                 openBtn.style.cssText =
                     "height:24px; padding:2px 10px; font-size:12px;" +
                     "background:var(--comfy-input-bg,#222); color:var(--input-text,white);" +
-                    "border:1px solid var(--border-color,#444); border-radius:3px; cursor:pointer; flex:1;";
+                    "border:1px solid var(--border-color,#444); border-radius:3px; cursor:pointer; flex:2;";
                 openBtn.onclick = () => { this.openAngleMapUI(); };
 
                 const clearBtn = document.createElement("button");
-                clearBtn.textContent = "清空";
+                clearBtn.textContent = "清空参数";
                 clearBtn.style.cssText =
                     "height:24px; padding:2px 8px; font-size:12px;" +
                     "background:#a33; color:white;" +
-                    "border:none; border-radius:3px; cursor:pointer;";
+                    "border:none; border-radius:3px; cursor:pointer; flex:1;";
                 clearBtn.onclick = () => {
                     angleMapWidget.value = "";
                     app.graph.setDirtyCanvas(true, true);
@@ -412,8 +462,27 @@ app.registerExtension({
 
                 const inputEl = angleMapWidget.inputEl || angleMapWidget.element?.querySelector("input");
                 if (inputEl && inputEl.parentNode) {
-                    inputEl.style.marginBottom = "2px";
-                    inputEl.parentNode.insertBefore(btnContainer, inputEl.nextSibling);
+                    inputEl.style.marginBottom = "0";
+                    // 将 input + 按钮包裹进同一个容器，使节点底部跟随按钮高度
+                    const wrapper = document.createElement("div");
+                    wrapper.style.cssText = "display:flex; flex-direction:column; gap:2px; height:fit-content;width:100%;";
+                    const parent = inputEl.parentNode;
+                    // 用 wrapper 完全替换旧的 p-comfy-text-input 容器，避免空容器占用空间
+                    parent.parentNode.replaceChild(wrapper, parent);
+                    wrapper.appendChild(inputEl);
+                    wrapper.appendChild(btnContainer);
+
+                    // 修复外层所有包裹层的高度，min-height 是造成空隙的主要原因
+                    setTimeout(() => {
+                        let el = wrapper.parentElement;
+                        while (el) {
+                            const cls = el.className || "";
+                            if (cls.includes("size-full") || cls.includes("dom-widget")) {
+                                el.style.cssText = (el.style.cssText || "") + ";height:fit-content !important;min-height:0 !important;";
+                            }
+                            el = el.parentElement;
+                        }
+                    }, 0);
                 } else {
                     try {
                         this.addDOMWidget("angle_map_actions", "custom", btnContainer, { serialize: false });
