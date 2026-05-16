@@ -29,6 +29,7 @@ class ReferenceImageSelector:
                 "yaw_angles": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0}),
                 "background_images": ("IMAGE",),
                 "select_references": ("BOOLEAN", {"default": True, "label_on": "筛选+排序", "label_off": "仅排序"}),
+                "allow_switch_main": ("BOOLEAN", {"default": True, "label_on": "允许更换", "label_off": "固定第一张"}),
             },
         }
 
@@ -37,7 +38,7 @@ class ReferenceImageSelector:
     FUNCTION = "select"
     CATEGORY = "CustomNodes/SDPose"
 
-    def select(self, reference_images, angle_map, yaw_angles=None, background_images=None, select_references=True):
+    def select(self, reference_images, angle_map, yaw_angles=None, background_images=None, select_references=True, allow_switch_main=True):
         info_lines = []
         total_ref_count = reference_images.shape[0]
         info_lines.append(f"参考图总数: {total_ref_count}")
@@ -119,6 +120,15 @@ class ReferenceImageSelector:
 
         # ==================== 6. 确定主参考图 (覆盖帧数最多) ====================
         main_index = self._find_main_reference(candidate_indices, angle_map_list, yaw_list)
+
+        # 不允许更换主参考图时，检查索引0是否在候选集内
+        if not allow_switch_main:
+            if 0 in candidate_indices:
+                main_index = 0
+                info_lines.append("主参考图固定为第一张 (不允许更换)")
+            else:
+                info_lines.append("不允许更换主参考图, 但第一张不在候选集内, 回退算法选择")
+
         info_lines.append(f"主参考图索引: {main_index}, 角度: {angle_map_list[main_index]:.1f}°")
 
         # ==================== 7. 排序辅助参考图 ====================
