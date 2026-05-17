@@ -1,35 +1,15 @@
+# pyproject.toml
 [project]
-name = "comfyui-customnodekit"
+name = "comfyui-customnodekit" # Unique identifier for your node. Immutable after creation.
 description = "一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求"
-version = "1.0.2"
-license = {text = "MIT"}
-readme = "README.md"
+version = "1.0.3" # Custom Node version. Must be semantically versioned.
+license = { text = "MIT" }
+dependencies = [] # Filled in from requirements.txt
+
+[project.urls]
+Repository = "https://github.com/user2318/ComfyUI-CustomNodeKit"
 
 [tool.comfy]
-publisher_id = "user2318"
-display_name = "Custom Node Kit"
-description = "WanAnimate视频生成、SDPose姿态系统、视频工具、交互式裁剪、上下文窗口调度等节点集合"
-nodes = [
-    "WanAnimateToVideoCustom",
-    "SDPoseDrawKeypointsV2",
-    "SDPoseSaveJson",
-    "SDPoseLoadJson",
-    "SDPoseSliceKeypoints",
-    "SDPoseConcatKeypoints",
-    "SDPoseEstimateYawSimple",
-    "SDPoseEstimateYawAdvanced",
-    "SDPoseResizeKeypoints",
-    "SDPoseResampleKeypoints",
-    "VideoFrameCounter",
-    "ImageSequenceToVideo",
-    "PathCollectorNode",
-    "IndexSelectorNode",
-    "PathValidatorNode",
-    "FolderImageLoaderNode",
-    "ImageBatchConcatNode",
-    "ImageBatchResizeNode",
-    "InteractiveBatchCrop",
-    "WanContextWindowsManual_Custom",
-    "ReferenceImageSelector",
-    "IntegerSettingNode",
-]
+PublisherId = "user2318" # TODO (fill in Publisher ID from Comfy Registry Website).
+DisplayName = "Custom Node Kit" # Display name for the Custom Node. Can be changed later.
+Icon = ""
