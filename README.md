@@ -22,6 +22,9 @@
   - [Image Batch Concat](#image-batch-concat)
   - [Image Batch Resize](#image-batch-resize)
 - [依赖](#依赖)
+- [工作流](#工作流)
+  - [长视频姿态检测工作流](#长视频姿态检测工作流)
+  - [WanAnimate多参考图生成长视频工作流](#wananimate多参考图生成长视频工作流)
 - [使用示例](#使用示例)
 - [许可证](#许可证)
 
@@ -422,7 +425,91 @@ right：   等比缩放到 512×288，裁左侧 176px（需再放大到 512×512
 
 ---
 
+## 工作流
+
+`workflow/` 目录下提供了两个完整的 ComfyUI 工作流 JSON 文件，可直接拖入 ComfyUI 界面使用。
+
+### 长视频姿态检测工作流
+
+**文件**：`Long_Pose_detection_while_new.json`
+
+**用途**：对长视频进行逐帧骨骼（body）和面部关键点检测，支持将检测骨骼与参考图人物的骨骼进行比例对齐（BodyRatioMapper），最终生成骨骼可视化视频、面部特征 JSON 和姿态 JSON 文件。适用于制作舞蹈骨骼动画、动作捕捉数据提取等场景。
+
+**简要使用说明**：
+
+1. 在「参数设置」区域内设置分辨率（宽度/高度）、帧率（fps）、每片段帧数等；
+2. 在「视频分段循环加载」区域内配置输入视频路径、视频分段参数；
+3. 在「识别并保存面部图、面部特征点json、姿态json」区域内设置参考骨骼 JSON 路径和参考图，用于骨骼比例对齐；
+4. 在「骨骼对齐、绘制，合成骨骼视频」区域调整骨骼绘制参数（线条宽度、面部/手部关键点大小等）；
+5. **运行前请先清除工作目录中的过往文件，尤其是脸图（face）文件夹**，避免旧数据残留干扰；
+6. 运行后自动分段循环处理长视频，逐段进行 SDPose 姿态识别、骨骼对齐、可视化绘制，最终合成骨骼视频（保留原视频音频）。
+
+**视频合成方式**：将绘制好的骨骼帧通过 `ImageSequenceToVideo` 合成为视频文件，可同步附带原视频音频（通过 `VHS_LoadAudio` 加载）。
+
+**本工作流使用到的第三方节点包**（不含本工作区 `ComfyUI-CustomNodeKit` 自身节点）：
+
+| 节点包 | 主要用途 |
+|--------|----------|
+| `sdpose-ood` | SDPose 姿态识别模型加载（`SDPoseOODLoader`）与处理（`SDPoseOODProcessor`） |
+| `ComfyUI-WanAnimatePreprocess` | ONNX 面部检测模型加载（`OnnxDetectionModelLoader`）与面部图像截取（`PoseAndFaceDetection`） |
+| `comfyui-videohelpersuite` | 视频文件加载（`VHS_LoadVideoFFmpegPath`）与音频加载（`VHS_LoadAudio`） |
+| `comfyui-kjnodes` | 常量节点（`INTConstant`、`FloatConstant`、`StringConstant`） |
+| `comfyui-easy-use` | While 循环控制（`easy whileLoopStart`/`easy whileLoopEnd`）与缓存清理（`easy clearCacheAll`） |
+| `comfyui-impact-pack` | 循环条件比较（`ImpactCompare`） |
+| `comfyui-custom-scripts` | 数学表达式计算（`MathExpression\|pysssss`） |
+| `ComfyUI-BodyRatioMapper` | 骨骼比例对齐（`BodyRatioMapperProportionTransfer`） |
+| `ComfyUI-Addoor` | 临时文件清理（`AD_DeleteLocalAny`） |
+
+### WanAnimate多参考图生成长视频工作流
+
+**文件**：`WanAnimate_ref_pics_loop+context.json`
+
+**用途**：基于 WanAnimate 模型，使用多张参考图生成带有上下文窗口的长视频。该工作流特别包含一个**360° 图像批次预处理模块**，可将单张参考图处理为 360° 环绕视角的图片批次（配套文件存放于输出目录中），用户可以从生成结果中挑选合适角度的图片作为多参考图输入，从而更好地控制长视频中人物的外观一致性。
+
+**简要使用说明**：
+
+1. 在「模型、LoRA及VAE加载」区域加载 WanAnimate UNet 模型、CLIP 模型、VAE 及所需 LoRA；
+2. 在「设置主参考图」区域加载主参考图并缩放至 512×512；
+3. 在「设置副参考图」区域通过 `PathCollectorNode` 指定副参考图目录（可放入 360° 预处理输出的多角度参考图）；
+4. 在「提示词填写」区域输入正/负向提示词；
+5. 在「视频生成参数区」设置每段生成帧数、片段间重叠帧数等参数；
+6. 选择动作和面部数据加载方式：
+   - **常规加载**：直接载入原视频，实时识别面部和姿态（不支持骨骼对齐）；
+   - **快速加载**：直接载入预先导出的姿态 JSON 和面部 JSON，支持骨骼对齐；
+7. 运行后通过循环控制区逐段生成视频帧，利用 `Custom Context Windows` 实现跨段上下文窗口调度；
+8. **生成完成后**，手动启用「保存视频」区域，运行 `ImageSequenceToVideo` 将帧序列合成为视频文件（可附带原视频音频）。
+
+**视频合成方式**：先通过 KSampler 生成各段视频帧（`VAE Decode`），再进行跨段淡入淡出融合（`CrossFadeImages`），最后通过 `ImageSequenceToVideo` 将完整帧序列合成为视频。
+
+**360° 预处理模块说明**：
+
+- 该模块位于工作流下半部分（通常 mute 状态），包含 `InteractiveBatchCrop` 交互式裁剪、`SDPoseLoadJson` 加载 360° 关键点 JSON、`SDPoseResizeKeypoints` 缩放关键点、`SDPoseDrawKeypointsV2` 绘制姿态视频；
+- 配套文件（360° 关键点 JSON 等）需放置在 `output/video/360°` 目录下；
+- 用户可运行预处理模块生成 360° 环绕视角姿态视频批次，从中挑选合适角度的帧作为副参考图；
+- 复杂预处理建议使用主工作流（`Long_Pose_detection_while_new.json`）进行。
+
+**本工作流使用到的第三方节点包**（不含本工作区 `ComfyUI-CustomNodeKit` 自身节点）：
+
+| 节点包 | 主要用途 |
+|--------|----------|
+| `sdpose-ood` | SDPose 姿态识别模型加载与处理 |
+| `ComfyUI-WanAnimatePreprocess` | ONNX 面部检测模型加载与面部图像截取 |
+| `comfyui-videohelpersuite` | 视频文件加载（`VHS_LoadVideoFFmpegPath`）、图像分割（`VHS_SplitImages`）与音频加载 |
+| `comfyui-kjnodes` | 常量节点、`CrossFadeImages` 跨段融合、`ColorMatch` 色彩匹配、`PatchSageAttentionKJ` 等 |
+| `comfyui-easy-use` | While 循环控制、IfElse 条件分支、缓存清理、`easy imageSwitch` |
+| `comfyui-impact-pack` | 循环条件比较（`ImpactCompare`）、空值检测（`ImpactIfNone`） |
+| `comfyui-custom-scripts` | 数学表达式计算（`MathExpression\|pysssss`） |
+| `ComfyUI-BodyRatioMapper` | 骨骼比例对齐（`BodyRatioMapperProportionTransfer`） |
+| `rgthree-comfy` | `Any Switch` 多路图像切换、`Fast Muter` 快速开关 |
+| `pr-was-node-suite-comfyui-47064894` | `Image Filter Adjustments` 图像滤镜调整、`Random Number` 随机种子 |
+| `comfyui_memory_cleanup` | `RAMCleanup` / `VRAMCleanup` 内存/显存清理 |
+| `ComfyUI-EasyColorCorrector` | `BatchColorCorrection` 批量色彩校正 |
+
+---
+
 ## 依赖
+
+### Python 依赖
 
 核心依赖（已在 `requirements.txt` 中声明）：
 

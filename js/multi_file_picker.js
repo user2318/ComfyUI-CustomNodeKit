@@ -641,6 +641,26 @@ app.registerExtension({
                 });
                 ro.observe(this.el);
 
+                // 保持引用以便 onRemoved 中清理
+                if (this._pathCollectorResizeObserver) this._pathCollectorResizeObserver.disconnect();
+                this._pathCollectorResizeObserver = ro;
+
+                // ---- 自动恢复按钮：当 widget 被重建导致 wrapper 被销毁时，自动重建按钮 ----
+                if (this._pathCollectorMutationObserver) this._pathCollectorMutationObserver.disconnect();
+                const mo = new MutationObserver((mutations) => {
+                    for (const m of mutations) {
+                        for (const node of m.removedNodes) {
+                            if (node === wrapper || (node.nodeType === 1 && node.contains(wrapper))) {
+                                mo.disconnect();
+                                requestAnimationFrame(() => setTimeout(styleTextarea, 0));
+                                return;
+                            }
+                        }
+                    }
+                });
+                mo.observe(wrapper.parentNode, { childList: true });
+                this._pathCollectorMutationObserver = mo;
+
                 // 设置 widget 的 computeSize，保证节点最小高度合理
                 pathsWidget.computeSize = function(width) {
                     const textareaMinHeight = 50;   // textarea min-height
@@ -650,6 +670,14 @@ app.registerExtension({
                 };
             };
             requestAnimationFrame(() => setTimeout(styleTextarea, 0));
+
+            // 在节点被移除时清理所有 Observer，防止内存泄漏
+            const origOnRemoved = this.onRemoved;
+            this.onRemoved = function() {
+                this._pathCollectorMutationObserver?.disconnect();
+                this._pathCollectorResizeObserver?.disconnect();
+                return origOnRemoved?.call(this);
+            };
 
             return result;
         };
