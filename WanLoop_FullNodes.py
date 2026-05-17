@@ -318,7 +318,10 @@ class WanAnimateToVideoCustom:
         trim_image = max(0, ref_motion_latent_length * 4 - 3)
 
         # ----- latent_yaw_angles 下采样 -----
-        latent_yaw_angles = self._downsample_yaw_to_latent(yaw_angles, latent_length + trim_latent)
+        if yaw_angles is not None:
+            latent_yaw_angles = self._downsample_yaw_to_latent(yaw_angles, latent_length + trim_latent)
+        else:
+            latent_yaw_angles = None
 
         return (positive, negative, out_latent, trim_latent, trim_image, video_frame_offset + length, {"samples": concat_latent_image}, latent_yaw_angles)
 
