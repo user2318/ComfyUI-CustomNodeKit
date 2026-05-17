@@ -33,13 +33,13 @@
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/user2318/ComfyUI-CustomNodeKit.git ComfyUI-Custom_Tools
+git clone https://github.com/user2318/ComfyUI-CustomNodeKit.git
 ```
 
 2. 安装 Python 依赖：
 
 ```bash
-cd ComfyUI-Custom_Tools
+cd ComfyUI-CustomNodeKit
 pip install -r requirements.txt
 ```
 
@@ -76,8 +76,8 @@ pip install -r requirements.txt
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
-| **Get Frame Count** | `VideoHelper` | 获取输入图像/视频帧数统计信息 |
-| **Image Sequence to Video (ffmpeg)** | `VideoHelper` | 使用 ffmpeg 将图片序列合成为视频文件，支持自定义帧率、编码器参数 |
+| **VideoFrameCounter** | `video` | 获取输入视频/图像序列的帧数统计信息与帧率 |
+| **ImageSequenceToVideo** | `video` | 使用 ffmpeg 将图片序列合成为视频文件，支持 CRF、音频合成、帧偏移等参数 |
 
 ### 交互式工具
 
@@ -92,7 +92,7 @@ pip install -r requirements.txt
 | **Path Collector** | `Utility` | 从指定目录收集文件路径 |
 | **Index Selector** | `Utility` | 根据索引从列表中选取元素，支持 `last_folder` 输出 |
 | **Path Validator** | `Utility` | 验证文件路径是否存在 |
-| **Integer Aligner** | `Utility` | 将整数对齐到目标步长的倍数 |
+| **Integer Setting (整数设置)** | `CustomNodes/Utils` | 将整数对齐到目标步长（start + step×n），支持负整数 |
 
 ### 图像批次工具
 
@@ -426,11 +426,13 @@ right：   等比缩放到 512×288，裁左侧 176px（需再放大到 512×512
 
 核心依赖（已在 `requirements.txt` 中声明）：
 
-- `torch` — PyTorch 深度学习框架
+- `torch` — PyTorch 深度学习框架（通常由 ComfyUI 环境提供）
 - `numpy` — 数值计算
+- `Pillow` — 图像处理
+- `aiohttp` — 异步 HTTP 通信
 - `colorsys` — 颜色空间转换（Python 标准库）
 - `tqdm` — 进度条显示
-- `ffmpeg` — 视频合成（需要系统安装 ffmpeg 命令行工具）
+- `imageio-ffmpeg` — 视频合成（自动下载 ffmpeg，无需系统安装）
 
 ---
 

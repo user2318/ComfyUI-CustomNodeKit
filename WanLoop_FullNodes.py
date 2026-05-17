@@ -46,6 +46,7 @@ class WanAnimateToVideoCustom:
                 "continue_motion": ("IMAGE",),
                 "background_video": ("IMAGE",),
                 "character_mask": ("MASK",),
+                "yaw_angles": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0}),
                 "face_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "mid_frame": ("INT", {"default": -1, "min": -1, "max": 1000, "step": 1}),
                 "mid_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -54,8 +55,8 @@ class WanAnimateToVideoCustom:
             }
         }
 
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "INT", "INT", "INT", "LATENT")
-    RETURN_NAMES = ("positive", "negative", "latent", "trim_latent", "trim_image", "video_frame_offset", "concat_latent")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "INT", "INT", "INT", "LATENT", "FLOAT")
+    RETURN_NAMES = ("positive", "negative", "latent", "trim_latent", "trim_image", "video_frame_offset", "concat_latent", "latent_yaw_angles")
     FUNCTION = "process"
     CATEGORY = "WanLoop/整合节点"
 
@@ -67,7 +68,8 @@ class WanAnimateToVideoCustom:
                 pose_video=None, continue_motion=None, background_video=None,
                 character_mask=None, face_strength=1.0,
                 mid_frame=-1, mid_strength=0.5,
-                neutral_mix_min=0.0, neutral_mix_max=1.0):
+                neutral_mix_min=0.0, neutral_mix_max=1.0,
+                yaw_angles=None):
 
         trim_to_pose_video = False
         latent_length = ((length - 1) // 4) + 1
@@ -315,7 +317,41 @@ class WanAnimateToVideoCustom:
 
         trim_image = max(0, ref_motion_latent_length * 4 - 3)
 
-        return (positive, negative, out_latent, trim_latent, trim_image, video_frame_offset + length, {"samples": concat_latent_image})
+        # ----- latent_yaw_angles 下采样 -----
+        latent_yaw_angles = self._downsample_yaw_to_latent(yaw_angles, latent_length + trim_latent)
+
+        return (positive, negative, out_latent, trim_latent, trim_image, video_frame_offset + length, {"samples": concat_latent_image}, latent_yaw_angles)
+
+    # ==================== 辅助方法 ====================
+
+    def _downsample_yaw_to_latent(self, yaw_angles, total_latent_len):
+        """将像素帧偏航角下采样为 latent 帧偏航角（每4帧取首值）"""
+        if yaw_angles is None:
+            return [0.0] * total_latent_len
+
+        # 展平为 list[float]
+        if isinstance(yaw_angles, (int, float)):
+            yaw_list = [float(yaw_angles)]
+        elif isinstance(yaw_angles, list):
+            yaw_list = [float(v) for v in yaw_angles]
+        elif isinstance(yaw_angles, torch.Tensor):
+            yaw_list = yaw_angles.flatten().tolist()
+        else:
+            yaw_list = []
+
+        if len(yaw_list) == 0:
+            return [0.0] * total_latent_len
+
+        # 每 4 个像素帧取一个 latent 帧的值（取第一个像素帧的角度）
+        latent_yaw = []
+        for i in range(total_latent_len):
+            pixel_idx = i * 4
+            if pixel_idx < len(yaw_list):
+                latent_yaw.append(float(yaw_list[pixel_idx]))
+            else:
+                latent_yaw.append(float(yaw_list[-1]))
+
+        return latent_yaw
 
 
 # ==============================

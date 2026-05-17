@@ -1,6 +1,6 @@
 # WanContextWindowsNode.py
 # 完全自包含的 WAN Context Windows 节点，支持前缀拼接（真正的参考帧拼接）
-# 版本：2.0 - 支持前缀窗口
+# 版本：2.0 - 支持前缀窗口 + 动态前缀
 
 from __future__ import annotations
 from typing import TYPE_CHECKING, Callable
@@ -19,6 +19,13 @@ if TYPE_CHECKING:
     from comfy.model_base import BaseModel
     from comfy.model_patcher import ModelPatcher
     from comfy.controlnet import ControlBase
+
+# 动态前缀依赖：仅在运行时导入，避免循环或加载失败
+try:
+    from .reference_image_selector import ReferenceImageUtils
+except ImportError:
+    ReferenceImageUtils = None
+    logging.warning("[ContextWindows] 无法导入 ReferenceImageUtils，动态前缀功能不可用")
 
 
 class ContextWindowABC(ABC):
@@ -144,6 +151,11 @@ class IndexListContextHandler(ContextHandlerABC):
         self.split_conds_to_windows = split_conds_to_windows
         self.callbacks = {}
 
+        # ---- 动态前缀相关属性 ----
+        self.use_dynamic_prefix: bool = False
+        self.per_window_prefix_latents: dict[int, torch.Tensor] = {}
+        self._current_window_idx: int = 0
+
     def should_use_context(self, model: BaseModel, conds: list[list[dict]], x_in: torch.Tensor, timestep: torch.Tensor, model_options: dict[str]) -> bool:
         if x_in.size(self.dim) > self.context_length:
             logging.info(f"Using context windows {self.context_length} with overlap {self.context_overlap} for {x_in.size(self.dim)} frames.")
@@ -173,6 +185,22 @@ class IndexListContextHandler(ContextHandlerABC):
                     if isinstance(cond_item, torch.Tensor):
                         if self.dim < cond_item.ndim and cond_item.size(self.dim) == x_in.size(self.dim):
                             actual_cond_item = window.get_tensor(cond_item, retain_index_list=self.prefix_indices)
+                            # ---- 动态前缀替换 ----
+                            if self.use_dynamic_prefix and self._current_window_idx > 0 and key == "concat_latent_image":
+                                dynamic_latent = self.per_window_prefix_latents.get(self._current_window_idx)
+                                if dynamic_latent is not None:
+                                    pl = min(dynamic_latent.shape[self.dim], self.prefix_latent_len)
+                                    if pl > 0:
+                                        # 替换时间维度上前 pl 帧
+                                        slices = [slice(None)] * actual_cond_item.ndim
+                                        slices[self.dim] = slice(0, pl)
+                                        actual_cond_item[tuple(slices)] = dynamic_latent.to(
+                                            actual_cond_item.device, actual_cond_item.dtype
+                                        )[:, :, :pl, :, :].to(actual_cond_item.device, actual_cond_item.dtype)
+                                        logging.info(
+                                            "[ContextWindows] 窗口%d前缀已替换为动态编码prefix",
+                                            self._current_window_idx
+                                        )
                             resized_actual_cond[key] = actual_cond_item.to(device)
                         else:
                             resized_actual_cond[key] = cond_item.to(device)
@@ -358,6 +386,8 @@ class IndexListContextHandler(ContextHandlerABC):
             for callback in comfy.patcher_extension.get_all_callbacks(IndexListCallbacks.EVALUATE_CONTEXT_WINDOWS, self.callbacks):
                 callback(self, model, x_in, conds, timestep, model_options, window_idx, window, model_options, device, first_device)
             model_options["transformer_options"]["context_window"] = window
+            # 设置当前窗口索引，供 get_resized_cond 中动态前缀替换使用
+            self._current_window_idx = window_idx
             sub_x = window.get_tensor(x_in, device)
             sub_timestep = window.get_tensor(timestep, device, dim=0)
             sub_conds = [self.get_resized_cond(cond, x_in, window, device) for cond in conds]
@@ -737,7 +767,7 @@ def apply_freenoise(noise: torch.Tensor, dim: int, context_length: int, context_
 # ==================== 节点定义 ====================
 # 标准 ComfyUI 节点：使用 INPUT_TYPES / RETURN_TYPES / FUNCTION 等类属性（非 comfy_api）
 class CustomWanContextWindowsManualNode:
-    """手动设置 WAN 类模型的上下文窗口（dim=2），支持前缀参考帧。"""
+    """手动设置 WAN 类模型的上下文窗口（dim=2），支持前缀参考帧与动态前缀。"""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -768,6 +798,15 @@ class CustomWanContextWindowsManualNode:
                                           "tooltip": "Number of prefix reference frames (original frame units, auto-converted to latent). These frames are prepended to each window as stable reference."}),
                 "split_conds_to_windows": ("BOOLEAN", {"default": False,
                                                        "tooltip": "Whether to split multiple conditionings to each window based on region index."}),
+            },
+            "optional": {
+                "window_reference_images": ("IMAGE", {"tooltip": "原始参考图批次（来自 ReferenceImageSelector 的 raw_reference_images 输出），用于动态前缀"}),
+                "latent_yaw_angles": ("FLOAT", {"tooltip": "下采样后的 latent 偏航角（来自 WanAnimateToVideoCustom 的 latent_yaw_angles 输出）"}),
+                "vae": ("VAE", {"tooltip": "VAE 编码器，用于将参考图编码为 latent"}),
+                "reference_angle_map": ("STRING", {"default": "", "multiline": False, "tooltip": "参考图角度映射 JSON（来自 ReferenceImageSelector 的 reference_angle_map 输出）"}),
+                "allow_switch_main": ("BOOLEAN", {"default": True, "label_on": "允许更换主参考图", "label_off": "固定第一张",
+                                                  "tooltip": "动态前缀模式下是否允许更换主参考图"}),
+                "background_images": ("IMAGE", {"tooltip": "可选的背景图，用于动态前缀的 1+4n 拼接"}),
             }
         }
 
@@ -776,11 +815,13 @@ class CustomWanContextWindowsManualNode:
     FUNCTION = "apply_context_windows"
     CATEGORY = "context"
     EXPERIMENTAL = True
-    DESCRIPTION = "Manually set context windows for WAN-like models (dim=2). Supports prefixing reference frames."
+    DESCRIPTION = "Manually set context windows for WAN-like models (dim=2). Supports prefixing reference frames and dynamic prefix."
 
     def apply_context_windows(self, model, context_length, context_overlap, context_schedule,
                               context_stride, closed_loop, fuse_method, freenoise,
-                              prefix_frames=0, split_conds_to_windows=False):
+                              prefix_frames=0, split_conds_to_windows=False,
+                              window_reference_images=None, latent_yaw_angles=None, vae=None,
+                              reference_angle_map="", allow_switch_main=True, background_images=None):
         # 转换前缀帧数：原始帧 → latent 帧（每 4 个原始帧对应 1 个 latent 帧）
         prefix_latent_len = max((prefix_frames - 1) // 4 + 1, 0) if prefix_frames > 0 else 0
         # 转换 WAN 模型的帧步长
@@ -788,7 +829,7 @@ class CustomWanContextWindowsManualNode:
         context_overlap = max(((context_overlap - 1) // 4) + 1, 0)
 
         model = model.clone()
-        model.model_options["context_handler"] = IndexListContextHandler(
+        handler = IndexListContextHandler(
             context_schedule=get_matching_context_schedule(context_schedule),
             fuse_method=get_matching_fuse_method(fuse_method),
             context_length=context_length,
@@ -800,10 +841,142 @@ class CustomWanContextWindowsManualNode:
             prefix_latent_len=prefix_latent_len,
             split_conds_to_windows=split_conds_to_windows
         )
+        model.model_options["context_handler"] = handler
+
+        # ---- 动态前缀预计算 ----
+        has_all_inputs = all([
+            window_reference_images is not None,
+            latent_yaw_angles is not None,
+            vae is not None,
+        ])
+        if not has_all_inputs:
+            print("[ContextWindows] 动态前缀模式未启用 (缺少 window_reference_images / latent_yaw_angles / vae)")
+        elif ReferenceImageUtils is None:
+            print("[ContextWindows] 动态前缀模式未启用 (ReferenceImageUtils 导入失败)")
+        elif prefix_latent_len <= 0:
+            print("[ContextWindows] 动态前缀模式未启用 (prefix_frames <= 0)")
+        elif window_reference_images is not None and window_reference_images.shape[0] == 0:
+            print("[ContextWindows] 动态前缀模式未启用 (window_reference_images 为空)")
+        else:
+            handler.use_dynamic_prefix = True
+            self._precompute_window_prefixes(
+                handler, window_reference_images, latent_yaw_angles, vae,
+                reference_angle_map, allow_switch_main, background_images,
+            )
+
         create_prepare_sampling_wrapper(model)
         if freenoise:
             create_sampler_sample_wrapper(model)
         return (model,)
+
+    # ==================== 动态前缀预计算 ====================
+
+    def _precompute_window_prefixes(self, handler, window_reference_images, latent_yaw_angles,
+                                     vae, reference_angle_map, allow_switch_main, background_images):
+        """为每个非首窗口预计算 VAE 编码后的前缀 latent"""
+        import json
+
+        # 解析 latent_yaw_angles
+        if isinstance(latent_yaw_angles, (int, float)):
+            yaw_list = [float(latent_yaw_angles)]
+        elif isinstance(latent_yaw_angles, list):
+            yaw_list = [float(v) for v in latent_yaw_angles]
+        elif isinstance(latent_yaw_angles, torch.Tensor):
+            yaw_list = latent_yaw_angles.flatten().tolist()
+        else:
+            yaw_list = []
+
+        if not yaw_list:
+            print("[ContextWindows] 动态前缀模式未启用 (latent_yaw_angles 为空)")
+            handler.use_dynamic_prefix = False
+            return
+
+        # 解析 reference_angle_map
+        angle_map_list = None
+        if reference_angle_map and reference_angle_map.strip():
+            try:
+                parsed = json.loads(reference_angle_map)
+                if isinstance(parsed, list):
+                    angle_map_list = [float(v) for v in parsed]
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        if angle_map_list is None or len(angle_map_list) != window_reference_images.shape[0]:
+            print(
+                "[ContextWindows] 动态前缀模式未启用 "
+                f"(reference_angle_map 解析失败或数量 ({len(angle_map_list) if angle_map_list else 0}) "
+                f"与参考图数量 ({window_reference_images.shape[0]}) 不匹配)"
+            )
+            handler.use_dynamic_prefix = False
+            return
+
+        prefix_latent_len = handler.prefix_latent_len
+
+        # 用 standard_static 计算窗口数（仅用于确定窗口索引范围）
+        total_latent_frames = len(yaw_list)
+        if total_latent_frames <= handler.context_length:
+            num_windows = 1
+        else:
+            delta = handler.context_length - handler.context_overlap
+            num_windows = math.ceil((total_latent_frames - handler.context_length) / delta) + 1
+
+        print(f"[ContextWindows] 动态前缀模式已启用，窗口数: {num_windows}")
+
+        # 窗口 0 使用原生前缀，从窗口 1 开始计算动态前缀
+        for window_idx in range(1, num_windows):
+            if window_idx >= num_windows:
+                break
+            # 计算该窗口的 latent 帧范围 (standard_static 方式)
+            delta = handler.context_length - handler.context_overlap
+            start_latent = window_idx * delta
+            end_latent = min(start_latent + handler.context_length, total_latent_frames)
+
+            # 获取该窗口的 yaw 范围
+            window_yaws = yaw_list[start_latent:end_latent]
+            if not window_yaws:
+                continue
+            yaw_min = min(window_yaws)
+            yaw_max = max(window_yaws)
+            target_yaw = window_yaws[0]
+
+            print(
+                f"[ContextWindows] 窗口{window_idx}: yaw_range=[{yaw_min:.1f}, {yaw_max:.1f}], "
+                f"target_yaw={target_yaw:.1f}"
+            )
+
+            # 需要多少像素帧来覆盖 prefix_latent_len 个 latent 帧
+            needed_pixel_frames = prefix_latent_len * 4 - 3
+
+            # 调用 ReferenceImageUtils 选择参考图
+            selected_batch, info_lines = ReferenceImageUtils.select_and_order(
+                window_reference_images, angle_map_list, window_yaws,
+                select_references=True,
+                allow_switch_main=allow_switch_main,
+                background_images=background_images,
+            )
+
+            # 打印前几行日志
+            for line in info_lines[:5]:
+                print(f"[ContextWindows] 窗口{window_idx}: {line}")
+
+            # 确保有足够的帧数
+            if selected_batch.shape[0] < needed_pixel_frames:
+                repeat_times = math.ceil(needed_pixel_frames / selected_batch.shape[0])
+                selected_batch = selected_batch.repeat(repeat_times, 1, 1, 1)[:needed_pixel_frames]
+                print(
+                    f"[ContextWindows] 窗口{window_idx}: 候选参考图不足, "
+                    f"已重复填充至 {needed_pixel_frames} 帧"
+                )
+            elif selected_batch.shape[0] > needed_pixel_frames:
+                selected_batch = selected_batch[:needed_pixel_frames]
+
+            # VAE 编码
+            encoded = vae.encode(selected_batch[:, :, :, :3])
+            handler.per_window_prefix_latents[window_idx] = encoded
+            print(
+                f"[ContextWindows] 窗口{window_idx}: 动态前缀已预计算, "
+                f"latent 形状={list(encoded.shape)}, 帧数={encoded.shape[2]}"
+            )
 
 
 # ==================== 注册 ====================
