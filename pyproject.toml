@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-customnodekit"
 description = "一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求"
-version = "1.0.0"
+version = "1.0.1"
 license = {text = "MIT"}
 readme = "README.md"
 
