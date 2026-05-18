@@ -328,8 +328,11 @@ class ReferenceImageSelector:
         # ==================== 3. 处理 yaw_angles 输入 ====================
         yaw_list = ReferenceImageUtils._flatten_yaw(yaw_angles)
 
-        if len(yaw_list) == 0:
-            info_lines.append("偏航角数据为空, 直接输出全部参考图 (1+4n)")
+        if len(yaw_list) <= 1:
+            if len(yaw_list) == 0:
+                info_lines.append("偏航角数据为空, 直接输出全部参考图 (1+4n)")
+            else:
+                info_lines.append("偏航角数据不足(仅1帧), 视为无效输入, 直接输出全部参考图 (1+4n)")
             result, _ = ReferenceImageUtils._build_batch_flat(total_ref_count, reference_images, info_lines, background_images)
             return (result, "\n".join(info_lines), raw_images, validated_angle_map)
 

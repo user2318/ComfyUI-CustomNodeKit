@@ -270,6 +270,9 @@ class KeypointDraw:
             if yaw_val >= 150.0 or yaw_val <= -150.0:
                 # 背对镜头: 所有四肢在底层, 头部在顶层
                 return "both", None
+            # 接近正对时（yaw 绝对值很小），强制为"both"，避免微小偏航角导致误分层
+            if abs(yaw_val) < 5.0:
+                return "both", None
             sign = 1 if yaw_val > 0 else (-1 if yaw_val < 0 else 0)
         else:
             if keypoints is not None and len(keypoints) >= 2:
@@ -295,14 +298,17 @@ class KeypointDraw:
         #       sign<0 = 左侧面朝镜头更多 → 左侧是前侧(top), 右侧是后侧(bottom)
         #       sign=0 = 正对 → 所有四肢在bottom按Y排序, top为空
         if sign > 0:
-            return "left", "right"    # 左后右前
+            return "left", "right"    # sign>0=面朝右→左侧=后侧(bottom), 右侧=前侧(top)
         elif sign < 0:
-            return "right", "left"    # 右后左前
+            return "right", "left"    # sign<0=面朝左→右侧=后侧(bottom), 左侧=前侧(top)
         else:
             return "both", None       # 正对: 所有在底层, 按Y排序
 
-    def _sort_limbs_by_y(self, indices, keypoints):
-        """按骨骼中点Y坐标升序排列（Y小=上方=先画，Y大=下方=后画=覆盖上方）"""
+    def _sort_limbs_by_y(self, indices, keypoints, reverse=False):
+        """按骨骼中点Y坐标排序。
+        默认升序（reverse=False）: Y小=上方=先画，Y大=下方=后画=覆盖上方。用于侧面分层绘制。
+        降序（reverse=True）: Y大=下方=先画，Y小=上方=后画=覆盖下方。用于正对时手臂覆盖腿。
+        """
         if not indices:
             return []
         y_mids = []
@@ -312,7 +318,7 @@ class KeypointDraw:
             p2 = keypoints[limb[1] - 1]
             y_mid = (p1[1] + p2[1]) / 2.0
             y_mids.append(y_mid)
-        sorted_pairs = sorted(zip(indices, y_mids), key=lambda x: x[1])
+        sorted_pairs = sorted(zip(indices, y_mids), key=lambda x: x[1], reverse=reverse)
         return [pair[0] for pair in sorted_pairs]
 
     # ---------- 辅助方法: 绘制单根骨骼 ----------
@@ -373,11 +379,47 @@ class KeypointDraw:
                 self.circle(canvas, (x,y), hand_point_size, (0,0,255))
 
     # ---------- 辅助方法: 绘制一组骨骼 ----------
-    def _draw_limb_group(self, canvas, limb_indices, keypoints, scores, threshold, stick_width):
-        """绘制一组骨骼, 先按Y排序后画"""
-        sorted_idx = self._sort_limbs_by_y(limb_indices, keypoints)
+    def _draw_limb_group(self, canvas, limb_indices, keypoints, scores, threshold, stick_width, reverse=False):
+        """绘制一组骨骼, 先按Y排序后画。reverse=True时Y降序（下方先画，上方后画）。"""
+        sorted_idx = self._sort_limbs_by_y(limb_indices, keypoints, reverse=reverse)
         for i in sorted_idx:
             self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width)
+
+    # ---------- 自适应臂腿覆盖规则 ----------
+    def _arms_cover_legs(self, yaw, keypoints):
+        """
+        判断臂是否应该覆盖腿（|偏航角| < 90°).
+        
+        有 yaw 输入时直接用 yaw 判定：
+            |yaw| < 90° → 臂覆盖腿（正面）
+            |yaw| > 90° → 腿覆盖臂（背面）
+        
+        无 yaw 输入时回退到肩宽/髋宽比估算偏航角：
+            - 偏正面时肩髋投影宽度大 → ratio > 0.25 → 臂覆盖腿
+            - 偏侧面时肩髋投影宽度小 → ratio <= 0.25 → 腿覆盖臂
+            - 特殊情况：肩宽 < 5像素或关键点不全时退化为 True（臂覆盖腿）
+        """
+        if yaw is not None:
+            return abs(yaw) < 90.0
+        
+        # 回退：基于肩宽/髋宽比估算偏航角
+        if keypoints is None or len(keypoints) < 18:
+            return True
+        # 肩宽
+        shoulder_span = abs(keypoints[2][0] - keypoints[5][0])
+        # 髋宽
+        hip_span = abs(keypoints[8][0] - keypoints[11][0])
+        # 颈到髋中点的Y距离
+        neck = keypoints[1]
+        hip_cy = (keypoints[8][1] + keypoints[11][1]) / 2.0
+        neck_hip_y = max(abs(neck[1] - hip_cy), 1.0)
+        
+        max_span = max(shoulder_span, hip_span)
+        # 如果肩宽太小说明关键点异常 → 默认臂覆盖腿
+        if max_span < 5.0:
+            return True
+        ratio = max_span / (neck_hip_y * 0.4)
+        return ratio > 0.25
 
     def draw_wholebody_keypoints(self, canvas, keypoints, scores=None, threshold=0.3,
                                  draw_body=True, draw_feet=True, draw_face=True, draw_hands=True,
@@ -406,14 +448,27 @@ class KeypointDraw:
         bottom_legs, bottom_arms, bottom_faces = get_limb_group(bottom_side)
         top_legs, top_arms, top_faces = get_limb_group(top_side)
 
+        # ---- 自适应臂腿覆盖规则 ----
+        arms_cover = self._arms_cover_legs(yaw, keypoints)
+
         # ======================================================
-        # Layer 0 (底层, 先画): 后侧腿 + 后侧手臂 + 后侧脸部骨骼 + 后侧手 + 后侧脚圆点 + 后侧眼
-        # 绘制顺序: 腿(先画) → 手臂(后画覆盖腿) → 脸部骨骼 → 手 → 脚 → 眼
+        # Layer 0 (底层, 先画): 后侧四肢 + 后侧脸部骨骼 + 后侧手 + 后侧脚圆点 + 后侧眼
         # ======================================================
         if draw_body and len(keypoints) >= 18:
-            # 先画腿（底层），再画手臂（覆盖腿）
-            self._draw_limb_group(canvas, bottom_legs, keypoints, scores, threshold, stick_width)
-            self._draw_limb_group(canvas, bottom_arms, keypoints, scores, threshold, stick_width)
+            if bottom_side == "both":
+                # 正对/背身: 保持现有 Y 降序模式
+                all_limbs = ALL_LEG_LIMBS + ALL_ARM_LIMBS
+                self._draw_limb_group(canvas, all_limbs, keypoints, scores, threshold, stick_width, reverse=True)
+            else:
+                # 侧面: 后侧四肢按自适应规则绘制
+                if arms_cover:
+                    # 臂覆盖腿：先画腿，再画臂
+                    self._draw_limb_group(canvas, bottom_legs, keypoints, scores, threshold, stick_width)
+                    self._draw_limb_group(canvas, bottom_arms, keypoints, scores, threshold, stick_width)
+                else:
+                    # 腿覆盖臂：先画臂，再画腿
+                    self._draw_limb_group(canvas, bottom_arms, keypoints, scores, threshold, stick_width)
+                    self._draw_limb_group(canvas, bottom_legs, keypoints, scores, threshold, stick_width)
             # 脸部骨骼(后侧)
             for i in bottom_faces:
                 self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width)
@@ -481,15 +536,27 @@ class KeypointDraw:
                     self.circle(canvas, (x,y), face_point_size, (255,255,255))
 
         # ======================================================
-        # Layer 2 (顶层, 后画): 前侧腿 + 前侧手臂 + 前侧脸部骨骼 + 前侧手 + 前侧脚 + 前侧眼
-        # 绘制顺序: 腿(先画) → 手臂(后画覆盖腿) → 脸部骨骼 → 手 → 脚 → 眼
+        # Layer 2 (顶层, 后画): 前侧四肢 + 前侧脸部骨骼 + 前侧手 + 前侧脚 + 前侧眼
         # ======================================================
         if draw_body and len(keypoints) >= 18:
-            # 先画腿（底层），再画手臂（覆盖腿）
-            self._draw_limb_group(canvas, top_legs, keypoints, scores, threshold, stick_width)
-            self._draw_limb_group(canvas, top_arms, keypoints, scores, threshold, stick_width)
-            for i in top_faces:
-                self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width)
+            if top_side is not None and top_side != "both":
+                # 侧面: 前侧四肢按自适应规则绘制
+                if arms_cover:
+                    # 臂覆盖腿：先画腿，再画臂
+                    self._draw_limb_group(canvas, top_legs, keypoints, scores, threshold, stick_width)
+                    self._draw_limb_group(canvas, top_arms, keypoints, scores, threshold, stick_width)
+                else:
+                    # 腿覆盖臂：先画臂，再画腿
+                    self._draw_limb_group(canvas, top_arms, keypoints, scores, threshold, stick_width)
+                    self._draw_limb_group(canvas, top_legs, keypoints, scores, threshold, stick_width)
+                for i in top_faces:
+                    self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width)
+            elif top_side == "both":
+                # 背对时全部在 Layer 0 已处理
+                pass
+            else:
+                # top_side is None（正对时）：无前侧四肢
+                pass
 
         # 前侧手
         if draw_hands:
@@ -1393,9 +1460,9 @@ def _wrap_to_180(angles):
 
 def _compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
                       nose_neck_thresh, smooth_window, enable_side_calib,
-                      shoulder_weight, head_body_diff_threshold, confirmation_frames,
+                      shoulder_weight,
                       ema_alpha, min_angle_limit, max_angle_limit,
-                      pose_keypoints_full=None,merge_threshold=30.0):
+                      pose_keypoints_full=None,merge_threshold=30.0, sign_window=25.0):
     IDX_NOSE = 0
     IDX_NECK = 1
     IDX_R_SHOULDER = 2
@@ -1502,8 +1569,6 @@ def _compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
     ema_delta_nose = 0.0
 
     last_valid_body_sign = 1
-    head_only_counter = 0
-    sign_locked = False
 
     hip_weight = 1.0 - shoulder_weight
     total_weight = shoulder_weight + hip_weight
@@ -1564,26 +1629,7 @@ def _compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
             else:
                 ema_delta_shldr, ema_delta_hip, ema_delta_nose = delta_shldr, delta_hip, delta_nose
 
-            diff = abs(ema_delta_nose - ema_delta_shldr)
-            is_head_independent = diff > head_body_diff_threshold
-
-            if is_head_independent:
-                head_only_counter += 1
-            else:
-                head_only_counter = 0
-
-            if head_only_counter >= confirmation_frames:
-                sign_locked = True
-            else:
-                sign_locked = False
-
-            candidate_sign = None
-            if nose_neck_x is not None and abs(nose_neck_x) >= nose_neck_thresh:
-                candidate_sign = 1 if nose_neck_x > 0 else -1
-
-            if not sign_locked and candidate_sign is not None:
-                last_valid_body_sign = candidate_sign
-
+            # ---- 先计算 body_base_deg 和 body_abs，供后续符号判定使用 ----
             def angle_from_diff(diff_corr, ref_width):
                 if diff_corr is None or ref_width <= 0:
                     return None
@@ -1610,12 +1656,21 @@ def _compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
             else:
                 body_base_deg = None
 
-            raw_yaw = None
             body_abs = body_base_deg if body_base_deg is not None else 0.0
+
+            # 符号判定（带 body_abs 窗口约束）：
+            # 仅当身体接近正对(≈0°)或接近背对(≈180°)时才允许符号更新
+            # body_abs 很大时，鼻子偏移可能只是头部转动而非全身转向
+            # sign_window 控制窗口大小，默认 25°
+            in_sign_window = (body_abs < sign_window or body_abs > 180.0 - sign_window)
+            if in_sign_window and nose_neck_x is not None and abs(nose_neck_x) >= nose_neck_thresh:
+                last_valid_body_sign = 1 if nose_neck_x > 0 else -1
+
+            raw_yaw = None
             if body_base_deg is not None:
                 if body_abs < 10.0 and nose_neck_x is not None and abs(nose_neck_x) < nose_neck_thresh:
                     raw_yaw = 0.0
-                    last_valid_body_sign = 1 if nose_neck_x > 0 else -1
+                    # 不更新 last_valid_body_sign：|nose_neck_x| 太小，信号不可靠
                 else:
                     sign = last_valid_body_sign
                     if shldr_corr is not None:
@@ -1633,8 +1688,7 @@ def _compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
             frame_person_yaws.append(raw_yaw)
             frame_rows.append((frame_idx, p_idx, shldr_x, hip_x, nose_neck_x,
                                cur_neck_hip, shldr_corr, hip_corr,
-                               ema_delta_shldr, ema_delta_nose, diff,
-                               is_head_independent, sign_locked,
+                               ema_delta_shldr, ema_delta_nose,
                                body_abs, last_valid_body_sign, raw_yaw,
                                body_change_rate, dynamic_limit))
 
@@ -1765,8 +1819,8 @@ def _compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
     header = (f"{'Frame':>5} {'Pers':>4} | "
               f"{'ShldrX':>7} {'HipX':>7} {'NoseNekX':>9} "
               f"{'NekHip':>7} {'CorShldr':>8} {'CorHip':>7} "
-              f"{'dShldr':>7} {'dNose':>7} {'Diff':>7} "
-              f"{'Indep':>5} {'Lock':>4} {'BodyCh':>7} {'DynLim':>7} "
+              f"{'dShldr':>7} {'dNose':>7} "
+              f"{'BodyCh':>7} {'DynLim':>7} "
               f"{'BodyAbs':>7} {'Sign':>4} {'RawYaw':>7} {'FiltYaw':>8} {'CumYaw':>8} {'FinalYaw':>9}")
     lines.append(header)
     lines.append("-" * len(header))
@@ -1774,8 +1828,8 @@ def _compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
     for frame_idx, frame_rows in enumerate(frames_data):
         for (f_idx, p_idx, shldr_x, hip_x, nose_neck_x,
              cur_neck_hip, shldr_corr, hip_corr,
-             d_shldr, d_nose, diff_ch,
-             is_indep, locked, body_abs, used_sign, raw_yaw,
+             d_shldr, d_nose,
+             body_abs, used_sign, raw_yaw,
              body_ch, dyn_lim) in frame_rows:
 
             filt_yaw = filt_yaws_wrapped[frame_idx] if frame_idx < len(filt_yaws_wrapped) else None
@@ -1788,13 +1842,12 @@ def _compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
                     return f"{val:{w}.2f}" if w <= 7 else f"{val:{w}.3f}"
                 return f"{str(val):>{w}}"
             def fmt_int(val, w=4): return f"{val:{w}d}" if val is not None else " " * w
-            def fmt_bool(val, w=5): return f"{'True':>{w}}" if val else f"{'False':>{w}}"
 
             line = (f"{f_idx:5d} {p_idx:4d} | "
                     f"{fmt(shldr_x,7)} {fmt(hip_x,7)} {fmt(nose_neck_x,9)} "
                     f"{fmt(cur_neck_hip,7)} {fmt(shldr_corr,8)} {fmt(hip_corr,7)} "
-                    f"{fmt(d_shldr,7)} {fmt(d_nose,7)} {fmt(diff_ch,7)} "
-                    f"{fmt_bool(is_indep,5)} {fmt_bool(locked,4)} {fmt(body_ch,7)} {fmt(dyn_lim,7)} "
+                    f"{fmt(d_shldr,7)} {fmt(d_nose,7)} "
+                    f"{fmt(body_ch,7)} {fmt(dyn_lim,7)} "
                     f"{fmt(body_abs,7)} {fmt_int(used_sign,4)} "
                     f"{fmt(raw_yaw,7)} {fmt(filt_yaw,8)} {fmt(cum_yaw,8)} {fmt(final_yaw,9)}")
             lines.append(line)
@@ -1832,8 +1885,6 @@ class SDPoseEstimateYawSimple:
         nose_neck_thresh = 3.0
         smooth_window = 3
         enable_side_calib = True
-        head_body_diff_threshold = 0.05
-        confirmation_frames = 2
         ema_alpha = 0.4
         min_angle_limit = 1.0
         max_angle_limit = 60.0
@@ -1841,7 +1892,7 @@ class SDPoseEstimateYawSimple:
         return _compute_yaw_core(
             pose_keypoints_segment, conf_threshold, unwrap_angle,
             nose_neck_thresh, smooth_window, enable_side_calib,
-            shoulder_weight, head_body_diff_threshold, confirmation_frames,
+            shoulder_weight,
             ema_alpha, min_angle_limit, max_angle_limit,
             pose_keypoints_full,
             merge_threshold=30.0
@@ -1864,8 +1915,6 @@ class SDPoseEstimateYawAdvanced:
                 "smooth_window": ("INT", {"default": 3, "min": 0, "max": 10, "step": 1}),
                 "enable_side_calib": ("BOOLEAN", {"default": True}),
                 "shoulder_weight": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "head_body_diff_threshold": ("FLOAT", {"default": 0.05, "min": 0.01, "max": 0.3, "step": 0.01}),
-                "confirmation_frames": ("INT", {"default": 2, "min": 1, "max": 5, "step": 1}),
                 "ema_alpha": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "min_angle_limit": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 30.0, "step": 1.0}),
                 "max_angle_limit": ("FLOAT", {"default": 60.0, "min": 20.0, "max": 120.0, "step": 5.0}),
@@ -1886,14 +1935,14 @@ class SDPoseEstimateYawAdvanced:
 
     def calculate_yaw(self, pose_keypoints_segment, conf_threshold, unwrap_angle,
                       nose_neck_thresh, smooth_window, enable_side_calib,
-                      shoulder_weight, head_body_diff_threshold, confirmation_frames,
+                      shoulder_weight,
                       ema_alpha, min_angle_limit, max_angle_limit,
                       coverage_merge_threshold=30.0,
                       pose_keypoints_full=None):
         return _compute_yaw_core(
             pose_keypoints_segment, conf_threshold, unwrap_angle,
             nose_neck_thresh, smooth_window, enable_side_calib,
-            shoulder_weight, head_body_diff_threshold, confirmation_frames,
+            shoulder_weight,
             ema_alpha, min_angle_limit, max_angle_limit,
             pose_keypoints_full,
             merge_threshold=coverage_merge_threshold

@@ -32,7 +32,7 @@ class WanAnimateToVideoCustom:
                 "continue_motion_max_frames": ("INT", {"default": 5, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 1}),
                 "video_frame_offset": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),
                 "transition_width": ("INT", {"default": 0, "min": 0, "max": 128, "step": 4}),
-                "mode": (["fix", "legacy"], {"default": "legacy"}),
+                "mode": (["fix", "legacy", "vanilla"], {"default": "vanilla"}),
                 "tail_frame_count": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
                 "tail_start_strength": ("FLOAT", {"default": 0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "tail_end_strength": ("FLOAT", {"default": 0, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -212,76 +212,83 @@ class WanAnimateToVideoCustom:
                                      device=concat_latent_image.device, dtype=concat_latent_image.dtype)
         if continue_motion is not None:
             N = continue_motion.shape[0]
-            is_black = (continue_motion.abs().max(dim=-1)[0].max(dim=-1)[0].max(dim=-1)[0] < 1e-6)
-            binary_mask = is_black.float()
-            float_mask = binary_mask.clone().float()
 
-            if mode == "fix" and transition_width > 0:
-                trans = transition_width
-                black_regions = []
-                i = 0
-                while i < N:
-                    if is_black[i]:
-                        start = i
-                        while i < N and is_black[i]:
+            if mode == "vanilla":
+                # vanilla 模式：完全复刻官方行为，无条件 mask=0
+                ref_motion_latent_length = ((N - 1) // 4) + 1
+                mask_refmotion[:, :, :ref_motion_latent_length * 4, :, :] = 0.0
+            else:
+                # fix / legacy 模式：保留自定义的黑帧检测和尾帧处理
+                is_black = (continue_motion.abs().max(dim=-1)[0].max(dim=-1)[0].max(dim=-1)[0] < 1e-6)
+                binary_mask = is_black.float()
+                float_mask = binary_mask.clone().float()
+
+                if mode == "fix" and transition_width > 0:
+                    trans = transition_width
+                    black_regions = []
+                    i = 0
+                    while i < N:
+                        if is_black[i]:
+                            start = i
+                            while i < N and is_black[i]:
+                                i += 1
+                            end = i - 1
+                            black_regions.append((start, end))
+                        else:
                             i += 1
-                        end = i - 1
-                        black_regions.append((start, end))
-                    else:
-                        i += 1
 
-                for start, end in black_regions:
-                    left_start = max(0, start - trans)
-                    left_end = start - 1
-                    for j in range(left_start, left_end + 1):
-                        dist = start - j
-                        value = max(0.0, 1.0 - (dist - 1) / trans)
-                        float_mask[j] = max(float_mask[j], value)
+                    for start, end in black_regions:
+                        left_start = max(0, start - trans)
+                        left_end = start - 1
+                        for j in range(left_start, left_end + 1):
+                            dist = start - j
+                            value = max(0.0, 1.0 - (dist - 1) / trans)
+                            float_mask[j] = max(float_mask[j], value)
 
-                    right_start = end + 1
-                    right_end = min(N - 1, end + trans)
-                    for j in range(right_start, right_end + 1):
-                        dist = j - end
-                        value = max(0.0, 1.0 - (dist - 1) / trans)
-                        float_mask[j] = max(float_mask[j], value)
+                        right_start = end + 1
+                        right_end = min(N - 1, end + trans)
+                        for j in range(right_start, right_end + 1):
+                            dist = j - end
+                            value = max(0.0, 1.0 - (dist - 1) / trans)
+                            float_mask[j] = max(float_mask[j], value)
 
-                # fix 模式：纯黑帧硬替换为中性灰
-                for i in range(N):
-                    if binary_mask[i] == 1:
-                        image[i] = 0.5
+                    # fix 模式：纯黑帧硬替换为中性灰
+                    for i in range(N):
+                        if binary_mask[i] == 1:
+                            image[i] = 0.5
 
-            if mode == "legacy" and tail_frame_count > 0:
-                tail_len = min(tail_frame_count, N)
-                if tail_len > 0:
-                    use_mid = (mid_frame >= 1 and mid_frame <= tail_len)
-                    if use_mid:
-                        mid_idx = mid_frame - 1
-                        strengths_first = torch.linspace(tail_start_strength, mid_strength, mid_idx + 1, device=float_mask.device)
-                        strengths_second = torch.linspace(mid_strength, tail_end_strength, tail_len - mid_idx, device=float_mask.device)
-                        strengths = torch.cat([strengths_first, strengths_second[1:]])
-                        logging.info("[legacy模式] 使用中间帧锚点：第%d帧强度=%.2f，尾帧强度序列长度=%d", mid_frame, mid_strength, tail_len)
-                    else:
-                        strengths = torch.linspace(tail_start_strength, tail_end_strength, tail_len, device=float_mask.device)
-                        logging.info("[legacy模式] 未启用中间帧锚点，使用线性插值")
+                if mode == "legacy" and tail_frame_count > 0:
+                    tail_len = min(tail_frame_count, N)
+                    if tail_len > 0:
+                        use_mid = (mid_frame >= 1 and mid_frame <= tail_len)
+                        if use_mid:
+                            mid_idx = mid_frame - 1
+                            strengths_first = torch.linspace(tail_start_strength, mid_strength, mid_idx + 1, device=float_mask.device)
+                            strengths_second = torch.linspace(mid_strength, tail_end_strength, tail_len - mid_idx, device=float_mask.device)
+                            strengths = torch.cat([strengths_first, strengths_second[1:]])
+                            logging.info("[legacy模式] 使用中间帧锚点：第%d帧强度=%.2f，尾帧强度序列长度=%d", mid_frame, mid_strength, tail_len)
+                        else:
+                            strengths = torch.linspace(tail_start_strength, tail_end_strength, tail_len, device=float_mask.device)
+                            logging.info("[legacy模式] 未启用中间帧锚点，使用线性插值")
 
-                    for i in range(tail_len):
-                        frame_idx = N - tail_len + i
-                        float_mask[frame_idx] = max(float_mask[frame_idx].item(), strengths[i].item())
+                        for i in range(tail_len):
+                            frame_idx = N - tail_len + i
+                            float_mask[frame_idx] = max(float_mask[frame_idx].item(), strengths[i].item())
 
-                    if neutral_mix_min != 0.0 or neutral_mix_max != 1.0:
-                        logging.info("[legacy模式] 中性灰混合比例范围：掩码0时=%.2f, 掩码1时=%.2f", neutral_mix_min, neutral_mix_max)
-                    for i in range(tail_len):
-                        frame_idx = N - tail_len + i
-                        mask_strength = strengths[i].item()
-                        mix_alpha = neutral_mix_min + (neutral_mix_max - neutral_mix_min) * mask_strength
-                        if mix_alpha > 0:
-                            original = image[frame_idx]
-                            neutral = torch.full_like(original, 0.5)
-                            image[frame_idx] = original * (1 - mix_alpha) + neutral * mix_alpha
+                        if neutral_mix_min != 0.0 or neutral_mix_max != 1.0:
+                            logging.info("[legacy模式] 中性灰混合比例范围：掩码0时=%.2f, 掩码1时=%.2f", neutral_mix_min, neutral_mix_max)
+                        for i in range(tail_len):
+                            frame_idx = N - tail_len + i
+                            mask_strength = strengths[i].item()
+                            mix_alpha = neutral_mix_min + (neutral_mix_max - neutral_mix_min) * mask_strength
+                            if mix_alpha > 0:
+                                original = image[frame_idx]
+                                neutral = torch.full_like(original, 0.5)
+                                image[frame_idx] = original * (1 - mix_alpha) + neutral * mix_alpha
 
-            float_mask = float_mask.to(device=concat_latent_image.device)
-            expanded_float_mask = float_mask.view(1, 1, N, 1, 1)
-            mask_refmotion[:, :, :N, :, :] = expanded_float_mask
+                float_mask = float_mask.to(device=concat_latent_image.device)
+                expanded_float_mask = float_mask.view(1, 1, N, 1, 1)
+                mask_refmotion[:, :, :N, :, :] = expanded_float_mask
 
         # ----- character_mask 处理 -----
         if character_mask is not None:
