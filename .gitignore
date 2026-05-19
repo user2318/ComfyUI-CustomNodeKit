@@ -27,3 +27,6 @@ Thumbs.db
 
 # clinerules
 .clinerules
+
+# local distribution folder (not for upload)
+local/
