@@ -2,7 +2,7 @@
 [project]
 name = "comfyui-customnodekit" # Unique identifier for your node. Immutable after creation.
 description = "A custom node toolkit for ComfyUI covering video generation, pose processing, interactive image operations and common workflow needs. 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。"
-version = "1.0.7" # Custom Node version. Must be semantically versioned.
+version = "1.0.8" # Custom Node version. Must be semantically versioned.
 license = { text = "MIT" }
 dependencies = ["tqdm>=4.65.0", "imageio-ffmpeg>=0.5.0"]
 
