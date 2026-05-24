@@ -26,6 +26,30 @@ HAND_EDGES = [
     [0,17],[17,18],[18,19],[19,20]
 ]
 
+# 标准 DWPose/OpenPose 配色（与 comfyui_controlnet_aux 和 BodyRatioMapper 一致）
+STANDARD_BODY_COLORS = [
+    [255,   0,   0],  # limb  0 右肩 (颈→右肩)
+    [255,  85,   0],  # limb  1 左肩 (颈→左肩)
+    [255, 170,   0],  # limb  2 右肘 (右肩→右肘)
+    [255, 255,   0],  # limb  3 右腕 (右肘→右腕)
+    [170, 255,   0],  # limb  4 左肘 (左肩→左肘)
+    [ 85, 255,   0],  # limb  5 左腕 (左肘→左腕)
+    [  0, 255,   0],  # limb  6 右髋 (颈→右髋)
+    [  0, 255,  85],  # limb  7 右膝 (右髋→右膝)
+    [  0, 255, 170],  # limb  8 右踝 (右膝→右踝)
+    [  0, 255, 255],  # limb  9 左髋 (颈→左髋)
+    [  0, 170, 255],  # limb 10 左膝 (左髋→左膝)
+    [  0,  85, 255],  # limb 11 左踝 (左膝→左踝)
+    [  0,   0, 255],  # limb 12 颈→鼻
+    [ 85,   0, 255],  # limb 13 鼻→右眼
+    [170,   0, 255],  # limb 14 右眼→右耳
+    [255,   0, 255],  # limb 15 鼻→左眼
+    [255,   0, 170],  # limb 16 左眼→左耳
+]
+
+# 单色骨骼模式下的统一颜色（灰色）
+MONOCHROME_LIMB_COLOR = [128, 128, 128]
+
 # 新配色方案 V4：灰度兼容版 + 同侧同肢体内部区分
 BODY_COLORS = [
     [145, 60, 35],     #  0 右臂上段·颈→右肩       L≈78  [右暗·臂]
@@ -286,8 +310,18 @@ class KeypointDraw:
         sorted_pairs = sorted(zip(indices, y_mids), key=lambda x: x[1], reverse=reverse)
         return [pair[0] for pair in sorted_pairs]
 
+    @staticmethod
+    def _get_limb_color(limb_idx, color_scheme="v4_custom"):
+        """根据配色方案返回骨骼颜色。"""
+        if color_scheme == "monochrome":
+            return MONOCHROME_LIMB_COLOR
+        elif color_scheme == "standard":
+            return STANDARD_BODY_COLORS[limb_idx % len(STANDARD_BODY_COLORS)]
+        else:  # "v4_custom"
+            return BODY_COLORS[limb_idx % len(BODY_COLORS)]
+
     # ---------- 辅助方法: 绘制单根骨骼 ----------
-    def _draw_single_limb(self, canvas, limb_idx, keypoints, scores, threshold, stick_width):
+    def _draw_single_limb(self, canvas, limb_idx, keypoints, scores, threshold, stick_width, color_scheme="v4_custom"):
         limb = DRAW_LIMBS[limb_idx]
         idx1, idx2 = limb[0]-1, limb[1]-1
         if scores is not None and (scores[idx1] < threshold or scores[idx2] < threshold):
@@ -303,10 +337,11 @@ class KeypointDraw:
             return
         angle = math.degrees(math.atan2(X[0]-X[1], Y[0]-Y[1]))
         polygon = self.ellipse2Poly((int(mY), int(mX)), (int(length/2), stick_width), int(angle), 0, 360, 1)
-        self.fillConvexPoly(canvas, polygon, BODY_COLORS[limb_idx % len(BODY_COLORS)])
+        color = self._get_limb_color(limb_idx, color_scheme)
+        self.fillConvexPoly(canvas, polygon, color)
 
     # ---------- 辅助方法: 绘制手部(指定索引范围) ----------
-    def _draw_hands_range(self, canvas, keypoints, scores, threshold, hand_start, hand_end, hand_point_size, eps, W, H, hand_scale=1.0):
+    def _draw_hands_range(self, canvas, keypoints, scores, threshold, hand_start, hand_end, hand_point_size, eps, W, H, hand_scale=1.0, color_scheme="v4_custom"):
         """绘制指定索引范围的手部骨骼和圆点。hand_scale 控制手部缩放（1.0=原始大小），手腕点保持不动。"""
         if len(keypoints) < hand_end:
             return
@@ -333,8 +368,11 @@ class KeypointDraw:
             x1,y1 = int(scaled_kps[idx1][0]), int(scaled_kps[idx1][1])
             x2,y2 = int(scaled_kps[idx2][0]), int(scaled_kps[idx2][1])
             if x1>eps and y1>eps and x2>eps and y2>eps and 0<=x1<W and 0<=y1<H and 0<=x2<W and 0<=y2<H:
-                r,g,b = colorsys.hsv_to_rgb(ie/len(HAND_EDGES), 1.0, 1.0)
-                color = (int(r*255), int(g*255), int(b*255))
+                if color_scheme == "monochrome":
+                    color = MONOCHROME_LIMB_COLOR
+                else:
+                    r,g,b = colorsys.hsv_to_rgb(ie/len(HAND_EDGES), 1.0, 1.0)
+                    color = (int(r*255), int(g*255), int(b*255))
                 self.line(canvas, (x1,y1), (x2,y2), color, thickness=2)
         for i in range(hand_start, hand_end):
             if scores is not None and i < len(scores) and scores[i] < threshold:
@@ -344,11 +382,11 @@ class KeypointDraw:
                 self.circle(canvas, (x,y), hand_point_size, (0,0,255))
 
     # ---------- 辅助方法: 绘制一组骨骼 ----------
-    def _draw_limb_group(self, canvas, limb_indices, keypoints, scores, threshold, stick_width, reverse=False):
+    def _draw_limb_group(self, canvas, limb_indices, keypoints, scores, threshold, stick_width, reverse=False, color_scheme="v4_custom"):
         """绘制一组骨骼, 先按Y排序后画。reverse=True时Y降序（下方先画，上方后画）。"""
         sorted_idx = self._sort_limbs_by_y(limb_indices, keypoints, reverse=reverse)
         for i in sorted_idx:
-            self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width)
+            self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
 
     # ---------- 自适应臂腿覆盖规则 ----------
     def _arms_cover_legs(self, yaw, keypoints):
@@ -376,7 +414,7 @@ class KeypointDraw:
     def draw_wholebody_keypoints(self, canvas, keypoints, scores=None, threshold=0.3,
                                  draw_body=True, draw_feet=True, draw_face=True, draw_hands=True,
                                  stick_width=4, face_point_size=3, hand_point_size=4,
-                                 yaw=None, hand_scale=1.0):
+                                 yaw=None, hand_scale=1.0, color_scheme="v4_custom"):
         H, W = canvas.shape[:2]
         eps = 0.01
 
@@ -410,32 +448,32 @@ class KeypointDraw:
             if bottom_side == "both":
                 # 正对/背身: 保持现有 Y 降序模式
                 all_limbs = ALL_LEG_LIMBS + ALL_ARM_LIMBS
-                self._draw_limb_group(canvas, all_limbs, keypoints, scores, threshold, stick_width, reverse=True)
+                self._draw_limb_group(canvas, all_limbs, keypoints, scores, threshold, stick_width, reverse=True, color_scheme=color_scheme)
             else:
                 # 侧面: 后侧四肢按自适应规则绘制
                 if arms_cover:
                     # 臂覆盖腿：先画腿，再画臂
-                    self._draw_limb_group(canvas, bottom_legs, keypoints, scores, threshold, stick_width)
-                    self._draw_limb_group(canvas, bottom_arms, keypoints, scores, threshold, stick_width)
+                    self._draw_limb_group(canvas, bottom_legs, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
+                    self._draw_limb_group(canvas, bottom_arms, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
                 else:
                     # 腿覆盖臂：先画臂，再画腿
-                    self._draw_limb_group(canvas, bottom_arms, keypoints, scores, threshold, stick_width)
-                    self._draw_limb_group(canvas, bottom_legs, keypoints, scores, threshold, stick_width)
+                    self._draw_limb_group(canvas, bottom_arms, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
+                    self._draw_limb_group(canvas, bottom_legs, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
             # 脸部骨骼(后侧)
             for i in bottom_faces:
-                self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width)
+                self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
 
         # 后侧手
         if draw_hands:
             if bottom_side == "left" and len(keypoints) >= 134:
-                self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H, hand_scale)
+                self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H, hand_scale, color_scheme=color_scheme)
             elif bottom_side == "right" and len(keypoints) >= 113:
-                self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H, hand_scale)
+                self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H, hand_scale, color_scheme=color_scheme)
             elif bottom_side == "both":
                 if len(keypoints) >= 113:
-                    self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H, hand_scale)
+                    self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H, hand_scale, color_scheme=color_scheme)
                 if len(keypoints) >= 134:
-                    self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H, hand_scale)
+                    self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H, hand_scale, color_scheme=color_scheme)
 
         # 后侧脚
         if draw_feet and len(keypoints) >= 24:
@@ -473,7 +511,7 @@ class KeypointDraw:
         # Layer 1 (中层): 颈→鼻骨骼 + 身体中线关键点圆点 + 面部其余点
         # ======================================================
         if draw_body and len(keypoints) >= 18:
-            self._draw_single_limb(canvas, 12, keypoints, scores, threshold, stick_width)
+            self._draw_single_limb(canvas, 12, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
 
         # 面部其余点 (轮廓 0-16、眉毛 17-26、鼻子 27-35、嘴唇 48-67、瞳孔 68-69)
         # 映射到 keypoints: 24 + face_idx
@@ -494,14 +532,14 @@ class KeypointDraw:
                 # 侧面: 前侧四肢按自适应规则绘制
                 if arms_cover:
                     # 臂覆盖腿：先画腿，再画臂
-                    self._draw_limb_group(canvas, top_legs, keypoints, scores, threshold, stick_width)
-                    self._draw_limb_group(canvas, top_arms, keypoints, scores, threshold, stick_width)
+                    self._draw_limb_group(canvas, top_legs, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
+                    self._draw_limb_group(canvas, top_arms, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
                 else:
                     # 腿覆盖臂：先画臂，再画腿
-                    self._draw_limb_group(canvas, top_arms, keypoints, scores, threshold, stick_width)
-                    self._draw_limb_group(canvas, top_legs, keypoints, scores, threshold, stick_width)
+                    self._draw_limb_group(canvas, top_arms, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
+                    self._draw_limb_group(canvas, top_legs, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
                 for i in top_faces:
-                    self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width)
+                    self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
             elif top_side == "both":
                 # 背对时全部在 Layer 0 已处理
                 pass
@@ -512,9 +550,9 @@ class KeypointDraw:
         # 前侧手
         if draw_hands:
             if top_side == "left" and len(keypoints) >= 134:
-                self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H, hand_scale)
+                self._draw_hands_range(canvas, keypoints, scores, threshold, 113, 134, hand_point_size, eps, W, H, hand_scale, color_scheme=color_scheme)
             elif top_side == "right" and len(keypoints) >= 113:
-                self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H, hand_scale)
+                self._draw_hands_range(canvas, keypoints, scores, threshold, 92, 113, hand_point_size, eps, W, H, hand_scale, color_scheme=color_scheme)
 
         # 前侧脚
         if draw_feet and len(keypoints) >= 24:

@@ -521,6 +521,7 @@ class SDPoseDrawKeypointsV2:
                 "mouth_mode": (["draw_all", "no_draw", "inner_lip_only"], {"default": "draw_all"}),
                 "enable_yaw_thickness": ("BOOLEAN", {"default": False, "tooltip": "开启后根据偏航角动态调整骨骼粗细：正面(0°/±180°)最粗，侧面(±90°)最细"}),
                 "yaw_thickness_min": ("INT", {"default": 1, "min": 1, "max": 20, "step": 1, "tooltip": "侧面(±90°)时的最细粗细，自动受 stick_width 约束（不会高于 stick_width）"}),
+                "color_scheme": (["v4_custom", "standard", "monochrome"], {"default": "v4_custom", "tooltip": "骨骼配色方案：v4_custom=自定义V4方案(默认), standard=标准OpenPose彩虹配色, monochrome=统一灰色"}),
             },
             "optional": {
                 "yaw_angles": ("FLOAT", { "tooltip": "来自 SDPoseEstimateYawSimple/Advanced 的 yaw_array，用于动态调整骨骼粗细和遮挡顺序" }),
@@ -539,7 +540,8 @@ class SDPoseDrawKeypointsV2:
              enable_yaw_thickness=False,
              yaw_thickness_min=1,
              yaw_angles=None,
-             hand_scale=1.0):
+             hand_scale=1.0,
+             color_scheme="v4_custom"):
         if not keypoints:
             return (torch.zeros((1, 64, 64, 3), dtype=torch.float32),)
 
@@ -603,7 +605,8 @@ class SDPoseDrawKeypointsV2:
                     face_point_size=face_point_size,
                     hand_point_size=hand_point_size,
                     yaw=cur_yaw,
-                    hand_scale=hand_scale
+                    hand_scale=hand_scale,
+                    color_scheme=color_scheme
                 )
 
             pose_outputs.append(canvas)
