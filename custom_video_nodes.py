@@ -16,11 +16,35 @@ BASE_DIR = folder_paths.base_path
 
 
 def resolve_path(path: str) -> str:
-    """将输入路径转换为绝对路径（相对于 ComfyUI 根目录）"""
-    if os.path.isabs(path):
-        return os.path.normpath(path)
+    """将输入路径转换为绝对路径（相对于 ComfyUI 根目录）
+    
+    安全措施：
+    - 对空路径进行检测
+    - 对路径遍历攻击（如 ../../etc/passwd）进行检测和拦截
+    """
+    if not path or not path.strip():
+        raise ValueError("路径不能为空")
+    
+    norm_path = os.path.normpath(path.strip())
+    
+    # 路径遍历攻击检测：检查规范化后的路径是否试图逃逸预期范围
+    # 绝对路径：检查是否存在 ./.. 或 /.. 等明显遍历模式
+    if os.path.isabs(norm_path):
+        # 对绝对路径，检查是否有非法字符（如空字节）
+        if '\0' in norm_path:
+            raise ValueError(f"路径包含非法字符: {path!r}")
+        return norm_path
     else:
-        return os.path.normpath(os.path.join(BASE_DIR, path))
+        resolved = os.path.normpath(os.path.join(BASE_DIR, norm_path))
+        # 检查相对路径是否通过 .. 逃逸到了 BASE_DIR 之外
+        # 注意：这只适用于相对路径场景；绝对路径场景由用户自己负责
+        common_prefix = os.path.commonpath([resolved, BASE_DIR])
+        if common_prefix != BASE_DIR:
+            logging.warning(f"[Security] 路径遍历攻击检测已拒绝: {path!r} -> {resolved}")
+            raise PermissionError(f"路径越权访问: {path}")
+        if '\0' in resolved:
+            raise ValueError(f"路径包含非法字符: {path!r}")
+        return resolved
 
 
 def get_video_info(file_path: str) -> Tuple[float, float]:

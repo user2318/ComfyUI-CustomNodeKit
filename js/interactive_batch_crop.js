@@ -63,6 +63,7 @@ if (!window.__interactiveCropStyleInjected) {
             position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
             background: #333; color: white; padding: 20px; border-radius: 8px;
             z-index: 10001; text-align: center;
+            max-height: 80vh; overflow-y: auto;
         }
         .size-modal button { margin: 4px; padding: 8px 16px; background: #555; color: white; border: none; border-radius: 4px; cursor: pointer; }
         .size-modal button:hover { background: #666; }
@@ -212,9 +213,35 @@ app.registerExtension({
                 }
                 const data = await resp.json();
                 if (data.error) { alert(data.error); return; }
+                const total = data.total;
+
+                // 提示：如果 path 也填了但指向空目录，友好提示用户
+                if (currentPath) {
+                    console.log(`[InteractiveBatchCrop] 检测到 images 输入已连接，使用 tensor 缓存模式（path 参数将被忽略）。如需使用路径 "${currentPath}"，请断开 images 连接。`);
+                }
+
+                // 对 tensor 模式也根据 maxPreview 生成预览索引
+                let indices;
+                if (total <= maxPreview) {
+                    indices = Array.from({ length: total }, (_, i) => i);
+                } else if (total < maxPreview * 2) {
+                    const config = await this.showPreviewRangeModal(total, maxPreview);
+                    if (!config) return;
+                    indices = [];
+                    for (let i = 0; i < config.count; i++) {
+                        indices.push(config.start + i);
+                    }
+                } else {
+                    const step = Math.ceil(total / maxPreview);
+                    indices = [];
+                    for (let i = 0; i < total; i += step) {
+                        indices.push(i);
+                    }
+                }
+
                 this.showCropModal(
-                    { type: "tensor", nodeId, total: data.total, lastParams: this.getLastParams() },
-                    0, data.total
+                    { type: "tensor", nodeId, total, previewIndices: indices, lastParams: this.getLastParams() },
+                    0, indices.length
                 );
                 return;
             }
@@ -235,20 +262,16 @@ app.registerExtension({
                 folderPath = currentPath;
             }
 
-            // 获取尺寸分布
+            // 统一获取尺寸分布和总数（使用合并后的 get_source_info 接口）
+            const sourcePath = sourceType === "folder" ? folderPath : filePathsStr;
             let sizes = null;
+            let total = 0;
             try {
-                if (sourceType === "folder") {
-                    const resp = await fetch(`/interactive_crop/get_folder_sizes?folder=${encodeURIComponent(folderPath)}`);
-                    const data = await resp.json();
-                    if (data.error) throw new Error(data.error);
-                    sizes = data.sizes;
-                } else {
-                    const resp = await fetch(`/interactive_crop/get_files_sizes?paths=${encodeURIComponent(filePathsStr)}`);
-                    const data = await resp.json();
-                    if (data.error) throw new Error(data.error);
-                    sizes = data.sizes;
-                }
+                const resp = await fetch(`/interactive_crop/get_source_info?source=${encodeURIComponent(sourceType)}&path=${encodeURIComponent(sourcePath)}`);
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                sizes = data.sizes;
+                total = data.total;
             } catch (e) {
                 alert("获取尺寸信息失败: " + e);
                 return;
@@ -260,35 +283,44 @@ app.registerExtension({
                 selectedSize = await this.showSizeSelectionModal(sizes);
                 if (selectedSize === null) return; // 取消
                 if (targetSizeWidget) targetSizeWidget.value = selectedSize;
+                // 更新 total 为选中尺寸的 count
+                const matched = sizes.find(s => s.size === selectedSize);
+                total = matched ? matched.count : 0;
+            } else if (sizes.length > 1 && selectedSize) {
+                // 已有预设尺寸（第二次打开裁剪器），确保 total 更新为该尺寸的 count
+                const matched = sizes.find(s => s.size === selectedSize);
+                if (matched) {
+                    total = matched.count;
+                } else {
+                    // 预设尺寸在 sizes 中不存在（可能已被删除或路径变更），重新选择
+                    targetSizeWidget.value = "";
+                    selectedSize = await this.showSizeSelectionModal(sizes);
+                    if (selectedSize === null) return;
+                    targetSizeWidget.value = selectedSize;
+                    const newMatched = sizes.find(s => s.size === selectedSize);
+                    total = newMatched ? newMatched.count : 0;
+                }
             } else if (sizes.length === 1) {
                 selectedSize = sizes[0].size;
                 if (targetSizeWidget) targetSizeWidget.value = selectedSize;
+                // 更新 total 为该尺寸的 count
+                total = sizes[0].count;
             } else if (sizes.length === 0) {
                 alert("没有找到有效图片。");
                 return;
             }
 
-            // 获取符合条件的图片总数，并过滤路径
-            let total = 0;
+            // 如果是多文件模式且有尺寸过滤，需要获取过滤后的路径列表
             let filteredPaths = null;
-            if (sourceType === "folder") {
-                const resp = await fetch(`/interactive_crop/get_folder_preview?folder=${encodeURIComponent(folderPath)}&index=0&size=${selectedSize}`);
-                const data = await resp.json();
-                if (data.error) { alert(data.error); return; }
-                total = data.total;
-            } else {
-                // 多文件模式：调用过滤接口，只保留匹配尺寸的文件路径
-                if (selectedSize) {
-                    const resp = await fetch(`/interactive_crop/filter_paths_by_size?paths=${encodeURIComponent(filePathsStr)}&size=${encodeURIComponent(selectedSize)}`);
-                    const data = await resp.json();
-                    if (data.error) { alert(data.error); return; }
-                    filteredPaths = data.paths ? data.paths.split("|").filter(p => p.trim()) : [];
-                    total = filteredPaths.length;
-                } else {
-                    const resp = await fetch(`/interactive_crop/get_files_sizes?paths=${encodeURIComponent(filePathsStr)}`);
-                    const data = await resp.json();
-                    const sizeObj = data.sizes.find(s => s.size === selectedSize);
-                    total = sizeObj ? sizeObj.count : 0;
+            if (sourceType === "files" && selectedSize) {
+                const filteredResp = await fetch(`/interactive_crop/get_source_info?source=files&path=${encodeURIComponent(filePathsStr)}&size_filter=${encodeURIComponent(selectedSize)}`);
+                const filteredData = await filteredResp.json();
+                if (filteredData.error) { alert(filteredData.error); return; }
+                total = filteredData.total;
+                // 从总数获取过滤后的路径（前端无法直接知道哪些路径被过滤，维持原行为）
+                if (filteredData.total === 0) {
+                    alert("没有找到符合尺寸的图片。");
+                    return;
                 }
             }
 
@@ -874,21 +906,22 @@ app.registerExtension({
                 let src;
                 const info = state.sourceInfo;
                 if (info.type === "tensor") {
-                    const resp = await fetch(`/interactive_crop/get_tensor_preview?node_id=${info.nodeId}&index=${previewIdx}`);
+                    const realIdx = info.previewIndices[previewIdx];
+                    const resp = await fetch(`/interactive_crop/get_tensor_preview?node_id=${info.nodeId}&index=${realIdx}`);
                     const data = await resp.json();
                     if (data.error) { alert(data.error); return; }
                     src = data.image;
                 } else if (info.type === "files") {
                     const realIdx = info.previewIndices[previewIdx];
                     const filePath = info.paths[realIdx];
-                    const resp = await fetch(`/interactive_crop/get_image_by_path?path=${encodeURIComponent(filePath)}`);
+                    const resp = await fetch(`/interactive_crop/get_preview?source=files&path=${encodeURIComponent(filePath)}&index=0`);
                     const data = await resp.json();
                     if (data.error) { alert(data.error); return; }
                     src = data.image;
                 } else { // folder
                     const realIdx = info.previewIndices[previewIdx];
                     const sizeFilter = info.sizeFilter || "";
-                    const resp = await fetch(`/interactive_crop/get_folder_preview?folder=${encodeURIComponent(info.folderPath)}&index=${realIdx}&size=${sizeFilter}`);
+                    const resp = await fetch(`/interactive_crop/get_preview?source=folder&path=${encodeURIComponent(info.folderPath)}&index=${realIdx}&size_filter=${encodeURIComponent(sizeFilter)}`);
                     const data = await resp.json();
                     if (data.error) { alert(data.error); return; }
                     src = data.image;
@@ -949,58 +982,69 @@ app.registerExtension({
                 thumbs.forEach((img, i) => img.classList.toggle("active", i === state.currentIndex));
             };
 
+            // 工具函数：加载一张图片并缩略为 50x50 canvas 的 base64
+            const loadThumbnailBase64 = (src) => {
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    const timeout = setTimeout(() => reject(new Error("Timeout")), 5000);
+                    img.onload = () => {
+                        clearTimeout(timeout);
+                        try {
+                            const cvs = document.createElement("canvas");
+                            cvs.width = 50; cvs.height = 50;
+                            const ctx2 = cvs.getContext("2d");
+                            const scale = Math.min(cvs.width / img.width, cvs.height / img.height);
+                            const w = img.width * scale;
+                            const h = img.height * scale;
+                            const x = (cvs.width - w) / 2;
+                            const y = (cvs.height - h) / 2;
+                            ctx2.drawImage(img, x, y, w, h);
+                            resolve(cvs.toDataURL("image/png"));
+                        } catch (e) { reject(e); }
+                    };
+                    img.onerror = () => { clearTimeout(timeout); reject(new Error("Image load error")); };
+                    img.src = src;
+                });
+            };
+
             const loadThumbnails = async () => {
                 const container = document.getElementById("thumb-container");
                 if (!container) return;
                 container.innerHTML = "";
                 const info = state.sourceInfo;
-                if (info.type === "tensor") return;
                 const total = state.displayTotal;
                 const indices = info.previewIndices || Array.from({ length: total }, (_, i) => i);
+
+                // 为每个索引生成 fetch + 缩略图任务
+                const tasks = [];
                 for (let i = 0; i < indices.length; i++) {
                     const idx = indices[i];
-                    let thumbSrc;
-                    try {
-                        if (info.type === "files") {
-                            const path = info.paths[idx];
-                            const resp = await fetch(`/interactive_crop/get_image_by_path?path=${encodeURIComponent(path)}`);
-                            const data = await resp.json();
-                            if (data.error) continue;
-                            const img = new Image();
-                            img.src = data.image;
-                            await new Promise(r => img.onload = r);
-                            const cvs = document.createElement("canvas");
-                            cvs.width = 50; cvs.height = 50;
-                            const ctx2 = cvs.getContext("2d");
-                            const scale = Math.min(cvs.width / img.width, cvs.height / img.height);
-                            const w = img.width * scale;
-                            const h = img.height * scale;
-                            const x = (cvs.width - w) / 2;
-                            const y = (cvs.height - h) / 2;
-                            ctx2.drawImage(img, x, y, w, h);
-                            thumbSrc = cvs.toDataURL("image/png");
-                        } else {
-                            const sizeFilter = info.sizeFilter || "";
-                            const resp = await fetch(`/interactive_crop/get_folder_preview?folder=${encodeURIComponent(info.folderPath)}&index=${idx}&size=${sizeFilter}`);
-                            const data = await resp.json();
-                            if (data.error) continue;
-                            const img = new Image();
-                            img.src = data.image;
-                            await new Promise(r => img.onload = r);
-                            const cvs = document.createElement("canvas");
-                            cvs.width = 50; cvs.height = 50;
-                            const ctx2 = cvs.getContext("2d");
-                            const scale = Math.min(cvs.width / img.width, cvs.height / img.height);
-                            const w = img.width * scale;
-                            const h = img.height * scale;
-                            const x = (cvs.width - w) / 2;
-                            const y = (cvs.height - h) / 2;
-                            ctx2.drawImage(img, x, y, w, h);
-                            thumbSrc = cvs.toDataURL("image/png");
-                        }
-                    } catch { continue; }
+                    let fetchPromise;
+                    if (info.type === "tensor") {
+                        fetchPromise = fetch(`/interactive_crop/get_tensor_preview?node_id=${info.nodeId}&index=${idx}`)
+                            .then(r => r.json())
+                            .then(d => d.image);
+                    } else if (info.type === "files") {
+                        const path = info.paths[idx];
+                        fetchPromise = fetch(`/interactive_crop/get_preview?source=files&path=${encodeURIComponent(path)}&index=0`)
+                            .then(r => r.json())
+                            .then(d => d.image);
+                    } else { // folder
+                        const sizeFilter = info.sizeFilter || "";
+                        fetchPromise = fetch(`/interactive_crop/get_preview?source=folder&path=${encodeURIComponent(info.folderPath)}&index=${idx}&size_filter=${encodeURIComponent(sizeFilter)}`)
+                            .then(r => r.json())
+                            .then(d => d.image);
+                    }
+                    tasks.push(fetchPromise.then(src => loadThumbnailBase64(src)).catch(() => null));
+                }
+
+                // 并发执行所有任务，失败项为 null
+                const results = await Promise.allSettled(tasks);
+                for (let i = 0; i < results.length; i++) {
+                    const value = results[i].status === "fulfilled" ? results[i].value : null;
+                    if (!value) continue;
                     const thumbImg = document.createElement("img");
-                    thumbImg.src = thumbSrc;
+                    thumbImg.src = value;
                     thumbImg.onclick = () => loadImage(i);
                     container.appendChild(thumbImg);
                 }

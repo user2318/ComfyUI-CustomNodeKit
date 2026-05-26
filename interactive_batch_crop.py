@@ -3,7 +3,8 @@ import numpy as np
 import os
 import json
 import logging
-from collections import OrderedDict
+import time
+from collections import defaultdict, OrderedDict
 from PIL import Image, ImageColor
 from server import PromptServer
 from aiohttp import web
@@ -12,6 +13,40 @@ from aiohttp import web
 BATCH_SIZE = 32
 CACHE_MAX_SIZE = 50  # output_cache 最多保留 50 个节点的数据
 output_cache = OrderedDict()  # OrderedDict 实现 LRU 淘汰
+
+# ============= 安全工具 =============
+
+# 请求频率限制：防止路由被恶意高频调用
+_request_timestamps = defaultdict(list)  # IP -> [timestamp, ...]
+RATE_LIMIT_REQUESTS = 120   # 最大请求次数
+RATE_LIMIT_WINDOW = 60      # 时间窗口（秒）
+
+
+def _check_rate_limit(request) -> bool:
+    """检查请求是否超过频率限制，放行返回 True，拦截返回 False"""
+    ip = request.remote or "127.0.0.1"
+    now = time.time()
+    timestamps = _request_timestamps[ip]
+    # 清理过期记录
+    cutoff = now - RATE_LIMIT_WINDOW
+    _request_timestamps[ip] = [t for t in timestamps if t > cutoff]
+    if len(_request_timestamps[ip]) >= RATE_LIMIT_REQUESTS:
+        logging.warning(f"[Security] 请求频率限制已触发: {ip}")
+        return False
+    _request_timestamps[ip].append(now)
+    return True
+
+# 允许的图片格式白名单（用于格式验证）
+ALLOWED_IMAGE_FORMATS = {"PNG", "JPEG", "JPG", "WEBP", "BMP", "TIFF", "TIF"}
+
+
+def _validate_image_format(path: str) -> bool:
+    """验证文件是否为允许的图片格式"""
+    try:
+        with Image.open(path) as img:
+            return img.format is not None and img.format.upper() in ALLOWED_IMAGE_FORMATS
+    except Exception:
+        return False
 
 
 def _parse_fill_color(fill_color: str, device: torch.device):
@@ -256,117 +291,172 @@ class InteractiveBatchCrop:
             return (result,)
 
 
-# ============= 路由 =============
-@PromptServer.instance.routes.get("/interactive_crop/get_image_by_path")
-async def get_image_by_path(request):
-    import base64
-    from io import BytesIO
-    path = request.query.get("path")
-    if not path or not os.path.isfile(path):
-        return web.json_response({"error":"Invalid path"}, status=400)
-    try:
-        img = Image.open(path).convert("RGB")
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        return web.json_response({"image": f"data:image/png;base64,{b64}"})
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+# ============= 合并后的路由（2个统一入口替代原来的5个） =============
 
-@PromptServer.instance.routes.get("/interactive_crop/filter_paths_by_size")
-async def filter_paths_by_size(request):
-    paths_str = request.query.get("paths", "")
-    size = request.query.get("size", "")
-    if not paths_str or not size:
-        return web.json_response({"error": "Missing paths or size"}, status=400)
-    paths = [p.strip() for p in paths_str.split("|") if p.strip()]
-    w, h = map(int, size.split("x"))
-    filtered = []
-    for p in paths:
-        if os.path.isfile(p):
-            try:
-                with Image.open(p) as im:
-                    if im.size == (w, h):
-                        filtered.append(p)
-            except:
-                pass
-    paths_str = "|".join(filtered)
-    return web.json_response({"paths": paths_str, "count": len(filtered)})
+@PromptServer.instance.routes.get("/interactive_crop/get_source_info")
+async def get_source_info(request):
+    """
+    统一入口：获取文件源的尺寸分布和总数
+    合并自：get_folder_sizes / get_files_sizes（含 filter_paths_by_size 的统计部分）
+    
+    参数：
+        source: "folder" | "files"
+        path: 文件夹路径 或 以 | 分隔的文件路径列表
+        size_filter: 可选，只统计匹配尺寸（格式 "WxH"）
+    
+    返回：
+        { sizes: [{size: "WxH", count: N}, ...], total: N }
+    """
+    source = request.query.get("source", "folder")
+    path = request.query.get("path", "")
+    size_filter = request.query.get("size_filter", "")
 
+    # 安全检测：频率限制
+    if not _check_rate_limit(request):
+        return web.json_response({"error": "Too many requests"}, status=429)
 
-@PromptServer.instance.routes.get("/interactive_crop/get_folder_preview")
-async def get_folder_preview(request):
-    folder = request.query.get("folder")
-    index = int(request.query.get("index", "0"))
-    size = request.query.get("size", "")
-    if not folder or not os.path.isdir(folder):
-        return web.json_response({"error":"Invalid folder"}, status=400)
-    exts = ('.png','.jpg','.jpeg','.bmp','.webp')
-    files = sorted([f for f in os.listdir(folder) if f.lower().endswith(exts)])
-    paths = [os.path.join(folder, f) for f in files]
-    if size:
-        w, h = map(int, size.split("x"))
-        filtered = []
-        for p in paths:
-            if os.path.isfile(p):
-                try:
-                    with Image.open(p) as im:
-                        if im.size == (w, h):
-                            filtered.append(p)
-                except:
-                    pass
-        paths = filtered
-    if index < 0 or index >= len(paths):
-        return web.json_response({"error":"Index out of range"}, status=400)
-    from io import BytesIO
-    import base64
-    with Image.open(paths[index]) as img:
-        img_rgb = img.convert("RGB")
-        buf = BytesIO()
-        img_rgb.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
-    return web.json_response({"image": f"data:image/png;base64,{b64}", "total": len(paths)})
+    if not path:
+        return web.json_response({"error": "Missing path"}, status=400)
 
-@PromptServer.instance.routes.get("/interactive_crop/get_folder_sizes")
-async def get_folder_sizes(request):
-    folder = request.query.get("folder")
-    if not folder or not os.path.isdir(folder):
-        return web.json_response({"error":"Invalid folder"}, status=400)
-    exts = ('.png','.jpg','.jpeg','.bmp','.webp')
-    files = sorted([f for f in os.listdir(folder) if f.lower().endswith(exts)])
-    size_counts = {}
-    for f in files:
+    exts = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
+
+    if source == "folder":
+        if not os.path.isdir(path):
+            return web.json_response({"error": "Invalid folder"}, status=400)
         try:
-            with Image.open(os.path.join(folder, f)) as im:
-                s = f"{im.width}x{im.height}"
-                size_counts[s] = size_counts.get(s,0)+1
-        except:
-            pass
-    sizes = [{"size": s, "count": c} for s,c in size_counts.items()]
-    sizes.sort(key=lambda x: x["count"], reverse=True)
-    return web.json_response({"sizes": sizes})
+            files = sorted([f for f in os.listdir(path) if f.lower().endswith(exts)])
+        except Exception:
+            return web.json_response({"error": "Cannot read folder"}, status=400)
+        all_paths = [os.path.join(path, f) for f in files]
+    else:  # files
+        all_paths = [p.strip() for p in path.split("|") if p.strip()]
+        if not all_paths:
+            return web.json_response({"error": "No valid paths"}, status=400)
 
-@PromptServer.instance.routes.get("/interactive_crop/get_files_sizes")
-async def get_files_sizes(request):
-    paths_str = request.query.get("paths", "")
-    if not paths_str:
-        return web.json_response({"error":"No paths"}, status=400)
-    paths = [p.strip() for p in paths_str.split("|") if p.strip()]
+    # 统计尺寸分布
     size_counts = {}
-    for p in paths:
+    for p in all_paths:
         try:
             if os.path.isfile(p):
                 with Image.open(p) as im:
                     s = f"{im.width}x{im.height}"
-                    size_counts[s] = size_counts.get(s,0)+1
-        except:
+                    size_counts[s] = size_counts.get(s, 0) + 1
+        except Exception:
             pass
-    sizes = [{"size": s, "count": c} for s,c in size_counts.items()]
-    sizes.sort(key=lambda x: x["count"], reverse=True)
-    return web.json_response({"sizes": sizes})
 
+    sizes = [{"size": s, "count": c} for s, c in size_counts.items()]
+    sizes.sort(key=lambda x: x["count"], reverse=True)
+
+    total = sum(c for _, c in size_counts.items())
+    if size_filter:
+        total = size_counts.get(size_filter, 0)
+
+    return web.json_response({"sizes": sizes, "total": total})
+
+
+@PromptServer.instance.routes.get("/interactive_crop/get_preview")
+async def get_preview(request):
+    """
+    统一入口：获取指定索引的图片预览（base64）
+    合并自：get_image_by_path / get_folder_preview / filter_paths_by_size（预览部分）
+
+    参数：
+        source: "folder" | "files" | "tensor"
+        path:  文件夹路径 或 |分隔的文件列表（tensor 模式不需要）
+        index: 图片索引（默认 0）
+        size_filter: 可选，文件夹模式只匹配指定尺寸
+        node_id: tensor 模式需要
+
+    返回：
+        { image: "data:image/png;base64,...", total: N }
+    """
+    source = request.query.get("source", "folder")
+    path = request.query.get("path", "")
+    index = int(request.query.get("index", "0"))
+    size_filter = request.query.get("size_filter", "")
+    node_id = request.query.get("node_id", "")
+
+    # 安全检测：频率限制
+    if not _check_rate_limit(request):
+        return web.json_response({"error": "Too many requests"}, status=429)
+
+    from io import BytesIO
+    import base64
+
+    exts = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
+
+    if source == "tensor":
+        # tensor 模式：从缓存读取（不操作文件系统）
+        if not node_id or node_id not in output_cache:
+            return web.json_response({"error": "Node not executed yet"}, status=404)
+        cache = output_cache[node_id]
+        if cache["source_type"] != "tensor":
+            return web.json_response({"error": "Not tensor mode"}, status=400)
+        batch = cache["batch"]
+        if index < 0 or index >= batch.shape[0]:
+            return web.json_response({"error": "Index out of range"}, status=400)
+        import torchvision.transforms.functional as TF
+        img_tensor = batch[index].permute(2, 0, 1)
+        img_pil = TF.to_pil_image(img_tensor.clamp(0, 1))
+        buf = BytesIO()
+        img_pil.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return web.json_response({"image": f"data:image/png;base64,{b64}", "total": batch.shape[0]})
+
+    # 文件类模式：解析路径列表
+    if source == "folder":
+        if not path or not os.path.isdir(path):
+            return web.json_response({"error": "Invalid folder"}, status=400)
+        try:
+            files = sorted([f for f in os.listdir(path) if f.lower().endswith(exts)])
+        except Exception:
+            return web.json_response({"error": "Cannot read folder"}, status=400)
+        all_paths = [os.path.join(path, f) for f in files]
+    else:  # files
+        if not path:
+            return web.json_response({"error": "Missing path"}, status=400)
+        all_paths = [p.strip() for p in path.split("|") if p.strip()]
+
+    if not all_paths:
+        return web.json_response({"error": "No valid images found"}, status=400)
+
+    # 如果指定尺寸过滤，筛选
+    if size_filter:
+        try:
+            w, h = map(int, size_filter.split("x"))
+        except ValueError:
+            return web.json_response({"error": "Invalid size_filter format"}, status=400)
+        filtered_paths = []
+        for p in all_paths:
+            if os.path.isfile(p):
+                try:
+                    with Image.open(p) as im:
+                        if im.size == (w, h):
+                            filtered_paths.append(p)
+                except Exception:
+                    pass
+        all_paths = filtered_paths
+
+    if index < 0 or index >= len(all_paths):
+        return web.json_response({"error": "Index out of range"}, status=400)
+
+    try:
+        with Image.open(all_paths[index]) as img:
+            img_rgb = img.convert("RGB")
+            buf = BytesIO()
+            img_rgb.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+        return web.json_response({"image": f"data:image/png;base64,{b64}", "total": len(all_paths)})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+# ============= 保留的独立路由 =============
+
+# tensor 预览（单独保留，只读缓存，不操作文件系统）
 @PromptServer.instance.routes.get("/interactive_crop/get_tensor_preview")
 async def get_tensor_preview(request):
+    """保留：仅读内存缓存，不接触文件系统"""
     node_id = request.query.get("node_id")
     index = int(request.query.get("index","0"))
     if not node_id or node_id not in output_cache:
@@ -387,7 +477,7 @@ async def get_tensor_preview(request):
     b64 = base64.b64encode(buf.getvalue()).decode()
     return web.json_response({"image": f"data:image/png;base64,{b64}", "total": batch.shape[0]})
 
-# ============= InteractiveBatchCrop 专属单选目录路由 =============
+# tkinter 文件夹选择弹窗（需用户交互）
 @PromptServer.instance.routes.post("/interactive_crop/select_folder")
 async def select_folder(request):
     """只弹窗选择单个目录（单选），不循环多选"""
@@ -408,7 +498,7 @@ async def select_folder(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-# ============= 多选文件路由（共享给其他节点） =============
+# tkinter 文件选择弹窗（需用户交互）
 @PromptServer.instance.routes.post("/interactive_crop/select_files")
 async def select_files(request):
     try:
