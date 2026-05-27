@@ -4,6 +4,7 @@
 
 import math
 import json
+import logging
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 
@@ -104,6 +105,7 @@ def compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
     all_front_hip_abs = []       # 正面帧 scaled |hip_dx| (dx < 0)
     all_back_hip_abs = []        # 背面帧 scaled |hip_dx| (dx > 0)
     all_raw_data = []            # (shldr_dx, hip_dx, nh_dist, sh_y_diff, hip_y_diff)
+    shoulder_widths = []         # 降级模式备选：各帧肩宽（半身/无髋时替代颈髋距离做参考尺度）
 
     for frame in anchor_seq:
         for person in frame.get("people", []):
@@ -133,9 +135,21 @@ def compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
             shoulder_y_diff = r_shoulder[1] - l_shoulder[1] if shldr_valid else None
             hip_y_diff = r_hip[1] - l_hip[1] if hip_valid else None
             all_raw_data.append((shldr_dx, hip_dx, nh_dist, shoulder_y_diff, hip_y_diff))
+            # 收集肩宽（降级模式备选：半身无髋时用肩宽比例映射到6方向）
+            if shldr_valid:
+                shoulder_widths.append(abs(r_shoulder[0] - l_shoulder[0]))
 
     if not neck_hip_dists:
-        return ("Error: No valid neck-hip distance found", torch.zeros(len(pose_keypoints_segment)))
+        # 降级模式：无有效颈髋距离（常见于半身舞蹈），自动降级为6方向
+        if shoulder_widths:
+            body_ref_dist = np.percentile(shoulder_widths, 95)
+            logging.warning(f"[Yaw] 降级模式：无有效颈髋距离（可能为半身），使用肩宽P95={body_ref_dist:.1f}作为参考尺度")
+        else:
+            body_ref_dist = 0.0
+            logging.warning("[Yaw] 降级模式：肩髋均不可用，所有帧输出0°（正面）")
+        return _compute_yaw_quantized_6dir(
+            pose_keypoints_segment, body_ref_dist, conf_threshold
+        )
 
     anchor_neck_hip = np.percentile(neck_hip_dists, 99)
 
@@ -679,6 +693,94 @@ def compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
                     f"{fmt(sign,5)} {fmt(raw_yaw,8)} {fmt(final_yaw,9)}")
             lines.append(line)
 
+    return (yaw_tensor, "\n".join(lines))
+
+
+
+# ==================== 降级模式：6方向量化（半身/无髋场景） ====================
+def _compute_yaw_quantized_6dir(pose_keypoints_segment, body_ref_dist, conf_threshold):
+    """
+    降级模式：无有效颈髋距离时使用（常见于半身舞蹈）。
+    依赖肩宽比例映射到6个离散方向，正面判定放宽。
+    
+    6方向: 0°(正面), ±60°(前侧), ±120°(后侧), 180°(背面)
+    肩髋均不可用时(body_ref_dist<=0)全部输出0°。
+    
+    Returns: (yaw_tensor, table_string)
+    """
+    FRONT_ZOOM = 1.2                # 正面放大系数，使比例→角度映射时正面区间更宽
+    NOSE_FRONT_THRESH = 15.0        # 鼻颈X差阈值，超过才尝试区分正背面（放宽到15°）
+    
+    yaw_list = []
+    
+    for frame in pose_keypoints_segment:
+        for person in frame.get("people", []):
+            flat = _get_flat_keypoints(person)
+            r_sh = _get_point(flat, 2)
+            l_sh = _get_point(flat, 5)
+            nose = _get_point(flat, 0)
+            neck = _get_point(flat, 1)
+            
+            def v(p): return _is_valid(p, conf_threshold)
+            shldr_ok = v(r_sh) and v(l_sh)
+            
+            # 肩髋均不可用 → 默认正面
+            if body_ref_dist <= 0 or not shldr_ok:
+                yaw_list.append(0.0)
+                continue
+            
+            dx = r_sh[0] - l_sh[0]
+            dx_abs = abs(dx)
+            ratio = min(1.0, dx_abs / body_ref_dist)
+            
+            # 粗略角度：肩宽比例映射到0~90°（带正面放大系数）
+            raw_abs = min(90.0, ratio * 90.0 * FRONT_ZOOM)
+            
+            # 符号：肩dx>0 表示右肩在画面右侧 → 面朝左；dx<0 → 面朝右
+            sign = 1.0 if dx > 0 else -1.0
+            
+            # 判断正/背面：用鼻颈X差（放宽判定）
+            nose_ok = v(nose) and v(neck)
+            is_front = True
+            if nose_ok:
+                nose_neck_x = nose[0] - neck[0]
+                if abs(nose_neck_x) > NOSE_FRONT_THRESH:
+                    # 正面时鼻颈X差与肩dx符号相反（鼻子朝哪边转，哪边显宽）
+                    if (dx < 0 and nose_neck_x > 0) or (dx > 0 and nose_neck_x < 0):
+                        is_front = False
+            
+            if is_front:
+                yaw = sign * raw_abs
+            else:
+                yaw = sign * (180.0 - raw_abs)
+            
+            # 量化到6方向：四舍五入到最近的60°倍数
+            quantized = round(yaw / 60.0) * 60.0
+            # 边界处理：clamp到[-180, 180]，-180统一为180
+            if quantized > 180.0:
+                quantized = 180.0
+            elif quantized < -180.0:
+                quantized = 180.0
+            if quantized == -180.0:
+                quantized = 180.0
+            
+            yaw_list.append(quantized)
+    
+    yaw_tensor = torch.tensor(yaw_list, dtype=torch.float32)
+    
+    # 统计各方向分布
+    from collections import Counter
+    direction_counts = Counter(yaw_list)
+    dir_str = ", ".join(f"{d:.0f}°: {c}帧" for d, c in sorted(direction_counts.items()))
+    
+    # 构建诊断表格
+    lines = []
+    lines.append(f"【降级模式】无有效颈髋距离，使用肩宽比例映射到6方向")
+    lines.append(f"参考尺度: {body_ref_dist:.1f} (0=肩髋均不可用→全部输出0°)")
+    lines.append(f"正面放大系数: {FRONT_ZOOM} | 鼻颈阈值: {NOSE_FRONT_THRESH}")
+    lines.append(f"6方向: 0°=正面  ±60°=前侧  ±120°=后侧  180°=背面")
+    lines.append(f"方向分布: {dir_str}")
+    
     return (yaw_tensor, "\n".join(lines))
 
 
