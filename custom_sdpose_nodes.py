@@ -632,9 +632,11 @@ class SDPoseResizeKeypoints:
                 "allow_crop": ("BOOLEAN", {"default": False,
                                            "tooltip": "当保持宽高比且比例不匹配时，基于关键点包围盒智能裁剪，保证不丢失关键点"}),
                 "padding_top": ("INT", {"default": 10, "min": 0, "max": 200, "step": 1,
-                                        "tooltip": "包围盒向上扩展的像素数"}),
+                                        "tooltip": "【仅在允许裁剪时有效】包围盒向上扩展的像素数"}),
                 "padding_bottom": ("INT", {"default": 10, "min": 0, "max": 200, "step": 1,
-                                           "tooltip": "包围盒向下扩展的像素数"}),
+                                           "tooltip": "【仅在允许裁剪时有效】包围盒向下扩展的像素数"}),
+                "score_threshold": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01,
+                                              "tooltip": "【仅在允许裁剪时有效】参与包围盒计算的最低关键点置信度"}),
             },
         }
 
@@ -644,7 +646,7 @@ class SDPoseResizeKeypoints:
     CATEGORY = "SDPose"
 
     def resize(self, pose_keypoints, new_width, new_height, keep_aspect_ratio,
-               allow_crop, padding_top, padding_bottom):
+               allow_crop, padding_top, padding_bottom, score_threshold=0.1):
         if not isinstance(pose_keypoints, list) or not pose_keypoints:
             return (pose_keypoints,)
 
@@ -654,6 +656,8 @@ class SDPoseResizeKeypoints:
             all_x = []
             all_y = []
             for frame in frames:
+                canvas_w = frame.get("canvas_width", 0)
+                canvas_h = frame.get("canvas_height", 0)
                 for person in frame.get("people", []):
                     for key, value in person.items():
                         if key.endswith("_keypoints_2d") and isinstance(value, list):
@@ -661,7 +665,7 @@ class SDPoseResizeKeypoints:
                                 c = value[i+2] if i+2 < len(value) else 0.0
                                 x = value[i]
                                 y = value[i+1]
-                                if c > 0.0 and x > 0 and y > 0:
+                                if c > score_threshold and 0 <= x < canvas_w and 0 <= y < canvas_h:
                                     all_x.append(x)
                                     all_y.append(y)
             if not all_x:
@@ -674,21 +678,15 @@ class SDPoseResizeKeypoints:
                 safe_max_x = max_x + padding_right
                 safe_min_y = min_y - padding_top
                 safe_max_y = max_y + padding_bottom
-                safe_w = safe_max_x - safe_min_x
-                safe_h = safe_max_y - safe_min_y
-                target_ratio = new_width / new_height
-                if safe_w / safe_h > target_ratio:
-                    new_h = safe_w / target_ratio
-                    expand = (new_h - safe_h) / 2.0
-                    safe_min_y -= expand
-                    safe_max_y += expand
-                else:
-                    new_w = safe_h * target_ratio
-                    expand = (new_w - safe_w) / 2.0
-                    safe_min_x -= expand
-                    safe_max_x += expand
                 box_w = safe_max_x - safe_min_x
                 box_h = safe_max_y - safe_min_y
+                # 包围盒只外扩不内缩，等比缩放+居中填入目标画布
+                # 保证所有关键点始终完整保留在包围盒内
+                scale = min(new_width / box_w, new_height / box_h) if box_w > 0 and box_h > 0 else 1.0
+                scaled_w = box_w * scale
+                scaled_h = box_h * scale
+                offset_x = (new_width - scaled_w) / 2.0
+                offset_y = (new_height - scaled_h) / 2.0
                 result_frames = []
                 for frame in frames:
                     new_frame = {
@@ -705,8 +703,8 @@ class SDPoseResizeKeypoints:
                                     x = value[i]
                                     y = value[i+1]
                                     c = value[i+2] if i+2 < len(value) else 0.0
-                                    nx = (x - safe_min_x) * new_width / box_w
-                                    ny = (y - safe_min_y) * new_height / box_h
+                                    nx = (x - safe_min_x) * scale + offset_x
+                                    ny = (y - safe_min_y) * scale + offset_y
                                     new_keypoints.extend([nx, ny, c])
                                 new_person[key] = new_keypoints
                             else:
