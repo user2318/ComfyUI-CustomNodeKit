@@ -4,6 +4,7 @@
 import math
 import numpy as np
 import colorsys
+import cv2
 
 # ==================== 常量定义 ====================
 PROPAGATION_LIMBS = [
@@ -49,6 +50,12 @@ STANDARD_BODY_COLORS = [
 
 # 单色骨骼模式下的统一颜色（灰色）
 MONOCHROME_LIMB_COLOR = [128, 128, 128]
+
+# 预计算手部 20 条骨骼边缘的 HSV 颜色
+HAND_EDGE_COLORS = [
+    tuple(int(c * 255) for c in colorsys.hsv_to_rgb(i / len(HAND_EDGES), 1.0, 1.0))
+    for i in range(len(HAND_EDGES))
+]
 
 # 新配色方案 V4：灰度兼容版 + 同侧同肢体内部区分
 BODY_COLORS = [
@@ -141,113 +148,56 @@ ALL_BODY_LIMBS = list(range(12))
 
 # ==================== 绘制类 ====================
 class KeypointDraw:
+    # OpenCV 加速版本
     @staticmethod
     def circle(canvas_np, center, radius, color, thickness=-1):
-        cx, cy = center
-        h, w = canvas_np.shape[:2]
-        r_int = int(np.ceil(radius))
-        y_min, y_max = max(0, cy - r_int), min(h, cy + r_int + 1)
-        x_min, x_max = max(0, cx - r_int), min(w, cx + r_int + 1)
-        if y_max <= y_min or x_max <= x_min:
-            return
-        y, x = np.ogrid[y_min:y_max, x_min:x_max]
-        mask = (x - cx)**2 + (y - cy)**2 <= radius**2
-        canvas_np[y_min:y_max, x_min:x_max][mask] = color
+        cx, cy = int(round(center[0])), int(round(center[1]))
+        r = int(round(radius))
+        if r < 1:
+            r = 1
+        cv2.circle(canvas_np, (cx, cy), r, color, thickness=thickness, lineType=cv2.LINE_AA)
 
     @staticmethod
     def line(canvas_np, pt1, pt2, color, thickness=1):
-        x0, y0, x1, y1 = int(pt1[0]), int(pt1[1]), int(pt2[0]), int(pt2[1])
-        h, w = canvas_np.shape[:2]
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        sx, sy = 1 if x0 < x1 else -1, 1 if y0 < y1 else -1
-        err = dx - dy
-        points = []
-        x, y = x0, y0
-        while True:
-            points.append((x, y))
-            if x == x1 and y == y1:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
+        x0, y0 = int(round(pt1[0])), int(round(pt1[1]))
+        x1, y1 = int(round(pt2[0])), int(round(pt2[1]))
         if thickness > 1:
-            r = thickness / 2.0
-            for px, py in points:
-                y_min = max(0, py - int(np.ceil(r)))
-                y_max = min(h, py + int(np.ceil(r)) + 1)
-                x_min = max(0, px - int(np.ceil(r)))
-                x_max = min(w, px + int(np.ceil(r)) + 1)
-                if y_max > y_min and x_max > x_min:
-                    yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
-                    mask = (xx - px)**2 + (yy - py)**2 <= r**2
-                    canvas_np[y_min:y_max, x_min:x_max][mask] = color
+            cv2.line(canvas_np, (x0, y0), (x1, y1), color, thickness=thickness, lineType=cv2.LINE_AA)
         else:
-            for px, py in points:
-                if 0 <= px < w and 0 <= py < h:
-                    canvas_np[py, px] = color
+            cv2.line(canvas_np, (x0, y0), (x1, y1), color, thickness=1, lineType=cv2.LINE_AA)
 
     @staticmethod
     def fillConvexPoly(canvas_np, pts, color):
         if len(pts) < 3:
             return
-        pts = np.array(pts, dtype=np.int32)
-        h, w = canvas_np.shape[:2]
-        y_min, y_max = max(0, pts[:,1].min()), min(h, pts[:,1].max()+1)
-        x_min, x_max = max(0, pts[:,0].min()), min(w, pts[:,0].max()+1)
-        if y_max <= y_min or x_max <= x_min:
-            return
-        yy, xx = np.mgrid[y_min:y_max, x_min:x_max]
-        mask = np.zeros((y_max-y_min, x_max-x_min), dtype=bool)
-        for i in range(len(pts)):
-            p1, p2 = pts[i], pts[(i+1)%len(pts)]
-            y1, y2 = p1[1], p2[1]
-            if y1 == y2:
-                continue
-            if y1 > y2:
-                p1, p2 = p2, p1
-                y1, y2 = y2, y1
-            edge_mask = (yy >= y1) & (yy < y2)
-            if not edge_mask.any():
-                continue
-            x_interp = p1[0] + (yy - y1) * (p2[0] - p1[0]) / (y2 - y1)
-            mask ^= edge_mask & (xx >= x_interp)
-        canvas_np[y_min:y_max, x_min:x_max][mask] = color
+        pts_array = np.array(pts, dtype=np.int32)
+        cv2.fillConvexPoly(canvas_np, pts_array, color, lineType=cv2.LINE_AA)
 
     @staticmethod
     def ellipse2Poly(center, axes, angle, arc_start, arc_end, delta=1):
-        axes = (axes[0]+0.5, axes[1]+0.5)
-        angle = angle % 360
-        if arc_start > arc_end:
-            arc_start, arc_end = arc_end, arc_start
-        while arc_start < 0:
-            arc_start += 360
-            arc_end += 360
-        while arc_end > 360:
-            arc_end -= 360
-            arc_start -= 360
-        if arc_end - arc_start > 360:
-            arc_start, arc_end = 0, 360
-        angle_rad = math.radians(angle)
-        cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
-        pts = []
-        for i in range(arc_start, arc_end+delta, delta):
-            theta = math.radians(min(i, arc_end))
-            x = axes[0] * math.cos(theta)
-            y = axes[1] * math.sin(theta)
-            px = int(round(center[0] + x*cos_a - y*sin_a))
-            py = int(round(center[1] + x*sin_a + y*cos_a))
-            pts.append([px, py])
-        unique = []
-        for p in pts:
-            if not unique or tuple(p) != tuple(unique[-1]):
-                unique.append(p)
-        if len(unique) < 2:
-            unique = [[center[0], center[1]], [center[0], center[1]]]
-        return unique
+        axes_int = (int(round(axes[0])), int(round(axes[1])))
+        # OpenCV 使用顺时针角度（图像坐标系 y 轴向下）
+        # 原始代码使用数学逆时针角度（y 轴向上），需取反
+        angle_int = int(round((-angle) % 360))
+        arc_start_int = int(round(arc_start % 360))
+        arc_end_int = int(round(arc_end % 360))
+        if arc_end_int < arc_start_int:
+            arc_end_int += 360
+        pts_raw = cv2.ellipse2Poly(
+            (int(round(center[0])), int(round(center[1]))),
+            axes_int,
+            angle_int,
+            arc_start_int,
+            arc_end_int,
+            delta
+        )
+        # 确保为 numpy.ndarray 再转换
+        pts_np = np.asarray(pts_raw, dtype=np.int32).reshape(-1, 2)
+        pts_list = pts_np.tolist()
+        if len(pts_list) < 2:
+            pts_list = [[int(round(center[0])), int(round(center[1]))],
+                        [int(round(center[0])), int(round(center[1]))]]
+        return pts_list
 
     @staticmethod
     def _get_limb_layer_order(yaw, keypoints, scores, threshold, nose_neck_threshold=3.0):
@@ -327,18 +277,29 @@ class KeypointDraw:
         if scores is not None and (scores[idx1] < threshold or scores[idx2] < threshold):
             return
         p1, p2 = keypoints[idx1], keypoints[idx2]
-        if p1[0] < 0 or p1[1] < 0 or p2[0] < 0 or p2[1] < 0:
+        x1, y1 = p1[0], p1[1]
+        x2, y2 = p2[0], p2[1]
+        if x1 < 0 or y1 < 0 or x2 < 0 or y2 < 0:
             return
-        Y = np.array([p1[0], p2[0]])
-        X = np.array([p1[1], p2[1]])
-        mX, mY = (X[0]+X[1])/2, (Y[0]+Y[1])/2
-        length = math.hypot(X[0]-X[1], Y[0]-Y[1])
-        if length < 1:
+
+        # 计算中心、长度、角度
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < 1e-3:
             return
-        angle = math.degrees(math.atan2(X[0]-X[1], Y[0]-Y[1]))
-        polygon = self.ellipse2Poly((int(mY), int(mX)), (int(length/2), stick_width), int(angle), 0, 360, 1)
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+
+        # 椭圆半轴：长轴 = length/2，短轴 = stick_width//2 （确保至少为1）
+        radius_long = max(1, int(length / 2))
+        radius_short = max(1, stick_width)
+        axes = (radius_long, radius_short)
+
         color = self._get_limb_color(limb_idx, color_scheme)
-        self.fillConvexPoly(canvas, polygon, color)
+
+        # 直接使用 OpenCV 绘制填充椭圆
+        cv2.ellipse(canvas, (int(cx), int(cy)), axes, angle, 0, 360, color, -1, lineType=cv2.LINE_AA)
+        
 
     # ---------- 辅助方法: 绘制手部(指定索引范围) ----------
     def _draw_hands_range(self, canvas, keypoints, scores, threshold, hand_start, hand_end, hand_point_size, eps, W, H, hand_scale=1.0, color_scheme="v4_custom"):
@@ -371,8 +332,7 @@ class KeypointDraw:
                 if color_scheme == "monochrome":
                     color = MONOCHROME_LIMB_COLOR
                 else:
-                    r,g,b = colorsys.hsv_to_rgb(ie/len(HAND_EDGES), 1.0, 1.0)
-                    color = (int(r*255), int(g*255), int(b*255))
+                    color = HAND_EDGE_COLORS[ie]
                 self.line(canvas, (x1,y1), (x2,y2), color, thickness=2)
         for i in range(hand_start, hand_end):
             if scores is not None and i < len(scores) and scores[i] < threshold:

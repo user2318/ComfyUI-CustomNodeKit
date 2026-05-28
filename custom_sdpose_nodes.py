@@ -51,8 +51,14 @@ def _resample_downsample(frames, ratio, json_fps):
     duration = (n - 1) / json_fps
     orig_times = np.arange(n) / json_fps
     target_times = np.linspace(0, duration, target_n)
-    indices = np.array([np.argmin(np.abs(orig_times - t)) for t in target_times])
-    return [frames[i] for i in indices]
+    # O(log n) per target: searchsorted + 向量化最近邻
+    right = np.searchsorted(orig_times, target_times, side='right')
+    right = np.clip(right, 1, n - 1)
+    left = right - 1
+    # 向量化最近邻：左近取左，右近取右
+    closer_left = (target_times - orig_times[left]) <= (orig_times[right] - target_times)
+    indices = np.where(closer_left, left, right)
+    return [frames[int(i)] for i in indices]
 
 def _resample_upsample_duplicate(frames, ratio, json_fps):
     n = len(frames)
@@ -62,12 +68,12 @@ def _resample_upsample_duplicate(frames, ratio, json_fps):
     duration = (n - 1) / json_fps
     orig_times = np.arange(n) / json_fps
     target_times = np.linspace(0, duration, target_n)
-    out = []
-    for t in target_times:
-        nearest = int(np.argmin(np.abs(orig_times - t)))
-        nearest = max(0, min(n - 1, nearest))
-        out.append(frames[nearest])
-    return out
+    right = np.searchsorted(orig_times, target_times, side='right')
+    right = np.clip(right, 1, n - 1)
+    left = right - 1
+    closer_left = (target_times - orig_times[left]) <= (orig_times[right] - target_times)
+    indices = np.where(closer_left, left, right)
+    return [frames[int(i)] for i in indices]
 
 def _is_abrupt_jump(frame_a, frame_b, threshold_ratio=0.1):
     w = frame_a.get("canvas_width", 1)
@@ -584,15 +590,17 @@ class SDPoseDrawKeypointsV2:
                     kp = kp.copy()
                     sc = sc.copy()
                     if mouth_mode == "no_draw":
-                        hide_indices = list(range(72, 92))
+                        hide_idx = range(72, 92)
                     elif mouth_mode == "inner_lip_only":
-                        hide_indices = list(range(72, 84))
+                        hide_idx = range(72, 84)
                     else:
-                        hide_indices = []
-                    for i in hide_indices:
-                        if i < len(kp):
-                            kp[i] = [-1.0, -1.0]
-                            sc[i] = 0.0
+                        hide_idx = []
+                    idx_arr = np.array(list(hide_idx), dtype=int)
+                    mask = idx_arr < len(kp)
+                    valid_idx = idx_arr[mask]
+                    if len(valid_idx):
+                        kp[valid_idx] = [-1.0, -1.0]
+                        sc[valid_idx] = 0.0
 
                 canvas = drawer.draw_wholebody_keypoints(
                     canvas, kp, sc,
