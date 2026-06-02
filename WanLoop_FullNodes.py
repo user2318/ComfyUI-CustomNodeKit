@@ -52,6 +52,7 @@ class WanAnimateToVideoCustom:
                 "mid_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "neutral_mix_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "neutral_mix_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "pose_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
             }
         }
 
@@ -69,7 +70,7 @@ class WanAnimateToVideoCustom:
                 character_mask=None, face_strength=1.0,
                 mid_frame=-1, mid_strength=0.5,
                 neutral_mix_min=0.0, neutral_mix_max=1.0,
-                yaw_angles=None):
+                yaw_angles=None, pose_strength=1.0):
 
         trim_to_pose_video = False
         latent_length = ((length - 1) // 4) + 1
@@ -323,6 +324,28 @@ class WanAnimateToVideoCustom:
         out_latent = {"samples": latent}
 
         trim_image = max(0, ref_motion_latent_length * 4 - 3)
+
+        # ----- pose_strength 强度控制（conditioning 层缩放） -----
+        if pose_strength != 1.0:
+            pos_list = []
+            for cond in positive:
+                c = cond[0]
+                cond_dict = cond[1].copy()
+                if "pose_video_latent" in cond_dict:
+                    cond_dict["pose_video_latent"] = cond_dict["pose_video_latent"] * pose_strength
+                    logging.info(f"[WanAnimateToVideoCustom] pose_strength={pose_strength}, "
+                               f"pose_video_latent_shape={cond_dict['pose_video_latent'].shape}")
+                pos_list.append([c, cond_dict])
+            positive = pos_list
+
+            neg_list = []
+            for cond in negative:
+                c = cond[0]
+                cond_dict = cond[1].copy()
+                if "pose_video_latent" in cond_dict:
+                    cond_dict["pose_video_latent"] = cond_dict["pose_video_latent"] * pose_strength
+                neg_list.append([c, cond_dict])
+            negative = neg_list
 
         # ----- latent_yaw_angles 下采样 -----
         if yaw_angles is not None:

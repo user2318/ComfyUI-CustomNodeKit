@@ -29,4 +29,6 @@ Thumbs.db
 .clinerules
 
 # local distribution folder (not for upload)
-local/
+local1/
+PROGRESS_README.md 
+test_yaw_improved/

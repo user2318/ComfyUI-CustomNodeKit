@@ -21,6 +21,7 @@
   - [Folder Image Loader](#folder-image-loader)
   - [Image Batch Concat](#image-batch-concat)
   - [Image Batch Resize](#image-batch-resize)
+  - [WanAnimate Uni3C 运镜控制](#wananimate-uni3c-运镜控制)
 - [依赖](#依赖)
 - [工作流](#工作流)
   - [长视频姿态检测工作流](#长视频姿态检测工作流)
@@ -59,6 +60,8 @@ pip install -r requirements.txt
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
 | **WanAnimateToVideoCustom** | `WanLoop/整合节点` | WanAnimate 视频生成核心节点，支持 pose/face 控制、尾帧分段掩码、中性灰混合、上下文模式等完整参数 |
+| **WanUni3CLoader** | `WanVideo/Control` | 加载 Uni3C ControlNet 模型，支持 fp32/bf16/fp16 精度选择（可选） |
+| **WanUni3CApply** | `WanVideo/Control` | 在 KSampler 中注入 Uni3C 运镜控制，支持 strength/start_percent/end_percent 等参数（可选） |
 
 ### SDPose 姿态系统
 
@@ -422,6 +425,63 @@ right：   等比缩放到 512×288，裁左侧 176px（需再放大到 512×512
 ```
 
 > 裁剪模式始终先缩放至覆盖目标尺寸（取 max 缩放比），再按方向裁剪多余内容，保证最终输出尺寸精确等于目标宽高。
+
+---
+
+### WanAnimate Uni3C 运镜控制
+
+Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制能力。它通过在 KSampler 的采样过程中注入 ControlNet 控制信号，引导生成结果按照指定的相机轨迹运动。**这是一个可选功能**，不使用时不影响正常生成流程。
+
+#### 使用前提
+
+1. 需要下载 Uni3C ControlNet 模型文件（`.safetensors`）放入 `ComfyUI/models/controlnet` 目录
+2. 需要安装 `diffusers` 和 `accelerate` Python 包
+
+#### WanUni3CLoader — 模型加载
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `model_name` | COMBO | ✅ | Uni3C ControlNet 模型文件，自动扫描 controlnet 目录 |
+| `base_precision` | 枚举 | ❌ | 基础精度，可选 `fp32` / `bf16` / `fp16`（默认 `fp16`） |
+
+**输出**：`uni3c_controlnet`（UNI3C_CONTROLNET）— 加载后的 ControlNet 模型，供 WanUni3CApply 使用。
+
+#### WanUni3CApply — 控制注入
+
+在 KSampler 中注入 Uni3C 运镜控制信号。节点通过 monkey-patch 模型内部的 `forward_orig` 方法，在每个 denoising step 中计算并注入控制信号。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `model` | MODEL | ✅ | 待注入控制的模型 |
+| `uni3c_controlnet` | UNI3C_CONTROLNET | ✅ | 由 WanUni3CLoader 加载的 ControlNet 模型 |
+| `render_latent` | LATENT | ✅ | 预渲染的参考视频潜空间张量（B, C, T, H, W），作为运镜控制的视觉参考 |
+| `strength` | FLOAT | ✅ | 控制强度（0.0-10.0，默认 1.0） |
+| `start_percent` | FLOAT | ✅ | 控制生效起始百分比（0.0-1.0，默认 0.0） |
+| `end_percent` | FLOAT | ✅ | 控制生效结束百分比（0.0-1.0，默认 1.0） |
+| `render_mask` | MASK | ❌ | 可选的渲染遮罩（实验性功能） |
+| `trim_latent` | INT | ❌ | 参考图占用的 latent 帧数，从 WanAnimateToVideoCustom 的 `trim_latent` 输出接入，用于时序对齐 |
+| `positive` | CONDITIONING | ❌ | 可选：传入 conditioning 自动提取 `concat_latent_image`，替代 WanAnimateChannelPack 节点 |
+| `negative` | CONDITIONING | ❌ | 同上，负条件 |
+
+**输出**：`model`（MODEL）— 已注入控制的模型，可直接连接 KSampler。
+
+#### 核心原理
+
+1. **v4 架构**：采用 monkey-patch 方式修改模型 `forward_orig` 方法，在 block 循环中精确控制注入时机
+2. **时序对齐**：通过 `trim_latent` 参数自动对齐 render_latent 与生成视频的时序偏移
+3. **异步预取**：控制信号采用 CPU→GPU 异步预取机制，与 block 计算重叠，最小化性能开销
+4. **step 控制**：通过 `start_percent` / `end_percent` 控制控制信号在 denoising 过程中的生效范围
+
+#### 典型工作流
+
+```
+[WanUni3CLoader] → uni3c_controlnet ─┐
+[渲染好的 latent] → render_latent ────┤
+                                      ↓
+[模型] → WanUni3CApply → model (已注入控制) → [KSampler] → [VAE Decode] → 输出
+```
+
+> **注意**：WanUni3CApply 节点内置了 WanAnimateChannelPack 逻辑，如果传入了 `positive`/`negative` conditioning，会自动从其中提取 `concat_latent_image`，无需额外连接 WanAnimateChannelPack 节点。
 
 ---
 
