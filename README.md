@@ -76,7 +76,8 @@ pip install -r requirements.txt
 | **Estimate Yaw (Advanced)** | `SDPose` | 完整版偏航角估计，可调节所有底层参数（平滑窗口、EMA alpha、角度限制、侧向校准等），并输出详细调试表格 |
 | **Resize SDPose Keypoints** | `SDPose` | 缩放姿态关键点坐标并更新画布尺寸，支持保持宽高比、智能裁剪（基于关键点包围盒） |
 | **Resample SDPose Keypoints** | `SDPose` | 对姿态关键点序列进行帧率重采样（抽帧/补帧），独立于 JSON 载入逻辑，支持空帧自动修复 |
-| **GroundingDinoModelLoader_SDPose** | `SDPose` | 加载 Grounding DINO 模型，用于 SDPoseOODProcessor 的文本提示驱动目标检测 |
+| **Load GroundingDINO Model** | `SDPose/GD` | 加载 GroundingDINO 模型（全局缓存，常驻 GPU），为官方 SDPose 提供 bbox 检测基础 |
+| **GD BBox Detect** | `SDPose/GD` | GroundingDINO 一站式检测：文本检测 → 多模式筛选 → 输出 bbox 给官方 SDPoseOODProcessor |
 | **Reference Image Selector** | `CustomNodes/SDPose` | 参考图选择器：根据偏航角范围自动筛选和排序参考图批次 |
 
 ### 视频工具
@@ -625,6 +626,21 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
                       ↓
               selected_images → [WanAnimateToVideoCustom] reference_image
 ```
+
+---
+
+## 致谢
+
+本项目的部分节点为以下第三方节点提供辅助服务（如 bbox 检测、姿态数据预处理等），感谢这些优秀项目的启发：
+
+- sdpose-ood — SDPose 姿态系统
+- ComfyUI-WanAnimatePreprocess & comfyui-kjnodes (Kijai) — WanAnimate 预处理与工具包
+- GroundingDINO (ShilongLiu) — GD 检测模型接口
+- ComfyUI-BodyRatioMapper — 骨骼比例对齐
+- comfyui-videohelpersuite — 视频工具
+- comfyui-custom-scripts — 实用节点
+
+同时，本项目中的 WanAnimate 多参考图视频生成逻辑、偏航角估计算法、上下文窗口调度策略、骨骼绘制引擎等核心逻辑均为自主实现。
 
 ---
 
