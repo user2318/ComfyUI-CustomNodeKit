@@ -76,6 +76,7 @@ pip install -r requirements.txt
 | **Estimate Yaw (Advanced)** | `SDPose` | 完整版偏航角估计，可调节所有底层参数（平滑窗口、EMA alpha、角度限制、侧向校准等），并输出详细调试表格 |
 | **Resize SDPose Keypoints** | `SDPose` | 缩放姿态关键点坐标并更新画布尺寸，支持保持宽高比、智能裁剪（基于关键点包围盒） |
 | **Resample SDPose Keypoints** | `SDPose` | 对姿态关键点序列进行帧率重采样（抽帧/补帧），独立于 JSON 载入逻辑，支持空帧自动修复 |
+| **GroundingDinoModelLoader_SDPose** | `SDPose` | 加载 Grounding DINO 模型，用于 SDPoseOODProcessor 的文本提示驱动目标检测 |
 | **Reference Image Selector** | `CustomNodes/SDPose` | 参考图选择器：根据偏航角范围自动筛选和排序参考图批次 |
 
 ### 视频工具
@@ -141,7 +142,7 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | `tail_frame_count` | INT | legacy 模式下尾帧掩码覆盖的帧数 |
 | `tail_start_strength` | FLOAT | legacy 模式下尾帧掩码起始强度 |
 | `tail_end_strength` | FLOAT | legacy 模式下尾帧掩码结束强度 |
-| `context_mode` | BOOLEAN | 启用上下文模式后，pose/face 视频将自动填充至与总 latent 长度匹配 |
+| `ref_mode` | 枚举 | `原模式`=内部1+4n排列后批量编码(接selected_images)；`兼容模式`=逐帧独立编码(接selected_images，兼容EverAnimate LoRA) |
 
 **可选参数：**
 
@@ -219,7 +220,7 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | `closed_loop` | BOOLEAN | 是否闭合窗口循环（仅循环调度有效） |
 | `fuse_method` | 枚举 | 窗口融合方式（见下文） |
 | `freenoise` | BOOLEAN | 是否启用 FreeNoise 噪声混洗（改善窗口间连续性） |
-| `prefix_frames` | INT | 前缀参考帧数（像素帧，自动转换）。这些帧会被固定追加到每个窗口开头，提供跨窗口的稳定上下文参考 |
+| `prefix_latent_num` | INT | 前缀参考帧的 latent 数量。接参考图选择器 raw_reference_images 的图片数量即可（每张图片编码为1个 latent）。这些帧会作为稳定参考拼接到每个窗口前 |
 | `split_conds_to_windows` | BOOLEAN | 是否将多个 conditioning 按区域索引分配给各窗口 |
 
 #### 调度策略 (context_schedule)
@@ -242,10 +243,9 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 
 #### 使用要点
 
-1. **帧数转换**：`context_length`、`context_overlap`、`prefix_frames` 均以像素帧为单位输入，节点内部自动转换为 latent 帧（每 4 像素帧 → 1 latent 帧）。
-2. **前缀参考帧**：设置 `prefix_frames > 0` 后，前 N 帧的 latent 会被追加到每个窗口开头作为稳定参考，适合需要全局上下文信息的生成任务。
+1. **帧数转换**：`context_length`、`context_overlap` 均以像素帧为单位输入，节点内部自动转换为 latent 帧（每 4 像素帧 → 1 latent 帧）。
+2. **前缀参考帧**：设置 `prefix_latent_num > 0` 后，该数量的参考图 latent 会被追加到每个窗口开头作为稳定参考，适合需要全局上下文信息的生成任务。
 3. **freenoise**：启用后会混洗噪声以改善窗口间的纹理连续性，建议在总帧数较长且重叠较小时开启。
-4. **与 WanAnimateToVideoCustom 配合**：将本节点输出的 model 连接到 KSampler，同时将 WanAnimateToVideoCustom 的 context_mode 设为 `True` 以确保 pose/face 视频长度匹配。
 
 #### 典型工作流
 
@@ -275,8 +275,10 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 
 | 输出 | 类型 | 说明 |
 |------|------|------|
-| `selected_images` | IMAGE | 筛选排序后的参考图批次（主参考图×1 + 辅助参考图各×4） |
+| `selected_images` | IMAGE | 筛选排序后的参考图批次（主参考图×1 + 辅助参考图各×1，原始图片直接输出） |
+| `raw_reference_images` | IMAGE | 原始参考图（未排序，用于接入 Custom Context Windows 的 prefix_latent_num） |
 | `info` | STRING | 调试信息（角度范围、候选索引、排序结果等） |
+| `reference_angle_map` | STRING | 参考图角度映射 JSON（用于下游节点） |
 
 #### 工作原理
 

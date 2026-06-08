@@ -22,37 +22,37 @@ class WanAnimateToVideoCustom:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "positive": ("CONDITIONING",),
-                "negative": ("CONDITIONING",),
-                "vae": ("VAE",),
-                "width": ("INT", {"default": 832, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
-                "height": ("INT", {"default": 480, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
-                "length": ("INT", {"default": 77, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 4}),
-                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
-                "continue_motion_max_frames": ("INT", {"default": 5, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 1}),
-                "video_frame_offset": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),
-                "transition_width": ("INT", {"default": 0, "min": 0, "max": 128, "step": 4}),
-                "mode": (["fix", "legacy", "vanilla"], {"default": "vanilla"}),
-                "tail_frame_count": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
-                "tail_start_strength": ("FLOAT", {"default": 0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "tail_end_strength": ("FLOAT", {"default": 0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "context_mode": ("BOOLEAN", {"default": False, "label_on": "启用上下文模式", "label_off": "禁用"}),
+                "positive": ("CONDITIONING", {"tooltip": "正向提示词 conditioning"}),
+                "negative": ("CONDITIONING", {"tooltip": "负向提示词 conditioning"}),
+                "vae": ("VAE", {"tooltip": "Wan 模型的 VAE，用于编码参考图和窗口帧"}),
+                "width": ("INT", {"default": 832, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16, "tooltip": "生成视频的宽度（像素），必须是 16 的倍数"}),
+                "height": ("INT", {"default": 480, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16, "tooltip": "生成视频的高度（像素），必须是 16 的倍数"}),
+                "length": ("INT", {"default": 77, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 4, "tooltip": "生成视频的帧数（像素帧），必须是 4 的倍数"}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096, "tooltip": "批量大小，通常保持为 1"}),
+                "continue_motion_max_frames": ("INT", {"default": 5, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 1, "tooltip": "从上一块携带的最大帧数（RGB 图像），用于块间接续"}),
+                "video_frame_offset": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1, "tooltip": "当前 chunk 的帧偏移量，从上一块的 video_frame_offset 输出接入"}),
+                "transition_width": ("INT", {"default": 0, "min": 0, "max": 128, "step": 4, "tooltip": "fix 模式下黑帧区域的过渡区宽度，0=禁用过渡"}),
+                "mode": (["fix", "legacy", "vanilla"], {"default": "vanilla", "tooltip": "掩码模式：vanilla=官方行为(fix/legacy不动)，fix=黑帧检测+过渡，legacy=尾帧渐变"}),
+                "tail_frame_count": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1, "tooltip": "legacy 模式下尾帧处理帧数，0=禁用"}),
+                "tail_start_strength": ("FLOAT", {"default": 0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "legacy 模式尾帧起始强度"}),
+                "tail_end_strength": ("FLOAT", {"default": 0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "legacy 模式尾帧结束强度"}),
+                "ref_mode": (["原模式", "兼容模式"], {"default": "原模式", "tooltip": "原模式=内部1+4n排列后批量编码(接selected_images)；兼容模式=逐帧独立编码(接selected_images，兼容EverAnimate LoRA)"}),
             },
             "optional": {
-                "clip_vision_output": ("CLIP_VISION_OUTPUT",),
-                "reference_image": ("IMAGE",),
-                "face_video": ("IMAGE",),
-                "pose_video": ("IMAGE",),
-                "continue_motion": ("IMAGE",),
-                "background_video": ("IMAGE",),
-                "character_mask": ("MASK",),
-                "yaw_angles": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0}),
-                "face_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "mid_frame": ("INT", {"default": -1, "min": -1, "max": 1000, "step": 1}),
-                "mid_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "neutral_mix_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "neutral_mix_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "pose_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "clip_vision_output": ("CLIP_VISION_OUTPUT", {"tooltip": "CLIP Vision 输出，用于参考图语义理解"}),
+                "reference_image": ("IMAGE", {"tooltip": "参考图输入。接参考图选择器的 selected_images（排序后的原始图片，节点内部自动处理1+4n或逐帧编码）"}),
+                "face_video": ("IMAGE", {"tooltip": "面部视频帧序列，用于面部引导"}),
+                "pose_video": ("IMAGE", {"tooltip": "姿态视频帧序列，用于姿态引导"}),
+                "continue_motion": ("IMAGE", {"tooltip": "上一块的末尾 RGB 帧，用于块间运动接续"}),
+                "background_video": ("IMAGE", {"tooltip": "背景视频帧序列，用于替换/增强背景"}),
+                "character_mask": ("MASK", {"tooltip": "角色遮罩，用于精确控制角色区域的保护"}),
+                "yaw_angles": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "tooltip": "偏航角序列（像素帧级别）"}),
+                "face_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "面部引导强度，0=关闭面部引导"}),
+                "pose_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "姿态引导强度，0=关闭姿态引导，>1=增强姿态影响"}),
+                "mid_frame": ("INT", {"default": -1, "min": -1, "max": 1000, "step": 1, "tooltip": "legacy 模式中间帧锚点位置，-1=不使用"}),
+                "mid_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "legacy 模式中间帧锚点强度"}),
+                "neutral_mix_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "legacy 模式掩码=0时的中性灰混合比例"}),
+                "neutral_mix_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "legacy 模式掩码=1时的中性灰混合比例"}),
             }
         }
 
@@ -64,29 +64,61 @@ class WanAnimateToVideoCustom:
     def process(self, positive, negative, vae, width, height, length, batch_size,
                 continue_motion_max_frames, video_frame_offset, transition_width,
                 mode, tail_frame_count, tail_start_strength, tail_end_strength,
-                context_mode,
-                clip_vision_output=None, reference_image=None, face_video=None,
-                pose_video=None, continue_motion=None, background_video=None,
-                character_mask=None, face_strength=1.0,
+                ref_mode,
+                clip_vision_output=None, reference_image=None,
+                face_video=None, pose_video=None, continue_motion=None,
+                background_video=None, character_mask=None,
+                face_strength=1.0, pose_strength=1.0,
                 mid_frame=-1, mid_strength=0.5,
                 neutral_mix_min=0.0, neutral_mix_max=1.0,
-                yaw_angles=None, pose_strength=1.0):
+                yaw_angles=None):
 
         trim_to_pose_video = False
         latent_length = ((length - 1) // 4) + 1
         latent_width = width // 8
         latent_height = height // 8
         trim_latent = 0
+        ref_motion_latent_length = 0
 
-        # ----- 参考图像处理 -----
+        # ----- 参考图像处理（根据模式走不同路径） -----
         if reference_image is None:
             reference_image = torch.zeros((1, height, width, 3))
-        image = comfy.utils.common_upscale(reference_image[:length].movedim(-1, 1), width, height, "area", "center").movedim(1, -1)
-        concat_latent_image = vae.encode(image[:, :, :, :3])
-        mask = torch.zeros((1, 4, concat_latent_image.shape[-3], concat_latent_image.shape[-2], concat_latent_image.shape[-1]),
-                           device=concat_latent_image.device, dtype=concat_latent_image.dtype)
-        trim_latent += concat_latent_image.shape[2]
-        ref_motion_latent_length = 0
+
+        if ref_mode == "兼容模式":
+            # 兼容模式：逐帧独立 VAE 编码（模拟 EverAnimate 单帧编码方式）
+            encoded_list = []
+            num_ref_frames = reference_image.shape[0]
+            for i in range(num_ref_frames):
+                single_img = reference_image[i:i+1]
+                single_img = comfy.utils.common_upscale(
+                    single_img.movedim(-1, 1), width, height, "area", "center"
+                ).movedim(1, -1)
+                single_latent = vae.encode(single_img[:, :, :, :3])
+                encoded_list.append(single_latent)
+            concat_latent_image = torch.cat(encoded_list, dim=2)
+            mask = torch.zeros((1, 4, concat_latent_image.shape[-3],
+                                concat_latent_image.shape[-2],
+                                concat_latent_image.shape[-1]),
+                               device=concat_latent_image.device, dtype=concat_latent_image.dtype)
+            trim_latent += concat_latent_image.shape[2]
+            # 构造占位 image 用于后续兼容（不会被实际用于编码）
+            image = torch.ones((length, height, width, 3)) * 0.5
+        else:
+            # 原模式：内部做 1+4n 排列后再批量编码
+            # 第1张参考图 ×1 + 其余参考图(每张×4)
+            ref_batch_parts = [reference_image[0:1]]
+            if reference_image.shape[0] > 1:
+                for i in range(1, reference_image.shape[0]):
+                    ref_batch_parts.append(reference_image[i:i+1].repeat(4, 1, 1, 1))
+            ref_batch = torch.cat(ref_batch_parts, dim=0)
+
+            # 限制到 length 帧
+            ref_batch = ref_batch[:length]
+            image = comfy.utils.common_upscale(ref_batch.movedim(-1, 1), width, height, "area", "center").movedim(1, -1)
+            concat_latent_image = vae.encode(image[:, :, :, :3])
+            mask = torch.zeros((1, 4, concat_latent_image.shape[-3], concat_latent_image.shape[-2], concat_latent_image.shape[-1]),
+                               device=concat_latent_image.device, dtype=concat_latent_image.dtype)
+            trim_latent += concat_latent_image.shape[2]
 
         # ----- continue_motion 处理 -----
         if continue_motion is None:
@@ -129,27 +161,13 @@ class WanAnimateToVideoCustom:
             ).movedim(1, -1)
             pose_video_latent = vae.encode(pose_video[:, :, :, :3])
 
-            T_ref = ((ref_pixel_frames - 1) // 4) + 1
-            delta = T_ref - 1
+            # 前补 latent 帧以对齐 concat_latent_image 的 anchor 部分
+            delta = trim_latent - 1
 
             if delta > 0:
-                first_latent = pose_video_latent[:, :, :1, :, :]
-                repeated = first_latent.repeat(1, 1, delta, 1, 1)
-                pose_video_latent = torch.cat([repeated, pose_video_latent], dim=2)
-                logging.info("[PoseVideo] 已在开头重复 %d 帧 latent，总长度 = %d", delta, pose_video_latent.shape[2])
-
-            if context_mode:
-                target_len = latent_length + trim_latent
-                current_len = pose_video_latent.shape[2]
-                extra = target_len - current_len
-                if extra > 0:
-                    last_frame = pose_video_latent[:, :, -1:, :, :]
-                    pad_frames = last_frame.repeat(1, 1, extra, 1, 1)
-                    pose_video_latent = torch.cat([pose_video_latent, pad_frames], dim=2)
-                    logging.info("[PoseVideo][上下文模式] 在末尾重复最后一帧 %d 次，总长度 = %d", extra, pose_video_latent.shape[2])
-                elif extra < 0:
-                    pose_video_latent = pose_video_latent[:, :, :target_len, :, :]
-                    logging.warning("[PoseVideo][上下文模式] 长度超了 %d 帧，已截断至 %d", abs(extra), target_len)
+                zero_pad = torch.zeros_like(pose_video_latent[:, :, :1, :, :]).repeat(1, 1, delta, 1, 1)
+                pose_video_latent = torch.cat([zero_pad, pose_video_latent], dim=2)
+                logging.info("[PoseVideo] 已在开头补 %d 帧零 latent，总长度 = %d", delta, pose_video_latent.shape[2])
 
             positive = node_helpers.conditioning_set_values(positive, {"pose_video_latent": pose_video_latent})
             negative = node_helpers.conditioning_set_values(negative, {"pose_video_latent": pose_video_latent})
@@ -167,28 +185,12 @@ class WanAnimateToVideoCustom:
                 face_video = face_video[video_frame_offset:]
         if face_video is not None:
             if reference_image is not None:
-                ref_pixel_frames = reference_image.shape[0]
-                n = (ref_pixel_frames - 1) // 4
-                prefix_frames_to_add = 4 * n
+                # 前补像素帧以对齐 concat_latent_image 的 anchor 部分
+                prefix_frames_to_add = max(0, (trim_latent - 1) * 4)
                 if prefix_frames_to_add > 0:
-                    first_frame = face_video[0:1]
-                    repeated = first_frame.repeat(prefix_frames_to_add, 1, 1, 1)
-                    face_video = torch.cat([repeated, face_video], dim=0)
-                    logging.info("[FaceVideo] 已在开头插入 %d 帧（第一帧重复），总帧数 = %d", prefix_frames_to_add, face_video.shape[0])
-
-            if context_mode:
-                total_latent = latent_length + trim_latent
-                required_pixel_frames = 4 * total_latent - 3
-                current_len = face_video.shape[0]
-                if current_len < required_pixel_frames:
-                    extra_frames = required_pixel_frames - current_len
-                    last_frame = face_video[-1:]
-                    pad_frames = last_frame.repeat(extra_frames, 1, 1, 1)
-                    face_video = torch.cat([face_video, pad_frames], dim=0)
-                    logging.info("[FaceVideo][上下文模式] 已在末尾重复最后一帧 %d 次，总帧数 = %d (所需=%d)", extra_frames, face_video.shape[0], required_pixel_frames)
-                elif current_len > required_pixel_frames:
-                    face_video = face_video[:required_pixel_frames]
-                    logging.warning("[FaceVideo][上下文模式] 总帧数超出所需，已截断至 %d", required_pixel_frames)
+                    neutral_pad = torch.full((prefix_frames_to_add, *face_video.shape[1:]), -1.0, device=face_video.device, dtype=face_video.dtype)
+                    face_video = torch.cat([neutral_pad, face_video], dim=0)
+                    logging.info("[FaceVideo] 已在开头补 %d 帧 -1.0，总帧数 = %d", prefix_frames_to_add, face_video.shape[0])
 
             face_video = comfy.utils.common_upscale(face_video.movedim(-1, 1), 512, 512, "area", "center") * 2.0 - 1.0
             face_video = face_video.movedim(0, 1).unsqueeze(0)
@@ -201,9 +203,14 @@ class WanAnimateToVideoCustom:
 
         # ----- 背景和遮罩处理 -----
         ref_images_num = max(0, ref_motion_latent_length * 4 - 3)
+        # EverAnimate 兼容的保护帧数（character_mask/background_video 偏移量用）
+        continue_motion_latents = ref_motion_latent_length
+        continue_motion_frames = continue_motion.shape[0] if continue_motion is not None else 0
+        effective_frame_offset = max(0, int(video_frame_offset) - continue_motion_frames)
+        protected_frames = ref_motion_latent_length * 4
         if background_video is not None:
-            if background_video.shape[0] > video_frame_offset:
-                background_video = background_video[video_frame_offset:]
+            if background_video.shape[0] > effective_frame_offset:
+                background_video = background_video[effective_frame_offset:]
                 background_video = comfy.utils.common_upscale(background_video[:length].movedim(-1, 1), width, height, "area", "center").movedim(1, -1)
                 if background_video.shape[0] > ref_images_num:
                     image[ref_images_num:background_video.shape[0]] = background_video[ref_images_num:]
@@ -293,11 +300,11 @@ class WanAnimateToVideoCustom:
 
         # ----- character_mask 处理 -----
         if character_mask is not None:
-            if character_mask.shape[0] > video_frame_offset or character_mask.shape[0] == 1:
+            if character_mask.shape[0] > effective_frame_offset or character_mask.shape[0] == 1:
                 if character_mask.shape[0] == 1:
                     character_mask = character_mask.repeat((length,) + (1,) * (character_mask.ndim - 1))
                 else:
-                    character_mask = character_mask[video_frame_offset:]
+                    character_mask = character_mask[effective_frame_offset:]
                 if character_mask.ndim == 3:
                     character_mask = character_mask.unsqueeze(1)
                     character_mask = character_mask.movedim(0, 1)
@@ -307,8 +314,8 @@ class WanAnimateToVideoCustom:
                                                             concat_latent_image.shape[-1],
                                                             concat_latent_image.shape[-2],
                                                             "nearest-exact", "center")
-                if character_mask.shape[2] > ref_images_num:
-                    mask_refmotion[:, :, ref_images_num:character_mask.shape[2]] = character_mask[:, :, ref_images_num:]
+                if character_mask.shape[2] > protected_frames:
+                    mask_refmotion[:, :, protected_frames:character_mask.shape[2]] = character_mask[:, :, protected_frames:]
 
         # ----- 拼接最终的 concat_latent_image -----
         concat_latent_image = torch.cat((concat_latent_image, vae.encode(image[:, :, :, :3])), dim=2)

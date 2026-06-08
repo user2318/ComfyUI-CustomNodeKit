@@ -794,8 +794,8 @@ class CustomWanContextWindowsManualNode:
                                                "tooltip": "The method to use to fuse the context windows."}),
                 "freenoise": ("BOOLEAN", {"default": False,
                                           "tooltip": "Whether to apply FreeNoise noise shuffling, improves window blending."}),
-                "prefix_frames": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1,
-                                          "tooltip": "Number of prefix reference frames (original frame units, auto-converted to latent). These frames are prepended to each window as stable reference."}),
+                "prefix_latent_num": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1,
+                                              "tooltip": "前缀参考帧的 latent 数量。接参考图选择器 raw_reference_images 的图片数量即可（每张图片编码为1个 latent）。这些帧会作为稳定参考拼接到每个窗口前。"}),
                 "split_conds_to_windows": ("BOOLEAN", {"default": False,
                                                        "tooltip": "Whether to split multiple conditionings to each window based on region index."}),
             },
@@ -819,11 +819,11 @@ class CustomWanContextWindowsManualNode:
 
     def apply_context_windows(self, model, context_length, context_overlap, context_schedule,
                               context_stride, closed_loop, fuse_method, freenoise,
-                              prefix_frames=0, split_conds_to_windows=False,
+                              prefix_latent_num=0, split_conds_to_windows=False,
                               window_reference_images=None, latent_yaw_angles=None, vae=None,
                               reference_angle_map="", allow_switch_main=True, background_images=None):
-        # 转换前缀帧数：原始帧 → latent 帧（每 4 个原始帧对应 1 个 latent 帧）
-        prefix_latent_len = max((prefix_frames - 1) // 4 + 1, 0) if prefix_frames > 0 else 0
+        # 前缀 latent 数直接用传入值（单位已经是 latent 帧）
+        prefix_latent_len = max(int(prefix_latent_num), 0)
         # 转换 WAN 模型的帧步长
         context_length = max(((context_length - 1) // 4) + 1, 1)
         context_overlap = max(((context_overlap - 1) // 4) + 1, 0)
@@ -854,7 +854,7 @@ class CustomWanContextWindowsManualNode:
         elif ReferenceImageUtils is None:
             print("[ContextWindows] 动态前缀模式未启用 (ReferenceImageUtils 导入失败)")
         elif prefix_latent_len <= 0:
-            print("[ContextWindows] 动态前缀模式未启用 (prefix_frames <= 0)")
+            print("[ContextWindows] 动态前缀模式未启用 (prefix_latent_num <= 0)")
         elif window_reference_images is not None and window_reference_images.shape[0] == 0:
             print("[ContextWindows] 动态前缀模式未启用 (window_reference_images 为空)")
         else:

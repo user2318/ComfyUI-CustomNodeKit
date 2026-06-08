@@ -531,6 +531,58 @@ class ImageBatchResizeNode:
         return (batch,)
 
 
+class SingleFrameVAEEncode:
+    """逐帧独立 VAE 编码节点
+    
+    将输入图像批次中的每张图单独送入 VAE 编码（每次 1 帧），
+    避免 Wan 3D VAE 的 temporal attention 产生跨帧影响，
+    然后将所有独立编码的 latent 在时间维度拼接输出。
+    
+    行为模拟 EverAnimate 节点的单帧编码 + 复制方式：
+    - 输入 N 张图 → 输出 N 帧 latent
+    - 每帧 latent 不受其他帧的时序上下文影响
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "vae": ("VAE",),
+            }
+        }
+    
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "encode"
+    CATEGORY = "WanLoop/工具节点"
+    
+    def encode(self, images, vae):
+        batch_size = images.shape[0]
+        if batch_size == 0:
+            raise ValueError("输入图像为空")
+        
+        encoded_list = []
+        
+        for i in range(batch_size):
+            # 每次只取 1 帧，保持 [1, H, W, 3] 形状
+            single_image = images[i:i+1]
+            
+            # 单帧 VAE 编码（无跨帧时序上下文）
+            single_latent = vae.encode(single_image[:, :, :, :3])
+            
+            # single_latent 形状为 [1, 16, 1, H/8, W/8]
+            encoded_list.append(single_latent)
+        
+        # 在时间维度（dim=2）拼接所有 latent
+        # 最终形状 [1, 16, N, H/8, W/8]
+        concat_latent = torch.cat(encoded_list, dim=2)
+        
+        out = {"samples": concat_latent}
+        
+        return (out,)
+
+
 # ==============================
 # 节点注册
 # ==============================
@@ -541,6 +593,7 @@ NODE_CLASS_MAPPINGS = {
     "FolderImageLoaderNode": FolderImageLoaderNode,
     "ImageBatchConcatNode": ImageBatchConcatNode,
     "ImageBatchResizeNode": ImageBatchResizeNode,
+    "SingleFrameVAEEncode": SingleFrameVAEEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -550,6 +603,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FolderImageLoaderNode": "文件夹图像载入器",
     "ImageBatchConcatNode": "图像批次合并",
     "ImageBatchResizeNode": "图像批次缩放",
+    "SingleFrameVAEEncode": "逐帧独立 VAE 编码",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

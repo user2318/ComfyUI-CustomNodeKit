@@ -258,9 +258,9 @@ class ReferenceImageSelector:
     - select_references: (可选) 是否挑选参考图；True=筛选+排序, False=仅排序(所有参考图都使用)
     
     输出:
-    - selected_images: 按规则拼接后的图像批次 (1+4n 格式, 给 WanAnimate)
+    - selected_images: 排序后的原始参考图（不做1+4n，内部1+4n交给主节点处理）
+    - raw_reference_images: 未排序的原始参考图（用于 ContextWindows 动态前缀，因为内部会重新筛选排序）
     - info: 调试/状态信息
-    - raw_reference_images: 原始参考图批次 (未经1+4n处理, 给 ContextWindows 动态前缀)
     - reference_angle_map: 验证后的角度映射 JSON 字符串 (给 ContextWindows 动态前缀)
     """
     
@@ -281,8 +281,8 @@ class ReferenceImageSelector:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "IMAGE", "STRING")
-    RETURN_NAMES = ("selected_images", "info", "raw_reference_images", "reference_angle_map")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("selected_images", "raw_reference_images", "info", "reference_angle_map")
     FUNCTION = "select"
     CATEGORY = "CustomNodes/SDPose"
 
@@ -292,7 +292,7 @@ class ReferenceImageSelector:
         info_lines.append(f"参考图总数: {total_ref_count}")
         info_lines.append(f"挑选模式: {'筛选+排序' if select_references else '仅排序(全部使用)'}")
 
-        # ---- 解析 angle_map（提前解析，用于 raw 输出） ----
+        # ---- 解析 angle_map ----
         angle_map_list = self._parse_angle_map(angle_map, info_lines)
         validated_angle_map = json.dumps(angle_map_list) if angle_map_list is not None else ""
         raw_images = reference_images.clone()
@@ -301,27 +301,28 @@ class ReferenceImageSelector:
         if total_ref_count == 0:
             info_lines.append("参考图为空")
             info_lines.append("背景图: 无")
-            return (raw_images, "\n".join(info_lines), raw_images, validated_angle_map)
+            info = "\n".join(info_lines)
+            return (raw_images, raw_images, info, validated_angle_map)
 
-        # ==================== 1. yaw_angles 未接入 → 全量 1+4n ====================
+        # ==================== 1. yaw_angles 未接入 → 直接输出原始参考图 ====================
         if yaw_angles is None:
-            info_lines.append("yaw_angles 未接入, 直接输出全部参考图 (1+4n)")
-            result, _ = ReferenceImageUtils._build_batch_flat(total_ref_count, reference_images, info_lines, background_images)
-            return (result, "\n".join(info_lines), raw_images, validated_angle_map)
+            info_lines.append("yaw_angles 未接入, 直接输出全部参考图")
+            info = "\n".join(info_lines)
+            return (raw_images, raw_images, info, validated_angle_map)
 
-        # ==================== 2. angle_map 无效 → 全量 1+4n ====================
+        # ==================== 2. angle_map 无效 → 直接输出原始参考图 ====================
         if angle_map_list is None:
-            info_lines.append("angle_map 无效, 直接输出全部参考图 (1+4n)")
-            result, _ = ReferenceImageUtils._build_batch_flat(total_ref_count, reference_images, info_lines, background_images)
-            return (result, "\n".join(info_lines), raw_images, validated_angle_map)
+            info_lines.append("angle_map 无效, 直接输出全部参考图")
+            info = "\n".join(info_lines)
+            return (raw_images, raw_images, info, validated_angle_map)
 
         map_count = len(angle_map_list)
         if map_count != total_ref_count:
             info_lines.append(
-                f"angle_map 数量({map_count})与参考图数量({total_ref_count})不匹配, 直接输出全部参考图 (1+4n)"
+                f"angle_map 数量({map_count})与参考图数量({total_ref_count})不匹配, 直接输出全部参考图"
             )
-            result, _ = ReferenceImageUtils._build_batch_flat(total_ref_count, reference_images, info_lines, background_images)
-            return (result, "\n".join(info_lines), raw_images, validated_angle_map)
+            info = "\n".join(info_lines)
+            return (raw_images, raw_images, info, validated_angle_map)
 
         info_lines.append(f"角度映射: {angle_map_list}")
 
@@ -330,23 +331,55 @@ class ReferenceImageSelector:
 
         if len(yaw_list) <= 1:
             if len(yaw_list) == 0:
-                info_lines.append("偏航角数据为空, 直接输出全部参考图 (1+4n)")
+                info_lines.append("偏航角数据为空, 直接输出全部参考图")
             else:
-                info_lines.append("偏航角数据不足(仅1帧), 视为无效输入, 直接输出全部参考图 (1+4n)")
-            result, _ = ReferenceImageUtils._build_batch_flat(total_ref_count, reference_images, info_lines, background_images)
-            return (result, "\n".join(info_lines), raw_images, validated_angle_map)
+                info_lines.append("偏航角数据不足(仅1帧), 视为无效输入, 直接输出全部参考图")
+            info = "\n".join(info_lines)
+            return (raw_images, raw_images, info, validated_angle_map)
 
-        # ==================== 4-9. 委托给 ReferenceImageUtils 核心逻辑 ====================
-        selected_tensor, utils_info_lines = ReferenceImageUtils.select_and_order(
-            reference_images, angle_map_list, yaw_list,
-            select_references=select_references,
-            allow_switch_main=allow_switch_main,
-            background_images=background_images,
-        )
-        info_lines.extend(utils_info_lines)
+        # ==================== 4-9. 提取选择排序核心逻辑（复用 ReferenceImageUtils）====================
+        candidate_indices = ReferenceImageUtils._filter_by_range(angle_map_list, min(yaw_list), max(yaw_list)) if select_references else list(range(total_ref_count))
+        if len(candidate_indices) == 0:
+            info_lines.append("无参考图角度在偏航角范围内, 直接输出全部参考图")
+            info = "\n".join(info_lines)
+            return (raw_images, raw_images, info, validated_angle_map)
+
+        candidate_angles = [angle_map_list[i] for i in candidate_indices]
+        info_lines.append(f"候选参考图索引: {candidate_indices}, 角度: {candidate_angles}")
+
+        main_index = ReferenceImageUtils._find_main_reference(candidate_indices, angle_map_list, yaw_list)
+        if not allow_switch_main and 0 in candidate_indices:
+            main_index = 0
+            info_lines.append("主参考图固定为第一张 (不允许更换)")
+
+        info_lines.append(f"主参考图索引: {main_index}, 角度: {angle_map_list[main_index]:.1f}°")
+
+        first_frame_yaw = yaw_list[0]
+        aux_indices = [idx for idx in candidate_indices if idx != main_index]
+        aux_indices.sort(key=lambda i: ReferenceImageUtils._angular_distance(angle_map_list[i], first_frame_yaw), reverse=True)
+
+        closest_to_first = min(candidate_indices, key=lambda i: ReferenceImageUtils._angular_distance(angle_map_list[i], first_frame_yaw))
+        if closest_to_first == main_index:
+            aux_indices.append(main_index)
+
+        ordered_indices = [main_index] + aux_indices
+        info_lines.append(f"最终排序索引: {ordered_indices}")
+
+        # 构建输出：主参考图 + 背景图块（原始图片）+ 辅助参考图
+        output_parts = [reference_images[main_index:main_index+1].clone()]
+        if background_images is not None and background_images.shape[0] > 0:
+            for i in range(background_images.shape[0]):
+                output_parts.append(background_images[i:i+1].clone())
+            info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张，原始图片直接插入)")
+        else:
+            info_lines.append("背景图: 无")
+        for idx in aux_indices:
+            output_parts.append(reference_images[idx:idx+1].clone())
+        selected_images = torch.cat(output_parts, dim=0)
+        info_lines.append(f"输出图像张数: {selected_images.shape[0]}")
 
         info = "\n".join(info_lines)
-        return (selected_tensor, info, raw_images, validated_angle_map)
+        return (selected_images, raw_images, info, validated_angle_map)
 
     # ==================== 辅助方法（委托给 ReferenceImageUtils） ====================
 
