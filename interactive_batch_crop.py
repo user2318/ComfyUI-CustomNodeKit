@@ -152,7 +152,7 @@ class InteractiveBatchCrop:
                 batch_grid = grid.expand(img_batch.shape[0], -1, -1, -1)
                 img_batch_perm = img_batch.permute(0, 3, 1, 2).float()
                 sampled = torch.nn.functional.grid_sample(
-                    img_batch_perm, batch_grid, mode='bilinear', padding_mode='zeros', align_corners=True
+                    img_batch_perm, batch_grid, mode='bilinear', padding_mode='border', align_corners=True
                 )  # B, C, H_out, W_out
                 sampled = sampled.permute(0, 2, 3, 1)  # B, H_out, W_out, C
                 # 蒙版
@@ -274,7 +274,7 @@ class InteractiveBatchCrop:
                 batch_grid = grid.expand(chunk.shape[0], -1, -1, -1)
                 chunk_perm = chunk.permute(0, 3, 1, 2).float()
                 sampled = torch.nn.functional.grid_sample(
-                    chunk_perm, batch_grid, mode='bilinear', padding_mode='zeros', align_corners=True
+                    chunk_perm, batch_grid, mode='bilinear', padding_mode='border', align_corners=True
                 )
                 sampled = sampled.permute(0, 2, 3, 1)
                 mask = ((src_x.unsqueeze(0) >= 0) & (src_x.unsqueeze(0) < W) &

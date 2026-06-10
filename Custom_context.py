@@ -67,6 +67,8 @@ class IndexListContextWindow(ContextWindowABC):
         # 记录原始窗口帧索引（不含前缀），由外部设置
         self.original_indices: list[int] = []
         self.prefix_length: int = 0
+        # causal_window_fix 锚点帧索引（在 index_list 中的位置），由 execute 动态设置
+        self.causal_anchor_idx: int | None = None
 
     def get_tensor(self, full: torch.Tensor, device=None, dim=None, retain_index_list=[]) -> torch.Tensor:
         if dim is None:
@@ -135,7 +137,8 @@ class IndexListContextHandler(ContextHandlerABC):
     def __init__(self, context_schedule: ContextSchedule, fuse_method: ContextFuseMethod,
                  context_length: int = 1, context_overlap: int = 0, context_stride: int = 1,
                  closed_loop: bool = False, dim: int = 0, freenoise: bool = False,
-                 prefix_latent_len: int = 0, split_conds_to_windows: bool = False):
+                 prefix_latent_len: int = 0, split_conds_to_windows: bool = False,
+                 causal_window_fix: bool = True):
         self.context_schedule = context_schedule
         self.fuse_method = fuse_method
         self.context_length = context_length          # 原始窗口长度（不含前缀）
@@ -155,6 +158,11 @@ class IndexListContextHandler(ContextHandlerABC):
         self.use_dynamic_prefix: bool = False
         self.per_window_prefix_latents: dict[int, torch.Tensor] = {}
         self._current_window_idx: int = 0
+
+        # ---- 因果窗口修复：串行传递上一窗口的 denoised 末帧 ----
+        self.causal_window_fix = causal_window_fix
+        self.prev_window_last_frame: torch.Tensor | None = None
+        self.prev_window_last_idx: int | None = None
 
     def should_use_context(self, model: BaseModel, conds: list[list[dict]], x_in: torch.Tensor, timestep: torch.Tensor, model_options: dict[str]) -> bool:
         if x_in.size(self.dim) > self.context_length:
@@ -348,6 +356,9 @@ class IndexListContextHandler(ContextHandlerABC):
             # 可选调试打印
             logging.debug(f"窗口 {idx}: pixel_start={window.pixel_start}, 原始索引 {window.original_indices[0]}-{window.original_indices[-1]}")
 
+        # 重置 causal_window_fix 状态
+        self.prev_window_last_frame = None
+        self.prev_window_last_idx = None
 
         conds_final = [torch.zeros_like(x_in) for _ in conds]
         if self.fuse_method.name == ContextFuseMethods.RELATIVE:
@@ -359,8 +370,21 @@ class IndexListContextHandler(ContextHandlerABC):
         for callback in comfy.patcher_extension.get_all_callbacks(IndexListCallbacks.EXECUTE_START, self.callbacks):
             callback(self, model, x_in, conds, timestep, model_options)
 
-        for enum_window in enumerated_context_windows:
-            results = self.evaluate_context_windows(calc_cond_batch, model, x_in, conds, timestep, [enum_window], model_options)
+        for window_idx, window in enumerated_context_windows:
+            # ---- causal_window_fix：将上一窗口的末帧索引注入当前窗口前缀 ----
+            if self.causal_window_fix and window_idx > 0:
+                if self.prev_window_last_idx is not None and self.prev_window_last_idx not in window.index_list:
+                    # 在 prefix 末尾插入上一窗口末帧索引
+                    insert_pos = window.prefix_length
+                    window.index_list.insert(insert_pos, self.prev_window_last_idx)
+                    window.prefix_length += 1
+                    window.context_length = len(window.index_list)
+                    window.causal_anchor_idx = self.prev_window_last_idx
+                    logging.info(
+                        "[causal_window_fix] 窗口%d: 注入 anchor idx=%d (共%d帧prefix)",
+                        window_idx, self.prev_window_last_idx, window.prefix_length
+                    )
+            results = self.evaluate_context_windows(calc_cond_batch, model, x_in, conds, timestep, [(window_idx, window)], model_options)
             for result in results:
                 self.combine_context_window_results(x_in, result.sub_conds_out, result.sub_conds, result.window, result.window_idx,
                                                     len(enumerated_context_windows), timestep, conds_final, counts_final, biases_final)
@@ -395,6 +419,21 @@ class IndexListContextHandler(ContextHandlerABC):
             if device is not None:
                 for i in range(len(sub_conds_out)):
                     sub_conds_out[i] = sub_conds_out[i].to(x_in.device)
+            # ---- causal_window_fix：保存上一窗口的 denoised 末帧 ----
+            if self.causal_window_fix and window_idx > 0 and sub_conds_out:
+                prefix_len = window.prefix_length
+                body_len = len(window.original_indices)
+                last_body_pos = prefix_len + body_len - 1  # 输出中最后一个 body 帧的位置
+                if last_body_pos < sub_conds_out[0].size(self.dim):
+                    # 用 denoised 估计 ≈ 输入噪声 + 模型预测（flow matching 近似）
+                    last_frame_noisy = sub_x.narrow(self.dim, last_body_pos, 1)
+                    last_frame_pred = sub_conds_out[0].narrow(self.dim, last_body_pos, 1)
+                    self.prev_window_last_frame = (last_frame_noisy + last_frame_pred).to(x_in.device)
+                    self.prev_window_last_idx = window.original_indices[-1]
+                    logging.info(
+                        "[causal_window_fix] 窗口%d: 保存 denoised 末帧 (idx=%d, shape=%s)",
+                        window_idx, self.prev_window_last_idx, list(self.prev_window_last_frame.shape)
+                    )
             results.append(ContextResults(window_idx, sub_conds_out, sub_conds, window))
         return results
 
@@ -798,6 +837,8 @@ class CustomWanContextWindowsManualNode:
                                               "tooltip": "前缀参考帧的 latent 数量。接参考图选择器 raw_reference_images 的图片数量即可（每张图片编码为1个 latent）。这些帧会作为稳定参考拼接到每个窗口前。"}),
                 "split_conds_to_windows": ("BOOLEAN", {"default": False,
                                                        "tooltip": "Whether to split multiple conditionings to each window based on region index."}),
+                "causal_window_fix": ("BOOLEAN", {"default": True,
+                                                  "tooltip": "串行模式：在每个窗口前补上一窗口的denoised末帧，保留脚印等交互细节。会牺牲并行性（每次denoise step内窗口串行执行）。"}),
             },
             "optional": {
                 "window_reference_images": ("IMAGE", {"tooltip": "原始参考图批次（来自 ReferenceImageSelector 的 raw_reference_images 输出），用于动态前缀"}),
@@ -820,6 +861,7 @@ class CustomWanContextWindowsManualNode:
     def apply_context_windows(self, model, context_length, context_overlap, context_schedule,
                               context_stride, closed_loop, fuse_method, freenoise,
                               prefix_latent_num=0, split_conds_to_windows=False,
+                              causal_window_fix=True,
                               window_reference_images=None, latent_yaw_angles=None, vae=None,
                               reference_angle_map="", allow_switch_main=True, background_images=None):
         # 前缀 latent 数直接用传入值（单位已经是 latent 帧）
@@ -839,7 +881,8 @@ class CustomWanContextWindowsManualNode:
             dim=2,
             freenoise=freenoise,
             prefix_latent_len=prefix_latent_len,
-            split_conds_to_windows=split_conds_to_windows
+            split_conds_to_windows=split_conds_to_windows,
+            causal_window_fix=causal_window_fix
         )
         model.model_options["context_handler"] = handler
 

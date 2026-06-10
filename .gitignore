@@ -28,6 +28,9 @@ Thumbs.db
 # clinerules
 .clinerules
 
+# PR description (not for upload)
+PR_submission_description.md
+
 # local distribution folder (not for upload)
 local1/
 PROGRESS_README.md 

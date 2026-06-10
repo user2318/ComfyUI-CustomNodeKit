@@ -27,6 +27,14 @@ HAND_EDGES = [
     [0,17],[17,18],[18,19],[19,20]
 ]
 
+# 脚部骨骼连线（踝关节→大趾），keypoints 数组中的 0-based 索引
+# 右脚踝(body[10]) → 右脚大趾(foot[21])
+# 左脚踝(body[13]) → 左脚大趾(foot[18])
+FOOT_LIMBS = [
+    [13, 18],   # 左脚踝 → 左脚大趾 (左 -> 索引小)
+    [10, 21],   # 右脚踝 → 右脚大趾 (右 -> 索引大)
+]
+
 # 标准 DWPose/OpenPose 配色（与 comfyui_controlnet_aux 和 BodyRatioMapper 一致）
 STANDARD_BODY_COLORS = [
     [255,   0,   0],  # limb  0 右肩 (颈→右肩)
@@ -76,6 +84,18 @@ BODY_COLORS = [
     [128, 42, 35],     # 14 脸右·右眼→右耳         L≈68  [右暗·脸]
     [162, 208, 242],   # 15 脸左·鼻→左眼           L≈199 [左亮·脸]
     [172, 218, 248],   # 16 脸左·左眼→左耳         L≈207 [左亮·脸]
+]
+
+# 脚部骨骼颜色 - Standard (OpenPose 标准)，来自 OpenPose 官方配色
+FOOT_LIMB_COLORS_STANDARD = [
+    [0, 235, 150],    # 左脚踝→大趾 (青绿色)
+    [100, 0, 215],    # 右脚踝→大趾 (蓝紫色)
+]
+
+# 脚部骨骼颜色 - V4 Custom（与对应小腿有明显区分）
+FOOT_LIMB_COLORS_V4 = [
+    [200, 180, 80],    # 左脚踝→大趾 (黄绿色，与左小腿紫灰[162,122,208]区分)
+    [50, 30, 160],     # 右脚踝→大趾 (深蓝紫色，与右小腿暗绿[65,118,42]区分)
 ]
 
 # 身体关节点圆点颜色 (索引 0-17, 统一蓝色系)
@@ -144,6 +164,11 @@ LEFT_FACE_LIMBS = [15, 16]
 MID_LIMB = [12]
 # 全部身体骨骼
 ALL_BODY_LIMBS = list(range(12))
+
+# 脚部骨骼分组（FOOT_LIMBS索引）
+LEFT_FOOT_LIMBS = [0]   # 左脚
+RIGHT_FOOT_LIMBS = [1]  # 右脚
+ALL_FOOT_LIMBS = [0, 1] # 全部
 
 
 # ==================== 绘制类 ====================
@@ -270,6 +295,16 @@ class KeypointDraw:
         else:  # "v4_custom"
             return BODY_COLORS[limb_idx % len(BODY_COLORS)]
 
+    @staticmethod
+    def _get_foot_limb_color(foot_idx, color_scheme="v4_custom"):
+        """根据配色方案返回脚部骨骼颜色。foot_idx: FOOT_LIMBS 的索引（0=左脚, 1=右脚）。"""
+        if color_scheme == "monochrome":
+            return MONOCHROME_LIMB_COLOR
+        elif color_scheme == "standard":
+            return FOOT_LIMB_COLORS_STANDARD[foot_idx]
+        else:  # "v4_custom"
+            return FOOT_LIMB_COLORS_V4[foot_idx]
+
     # ---------- 辅助方法: 绘制单根骨骼 ----------
     def _draw_single_limb(self, canvas, limb_idx, keypoints, scores, threshold, stick_width, color_scheme="v4_custom"):
         limb = DRAW_LIMBS[limb_idx]
@@ -300,6 +335,37 @@ class KeypointDraw:
         # 直接使用 OpenCV 绘制填充椭圆
         cv2.ellipse(canvas, (int(cx), int(cy)), axes, angle, 0, 360, color, -1, lineType=cv2.LINE_AA)
         
+
+    # ---------- 辅助方法: 绘制单根脚部骨骼（踝→大趾） ----------
+    def _draw_single_foot_limb(self, canvas, foot_idx, keypoints, scores, threshold, stick_width, color_scheme="v4_custom"):
+        """绘制一根脚部骨骼（踝关节到脚尖线）。foot_idx: FOOT_LIMBS 的索引。"""
+        limb = FOOT_LIMBS[foot_idx]
+        idx1, idx2 = limb[0], limb[1]  # 0-based 索引
+        if scores is not None and (scores[idx1] < threshold or scores[idx2] < threshold):
+            return
+        p1, p2 = keypoints[idx1], keypoints[idx2]
+        x1, y1 = p1[0], p1[1]
+        x2, y2 = p2[0], p2[1]
+        if x1 < 0 or y1 < 0 or x2 < 0 or y2 < 0:
+            return
+
+        # 计算中心、长度、角度
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < 1e-3:
+            return
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+
+        # 椭圆半轴：长轴 = length/2，短轴 = stick_width//2 （确保至少为1）
+        radius_long = max(1, int(length / 2))
+        radius_short = max(1, stick_width)
+        axes = (radius_long, radius_short)
+
+        color = self._get_foot_limb_color(foot_idx, color_scheme)
+
+        # 直接使用 OpenCV 绘制填充椭圆
+        cv2.ellipse(canvas, (int(cx), int(cy)), axes, angle, 0, 360, color, -1, lineType=cv2.LINE_AA)
 
     # ---------- 辅助方法: 绘制手部(指定索引范围) ----------
     def _draw_hands_range(self, canvas, keypoints, scores, threshold, hand_start, hand_end, hand_point_size, eps, W, H, hand_scale=1.0, color_scheme="v4_custom"):
@@ -348,6 +414,21 @@ class KeypointDraw:
         for i in sorted_idx:
             self._draw_single_limb(canvas, i, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
 
+    # ---------- 辅助方法: 绘制一组脚部骨骼 ----------
+    def _draw_foot_limb_group(self, canvas, foot_indices, keypoints, scores, threshold, stick_width, color_scheme="v4_custom"):
+        """绘制一组脚部骨骼（踝→大趾线）。"""
+        for i in foot_indices:
+            self._draw_single_foot_limb(canvas, i, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
+
+    # ---------- 辅助方法: 绘制脚部圆点 ----------
+    def _draw_foot_dots(self, canvas, keypoints, scores, threshold, foot_range, W, H, dot_size=4):
+        """绘制指定范围内脚部关键点圆点。"""
+        for i in foot_range:
+            if scores is not None and scores[i] < threshold: continue
+            x, y = int(keypoints[i][0]), int(keypoints[i][1])
+            if 0 <= x < W and 0 <= y < H:
+                self.circle(canvas, (x, y), dot_size, FOOT_DOT_COLORS[i - 18])
+
     # ---------- 自适应臂腿覆盖规则 ----------
     def _arms_cover_legs(self, yaw, keypoints):
         """
@@ -374,7 +455,8 @@ class KeypointDraw:
     def draw_wholebody_keypoints(self, canvas, keypoints, scores=None, threshold=0.3,
                                  draw_body=True, draw_feet=True, draw_face=True, draw_hands=True,
                                  stick_width=4, face_point_size=3, hand_point_size=4,
-                                 yaw=None, hand_scale=1.0, color_scheme="v4_custom"):
+                                 yaw=None, hand_scale=1.0, color_scheme="v4_custom",
+                                 foot_mode="dots"):
         H, W = canvas.shape[:2]
         eps = 0.01
 
@@ -395,14 +477,29 @@ class KeypointDraw:
             else:
                 return [], [], []
 
+        def get_foot_group(side):
+            """根据side返回脚部骨骼索引和脚部圆点索引范围。"""
+            if side == "left":
+                return LEFT_FOOT_LIMBS, range(18, 21)
+            elif side == "right":
+                return RIGHT_FOOT_LIMBS, range(21, 24)
+            elif side == "both":
+                return ALL_FOOT_LIMBS, range(18, 24)
+            else:
+                return [], []
+
         bottom_legs, bottom_arms, bottom_faces = get_limb_group(bottom_side)
         top_legs, top_arms, top_faces = get_limb_group(top_side)
+
+        # ---- 脚部前后分组 ----
+        bottom_feet_limbs, bottom_feet_dots = get_foot_group(bottom_side)
+        top_feet_limbs, top_feet_dots = get_foot_group(top_side)
 
         # ---- 自适应臂腿覆盖规则 ----
         arms_cover = self._arms_cover_legs(yaw, keypoints)
 
         # ======================================================
-        # Layer 0 (底层, 先画): 后侧四肢 + 后侧脸部骨骼 + 后侧手 + 后侧脚圆点 + 后侧眼
+        # Layer 0 (底层, 先画): 后侧四肢 + 后侧脸部骨骼 + 后侧手 + 后侧脚 + 后侧眼
         # ======================================================
         if draw_body and len(keypoints) >= 18:
             if bottom_side == "both":
@@ -437,19 +534,12 @@ class KeypointDraw:
 
         # 后侧脚
         if draw_feet and len(keypoints) >= 24:
-            if bottom_side == "left":
-                foot_range = range(18, 21)
-            elif bottom_side == "right":
-                foot_range = range(21, 24)
-            elif bottom_side == "both":
-                foot_range = range(18, 24)
+            if foot_mode == "line":
+                # 线条模式：画踝→大趾线，不画圆点
+                self._draw_foot_limb_group(canvas, bottom_feet_limbs, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
             else:
-                foot_range = []
-            for i in foot_range:
-                if scores is not None and scores[i] < threshold: continue
-                x, y = int(keypoints[i][0]), int(keypoints[i][1])
-                if 0 <= x < W and 0 <= y < H:
-                    self.circle(canvas, (x, y), 4, FOOT_DOT_COLORS[i - 18])
+                # dots 模式：画圆点（原有行为）
+                self._draw_foot_dots(canvas, keypoints, scores, threshold, bottom_feet_dots, W, H)
 
         # 后侧眼 (面部点 DWPose: 左眼 36-41, 右眼 42-47, 在 keypoints 中索引为 24+36=60 到 24+48=72)
         if draw_face and len(keypoints) >= 92:
@@ -516,17 +606,12 @@ class KeypointDraw:
 
         # 前侧脚
         if draw_feet and len(keypoints) >= 24:
-            if top_side == "left":
-                foot_range = range(18, 21)
-            elif top_side == "right":
-                foot_range = range(21, 24)
+            if foot_mode == "line":
+                # 线条模式：画踝→大趾线，不画圆点
+                self._draw_foot_limb_group(canvas, top_feet_limbs, keypoints, scores, threshold, stick_width, color_scheme=color_scheme)
             else:
-                foot_range = []
-            for i in foot_range:
-                if scores is not None and scores[i] < threshold: continue
-                x, y = int(keypoints[i][0]), int(keypoints[i][1])
-                if 0 <= x < W and 0 <= y < H:
-                    self.circle(canvas, (x, y), 4, FOOT_DOT_COLORS[i - 18])
+                # dots 模式：画圆点（原有行为）
+                self._draw_foot_dots(canvas, keypoints, scores, threshold, top_feet_dots, W, H)
 
         # 前侧眼
         if draw_face and len(keypoints) >= 92:

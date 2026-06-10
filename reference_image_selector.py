@@ -208,7 +208,10 @@ class ReferenceImageUtils:
                 main_index = 0
                 info_lines.append("主参考图固定为第一张 (不允许更换)")
             else:
-                info_lines.append("不允许更换主参考图, 但第一张不在候选集内, 回退算法选择")
+                # 方案A: 强制将第一张纳入候选集
+                info_lines.append("固定第一张: 索引0不在候选集内, 强制加入候选集")
+                candidate_indices.insert(0, 0)
+                main_index = 0
         
         info_lines.append(f"主参考图索引: {main_index}, 角度: {angle_map_list[main_index]:.1f}°")
         
@@ -286,6 +289,18 @@ class ReferenceImageSelector:
     FUNCTION = "select"
     CATEGORY = "CustomNodes/SDPose"
 
+    @staticmethod
+    def _append_background(images, background_images, info_lines):
+        """将 background_images 拼接到 images 末尾（如果存在）"""
+        if background_images is not None and background_images.shape[0] > 0:
+            parts = [images]
+            for i in range(background_images.shape[0]):
+                parts.append(background_images[i:i+1].clone())
+            info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张，原始图片直接插入)")
+            return torch.cat(parts, dim=0)
+        info_lines.append("背景图: 无")
+        return images
+
     def select(self, reference_images, angle_map, yaw_angles=None, background_images=None, select_references=True, allow_switch_main=True):
         info_lines = []
         total_ref_count = reference_images.shape[0]
@@ -300,29 +315,32 @@ class ReferenceImageSelector:
         # ==================== 0. 空张量守卫 ====================
         if total_ref_count == 0:
             info_lines.append("参考图为空")
-            info_lines.append("背景图: 无")
+            result = self._append_background(raw_images, background_images, info_lines)
             info = "\n".join(info_lines)
-            return (raw_images, raw_images, info, validated_angle_map)
+            return (result, result, info, validated_angle_map)
 
-        # ==================== 1. yaw_angles 未接入 → 直接输出原始参考图 ====================
+        # ==================== 1. yaw_angles 未接入 → 直接输出原始参考图（含背景图） ====================
         if yaw_angles is None:
             info_lines.append("yaw_angles 未接入, 直接输出全部参考图")
+            result = self._append_background(raw_images, background_images, info_lines)
             info = "\n".join(info_lines)
-            return (raw_images, raw_images, info, validated_angle_map)
+            return (result, raw_images, info, validated_angle_map)
 
-        # ==================== 2. angle_map 无效 → 直接输出原始参考图 ====================
+        # ==================== 2. angle_map 无效 → 直接输出原始参考图（含背景图） ====================
         if angle_map_list is None:
             info_lines.append("angle_map 无效, 直接输出全部参考图")
+            result = self._append_background(raw_images, background_images, info_lines)
             info = "\n".join(info_lines)
-            return (raw_images, raw_images, info, validated_angle_map)
+            return (result, raw_images, info, validated_angle_map)
 
         map_count = len(angle_map_list)
         if map_count != total_ref_count:
             info_lines.append(
                 f"angle_map 数量({map_count})与参考图数量({total_ref_count})不匹配, 直接输出全部参考图"
             )
+            result = self._append_background(raw_images, background_images, info_lines)
             info = "\n".join(info_lines)
-            return (raw_images, raw_images, info, validated_angle_map)
+            return (result, raw_images, info, validated_angle_map)
 
         info_lines.append(f"角度映射: {angle_map_list}")
 
@@ -334,23 +352,33 @@ class ReferenceImageSelector:
                 info_lines.append("偏航角数据为空, 直接输出全部参考图")
             else:
                 info_lines.append("偏航角数据不足(仅1帧), 视为无效输入, 直接输出全部参考图")
+            result = self._append_background(raw_images, background_images, info_lines)
             info = "\n".join(info_lines)
-            return (raw_images, raw_images, info, validated_angle_map)
+            return (result, raw_images, info, validated_angle_map)
 
-        # ==================== 4-9. 提取选择排序核心逻辑（复用 ReferenceImageUtils）====================
+        # ==================== 4-9. 选择排序核心逻辑 ====================
         candidate_indices = ReferenceImageUtils._filter_by_range(angle_map_list, min(yaw_list), max(yaw_list)) if select_references else list(range(total_ref_count))
         if len(candidate_indices) == 0:
             info_lines.append("无参考图角度在偏航角范围内, 直接输出全部参考图")
+            result = self._append_background(raw_images, background_images, info_lines)
             info = "\n".join(info_lines)
-            return (raw_images, raw_images, info, validated_angle_map)
+            return (result, raw_images, info, validated_angle_map)
 
         candidate_angles = [angle_map_list[i] for i in candidate_indices]
         info_lines.append(f"候选参考图索引: {candidate_indices}, 角度: {candidate_angles}")
 
+        # 确定主参考图
         main_index = ReferenceImageUtils._find_main_reference(candidate_indices, angle_map_list, yaw_list)
-        if not allow_switch_main and 0 in candidate_indices:
-            main_index = 0
-            info_lines.append("主参考图固定为第一张 (不允许更换)")
+
+        if not allow_switch_main:
+            if 0 in candidate_indices:
+                main_index = 0
+                info_lines.append("主参考图固定为第一张 (不允许更换)")
+            else:
+                # 方案A: 强制将第一张纳入候选集
+                info_lines.append("固定第一张: 索引0不在候选集内, 强制加入候选集")
+                candidate_indices.insert(0, 0)
+                main_index = 0
 
         info_lines.append(f"主参考图索引: {main_index}, 角度: {angle_map_list[main_index]:.1f}°")
 

@@ -53,6 +53,7 @@ class WanAnimateToVideoCustom:
                 "mid_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "legacy 模式中间帧锚点强度"}),
                 "neutral_mix_min": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "legacy 模式掩码=0时的中性灰混合比例"}),
                 "neutral_mix_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "legacy 模式掩码=1时的中性灰混合比例"}),
+                "prev_latent": ("LATENT", {"tooltip": "前一段输出的完整 latent（concat_latent），接入后忽略 continue_motion，直接用前一段潜变量替换中性灰帧编码后的 latent"}),
             }
         }
 
@@ -71,7 +72,7 @@ class WanAnimateToVideoCustom:
                 face_strength=1.0, pose_strength=1.0,
                 mid_frame=-1, mid_strength=0.5,
                 neutral_mix_min=0.0, neutral_mix_max=1.0,
-                yaw_angles=None):
+                yaw_angles=None, prev_latent=None):
 
         trim_to_pose_video = False
         latent_length = ((length - 1) // 4) + 1
@@ -79,6 +80,8 @@ class WanAnimateToVideoCustom:
         latent_height = height // 8
         trim_latent = 0
         ref_motion_latent_length = 0
+        _prev_latent_samples = None
+        _motion_latent_count = 0
 
         # ----- 参考图像处理（根据模式走不同路径） -----
         if reference_image is None:
@@ -120,8 +123,17 @@ class WanAnimateToVideoCustom:
                                device=concat_latent_image.device, dtype=concat_latent_image.dtype)
             trim_latent += concat_latent_image.shape[2]
 
-        # ----- continue_motion 处理 -----
-        if continue_motion is None:
+        # ----- continue_motion 处理（支持前一段 latent 直传） -----
+        if prev_latent is not None:
+            # 潜变量直传模式：忽略 continue_motion 像素帧，直接用中性灰占位
+            motion_latent_count = ((continue_motion_max_frames - 1) // 4) + 1
+            ref_motion_latent_length = motion_latent_count
+            image = torch.ones((length, height, width, 3)) * 0.5
+            _prev_latent_samples = prev_latent["samples"]
+            _motion_latent_count = motion_latent_count
+            logging.info("[PrevLatent] 启用潜变量直传，从上一段截取 %d 帧 latent（等效 %d 像素帧）",
+                         motion_latent_count, continue_motion_max_frames)
+        elif continue_motion is None:
             image = torch.ones((length, height, width, 3)) * 0.5
         else:
             continue_motion = continue_motion[-continue_motion_max_frames:]
@@ -205,7 +217,10 @@ class WanAnimateToVideoCustom:
         ref_images_num = max(0, ref_motion_latent_length * 4 - 3)
         # EverAnimate 兼容的保护帧数（character_mask/background_video 偏移量用）
         continue_motion_latents = ref_motion_latent_length
-        continue_motion_frames = continue_motion.shape[0] if continue_motion is not None else 0
+        if prev_latent is not None:
+            continue_motion_frames = continue_motion_max_frames
+        else:
+            continue_motion_frames = continue_motion.shape[0] if continue_motion is not None else 0
         effective_frame_offset = max(0, int(video_frame_offset) - continue_motion_frames)
         protected_frames = ref_motion_latent_length * 4
         if background_video is not None:
@@ -218,7 +233,33 @@ class WanAnimateToVideoCustom:
         # ----- 基于 continue_motion 内容生成掩码 -----
         mask_refmotion = torch.ones((1, 1, latent_length * 4, latent_height, latent_width),
                                      device=concat_latent_image.device, dtype=concat_latent_image.dtype)
-        if continue_motion is not None:
+        if prev_latent is not None:
+            # 潜变量直传模式：无 continue_motion 像素帧，掩码简化处理
+            N = ref_motion_latent_length * 4
+            if mode == "vanilla":
+                mask_refmotion[:, :, :N, :, :] = 0.0
+            elif mode == "legacy" and tail_frame_count > 0:
+                # legacy 模式基于帧数计算，不依赖像素内容，可以正常工作
+                tail_len = min(tail_frame_count, N)
+                if tail_len > 0:
+                    use_mid = (mid_frame >= 1 and mid_frame <= tail_len)
+                    if use_mid:
+                        mid_idx = mid_frame - 1
+                        strengths_first = torch.linspace(tail_start_strength, mid_strength, mid_idx + 1, device=mask_refmotion.device)
+                        strengths_second = torch.linspace(mid_strength, tail_end_strength, tail_len - mid_idx, device=mask_refmotion.device)
+                        strengths = torch.cat([strengths_first, strengths_second[1:]])
+                        logging.info("[PrevLatent][legacy模式] 使用中间帧锚点：第%d帧强度=%.2f，尾帧强度序列长度=%d", mid_frame, mid_strength, tail_len)
+                    else:
+                        strengths = torch.linspace(tail_start_strength, tail_end_strength, tail_len, device=mask_refmotion.device)
+                        logging.info("[PrevLatent][legacy模式] 未启用中间帧锚点，使用线性插值")
+                    float_mask = torch.zeros(N, device=mask_refmotion.device)
+                    for i in range(tail_len):
+                        frame_idx = N - tail_len + i
+                        float_mask[frame_idx] = max(float_mask[frame_idx].item(), strengths[i].item())
+                    expanded_float_mask = float_mask.view(1, 1, N, 1, 1)
+                    mask_refmotion[:, :, :N, :, :] = expanded_float_mask
+            # fix 模式在潜变量直传时退化为 vanilla（无像素帧可做黑帧检测）
+        elif continue_motion is not None:
             N = continue_motion.shape[0]
 
             if mode == "vanilla":
@@ -317,8 +358,16 @@ class WanAnimateToVideoCustom:
                 if character_mask.shape[2] > protected_frames:
                     mask_refmotion[:, :, protected_frames:character_mask.shape[2]] = character_mask[:, :, protected_frames:]
 
-        # ----- 拼接最终的 concat_latent_image -----
-        concat_latent_image = torch.cat((concat_latent_image, vae.encode(image[:, :, :, :3])), dim=2)
+        # ----- 拼接最终的 concat_latent_image（潜变量直传模式下替换前段 latent） -----
+        image_latent = vae.encode(image[:, :, :, :3])
+        if _prev_latent_samples is not None:
+            # 用前一段的潜变量替换最前面的 motion_latent_count 帧
+            trimmed = _prev_latent_samples[:, :, -_motion_latent_count:, :, :].to(device=image_latent.device, dtype=image_latent.dtype)
+            actual_count = min(_motion_latent_count, image_latent.shape[2])
+            image_latent[:, :, :actual_count, :, :] = trimmed[:, :, :actual_count, :, :]
+            logging.info("[PrevLatent] 已替换前 %d 帧 latent（传入 %d 帧，取末尾 %d 帧）",
+                         actual_count, _prev_latent_samples.shape[2], _motion_latent_count)
+        concat_latent_image = torch.cat((concat_latent_image, image_latent), dim=2)
 
         mask_refmotion = mask_refmotion.view(1, mask_refmotion.shape[2] // 4, 4, mask_refmotion.shape[3], mask_refmotion.shape[4]).transpose(1, 2)
         mask = torch.cat((mask, mask_refmotion), dim=2)

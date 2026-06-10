@@ -2,11 +2,14 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
+当前版本：**1.4.0** — 新增 SCAIL/SCAIL-2 多参考图视频生成支持。
+
 ## 目录
 
 - [安装](#安装)
 - [节点列表](#节点列表)
   - [WanLoop 视频生成](#wanloop-视频生成)
+  - [SCAIL/SCAIL-2 多参考图生成](#scailscail-2-多参考图生成)
   - [SDPose 姿态系统](#sdpose-姿态系统)
   - [视频工具](#视频工具)
   - [交互式工具](#交互式工具)
@@ -18,6 +21,7 @@
   - [Custom Context Windows (Manual)](#custom-context-windows-manual)
   - [Reference Image Selector](#reference-image-selector)
   - [SDPose 空帧修复](#sdpose-空帧修复)
+  - [SDPoseDrawKeypointsV2 脚部绘制模式](#sdposedrawkeypointsv2-脚部绘制模式)
   - [Folder Image Loader](#folder-image-loader)
   - [Image Batch Concat](#image-batch-concat)
   - [Image Batch Resize](#image-batch-resize)
@@ -26,6 +30,7 @@
 - [工作流](#工作流)
   - [长视频姿态检测工作流](#长视频姿态检测工作流)
   - [WanAnimate多参考图生成长视频工作流](#wananimate多参考图生成长视频工作流)
+  - [WanSCAIL2 多参考图生成长视频工作流](#wanscail2-多参考图生成长视频工作流)
 - [使用示例](#使用示例)
 - [许可证](#许可证)
 
@@ -59,16 +64,23 @@ pip install -r requirements.txt
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
-| **WanAnimateToVideoCustom** | `WanLoop/整合节点` | WanAnimate 视频生成核心节点，支持 pose/face 控制、尾帧分段掩码、中性灰混合、上下文模式等完整参数 |
+| **WanAnimateToVideoCustom** | `WanLoop/整合节点` | WanAnimate 视频生成核心节点，支持 pose/face 控制、尾帧分段掩码、中性灰混合、上下文模式、prev_latent 潜变量接续等完整参数 |
 | **单帧独立 VAE 编码** | `WanLoop/工具节点` | 将 N 张图片逐帧独立 VAE 编码后在时间维度拼接为 latent，为 ComfyUI-EverAnimate 项目提供锚点 latent |
 | **WanUni3CLoader** | `WanVideo/Control` | 加载 Uni3C ControlNet 模型，支持 fp32/bf16/fp16 精度选择（可选） |
 | **WanUni3CApply** | `WanVideo/Control` | 在 KSampler 中注入 Uni3C 运镜控制，支持 strength/start_percent/end_percent 等参数（可选） |
+
+### SCAIL/SCAIL-2 多参考图生成
+
+| 节点名 | 类别 | 说明 |
+|--------|------|------|
+| **Wan SCAIL To Video (Multi Ref)** | `model/conditioning/video_models` | SCAIL/SCAIL-2 多参考图视频生成 conditioning 节点。支持多张参考图自动编码、SCAIL-2 多身份 colored mask 注入、pose 视频引导、运动接续（prev_latent）等 |
+| **Create SCAIL-2 Colored Mask (Multi Ref)** | `conditioning/video_models/scail` | 渲染 SAM3 追踪数据为 SCAIL-2 使用的 colored mask。支持参考图和驱动视频的共享调色板排序（left_to_right/area），确保多人物场景下同一身份颜色一致 |
 
 ### SDPose 姿态系统
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
-| **Draw SDPose Keypoints (V2)** | `SDPose` | 将姿态关键点数据渲染为可视化图像，支持全身骨骼、手部、面部、脚部的分层绘制，并根据偏航角自动调整骨骼粗细与遮挡顺序 |
+| **Draw SDPose Keypoints (V2)** | `SDPose` | 将姿态关键点数据渲染为可视化图像，支持全身骨骼、手部、面部、脚部的分层绘制，并根据偏航角自动调整骨骼粗细与遮挡顺序。新增 `foot_mode` 参数支持 `dots`（圆点）和 `line`（踝→大趾线条）两种脚部绘制模式 |
 | **Save SDPose Keypoints as JSON** | `SDPose` | 保存姿态关键点数据为 JSON 文件，支持覆盖模式与自动递增编号 |
 | **Load SDPose JSON** | `SDPose` | 加载 JSON 姿态文件，支持按目标帧率自动抽帧/补帧（线性插值或复制），支持空帧自动修复 |
 | **Slice SDPose Keypoints** | `SDPose` | 对姿态序列进行时间切片（按起始帧与帧数截取） |
@@ -115,7 +127,7 @@ pip install -r requirements.txt
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
-| **Custom Context Windows (Manual)** | `context` | 通用上下文窗口调度节点。将长序列拆分为滑动窗口逐段处理，支持参考帧前缀、噪声混洗、多种调度策略（均匀/静态/循环/批处理）与融合模式（金字塔/线性叠加/相对加权），适用于需要分段式上下文管理的视频/序列生成任务 |
+| **Custom Context Windows (Manual)** | `context` | 通用上下文窗口调度节点。将长序列拆分为滑动窗口逐段处理，支持参考帧前缀、噪声混洗、多种调度策略（均匀/静态/循环/批处理）与融合模式（金字塔/线性叠加/相对加权）。新增 `causal_window_fix` 因果窗口修复功能，用于保留跨窗口的交互细节（如脚印） |
 
 ---
 
@@ -140,7 +152,7 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | `continue_motion_max_frames` | INT | 运动接续的最大参考帧数（从上一段视频尾部取帧） |
 | `video_frame_offset` | INT | 视频帧偏移量（多段拼接时递增） |
 | `transition_width` | INT | fix 模式下黑帧过渡宽度（0-128，步长 4） |
-| `mode` | 枚举 | `legacy`=旧版尾帧分段掩码模式 / `fix`=硬替换中性灰+过渡扩散模式 |
+| `mode` | 枚举 | `vanilla`=官方行为 / `legacy`=旧版尾帧分段掩码模式 / `fix`=硬替换中性灰+过渡扩散模式 |
 | `tail_frame_count` | INT | legacy 模式下尾帧掩码覆盖的帧数 |
 | `tail_start_strength` | FLOAT | legacy 模式下尾帧掩码起始强度 |
 | `tail_end_strength` | FLOAT | legacy 模式下尾帧掩码结束强度 |
@@ -157,6 +169,7 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | `continue_motion` | IMAGE | 上一段视频的尾部帧，用于运动接续 |
 | `background_video` | IMAGE | 背景视频，覆盖参考图批次中运动接续帧之后的区域 |
 | `character_mask` | MASK | 角色遮罩，在运动接续帧之后替换 concat_mask |
+| `prev_latent` | LATENT | 前一段输出的完整 latent（concat_latent），接入后忽略 continue_motion，直接用前一段潜变量替换中性灰帧编码后的 latent |
 | `face_strength` | FLOAT | 面部视频强度系数（0-1，默认 1.0） |
 | `mid_frame` | INT | legacy 模式下中间帧锚点位置（-1=禁用） |
 | `mid_strength` | FLOAT | legacy 模式下中间帧锚点强度 |
@@ -174,17 +187,6 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | `video_frame_offset` | INT | 累积帧偏移（用于多段拼接时传递给下一段） |
 | `concat_latent` | LATENT | 拼接后的完整 latent 图像（用于解码输出） |
 
-#### 两种模式的差异
-
-**legacy 模式**（推荐用于需要精细控制尾帧过渡的场景）：
-- 尾帧掩码强度由 `tail_start_strength` → `tail_end_strength` 线性过渡（可配合 `mid_frame` 设置中间锚点实现非线性过渡）
-- 支持中性灰混合：尾帧区域的图像会按掩码强度混合中性灰（`neutral_mix_min` 为掩码=0 时的混合比例，`neutral_mix_max` 为掩码=1 时的比例）
-
-**fix 模式**（推荐用于黑帧过渡场景）：
-- 纯黑帧被直接替换为中性灰（0.5）
-- 黑帧两侧的过渡区域按 `transition_width` 进行渐变扩散
-- 注意：纯白区域也会被视为有效内容
-
 #### 典型工作流
 
 ```
@@ -194,14 +196,14 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 [面部视频]          → face_video ──────┤
 [正向提示词]        → positive ────────┤
 [负向提示词]        → negative ────────┤
-                                       ↓
-                              WanAnimateToVideoCustom
-                                       ↓
-                    positive / negative / latent → [KSampler]
-                                                       ↓
-                                               [VAE Decode]
-                                                       ↓
-                                                  输出视频
+                                        ↓
+                               WanAnimateToVideoCustom
+                                        ↓
+                     positive / negative / latent → [KSampler]
+                                                        ↓
+                                                [VAE Decode]
+                                                        ↓
+                                                   输出视频
 ```
 
 ---
@@ -224,6 +226,7 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | `freenoise` | BOOLEAN | 是否启用 FreeNoise 噪声混洗（改善窗口间连续性） |
 | `prefix_latent_num` | INT | 前缀参考帧的 latent 数量。接参考图选择器 raw_reference_images 的图片数量即可（每张图片编码为1个 latent）。这些帧会作为稳定参考拼接到每个窗口前 |
 | `split_conds_to_windows` | BOOLEAN | 是否将多个 conditioning 按区域索引分配给各窗口 |
+| `causal_window_fix` | BOOLEAN | 因果窗口修复（默认 True）。开启后在每个窗口前补上一窗口的 denoised 末帧，保留脚印等交互细节。会牺牲并行性（每次 denoise step 内窗口串行执行） |
 
 #### 调度策略 (context_schedule)
 
@@ -248,15 +251,16 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 1. **帧数转换**：`context_length`、`context_overlap` 均以像素帧为单位输入，节点内部自动转换为 latent 帧（每 4 像素帧 → 1 latent 帧）。
 2. **前缀参考帧**：设置 `prefix_latent_num > 0` 后，该数量的参考图 latent 会被追加到每个窗口开头作为稳定参考，适合需要全局上下文信息的生成任务。
 3. **freenoise**：启用后会混洗噪声以改善窗口间的纹理连续性，建议在总帧数较长且重叠较小时开启。
+4. **causal_window_fix**：启用后会在每个窗口前补入上一窗口 denoised 输出的末帧作为 anchor，有效保留脚印、地面交互等跨窗口连续性细节。注意这会强制窗口串行执行，降低并行度。
 
 #### 典型工作流
 
 ```
 [加载模型] → model ──┐
-                     ↓
-          Custom Context Windows (Manual)
-                     ↓
-              model (已封装) → [KSampler] → [VAE Decode] → 输出
+                      ↓
+           Custom Context Windows (Manual)
+                      ↓
+               model (已封装) → [KSampler] → [VAE Decode] → 输出
 ```
 
 ---
@@ -299,10 +303,10 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 [多角度参考图] → reference_images ─┐
 [角度映射 JSON] → angle_map ───────┤
 [偏航角序列]    → yaw_angles ─────┤
-                                   ↓
-                        Reference Image Selector
-                                   ↓
-                          selected_images → [WanAnimateToVideoCustom] reference_image
+                                    ↓
+                         Reference Image Selector
+                                    ↓
+                           selected_images → [WanAnimateToVideoCustom] reference_image
 ```
 
 > **提示**：`angle_map` 输入可直接连接前端 JS 节点 `Angle Map Config` 来可视化配置角度映射。
@@ -330,6 +334,19 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 
 - 在姿态数据来源不够稳定的情况下建议开启
 - 配合 `Estimate Yaw` 节点使用时可有效避免因空帧导致的角度跳变
+
+---
+
+### SDPoseDrawKeypointsV2 脚部绘制模式
+
+从 v1.4.0 开始，SDPoseDrawKeypointsV2 新增 `foot_mode` 参数，提供两种脚部绘制方式：
+
+| 模式 | 说明 |
+|------|------|
+| `dots` | 默认模式。在脚部关键点位置绘制彩色圆点（与之前版本行为一致） |
+| `line` | 线条模式。绘制踝关节→大脚趾的连线，更清晰地表现脚部朝向和姿态，不绘制圆点 |
+
+两种模式下都会根据 `bottom_side` / `top_side` 参数进行前后侧分层绘制，确保遮挡关系正确。
 
 ---
 
@@ -385,10 +402,10 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 ```
 [FolderImageLoader A] → images_a ─┐
 [FolderImageLoader B] → images_b ─┤
-                                   ↓
-                          Image Batch Concat
-                                   ↓
-                              images (合并批次)
+                                    ↓
+                           Image Batch Concat
+                                    ↓
+                               images (合并批次)
 ```
 
 ---
@@ -481,7 +498,7 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
 ```
 [WanUni3CLoader] → uni3c_controlnet ─┐
 [渲染好的 latent] → render_latent ────┤
-                                      ↓
+                                       ↓
 [模型] → WanUni3CApply → model (已注入控制) → [KSampler] → [VAE Decode] → 输出
 ```
 
@@ -491,13 +508,16 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
 
 ## 工作流
 
-`workflow/` 目录下提供了两个完整的 ComfyUI 工作流 JSON 文件，可直接拖入 ComfyUI 界面使用。
+`workflow/` 目录下提供了多个完整的 ComfyUI 工作流 JSON 文件，可直接拖入 ComfyUI 界面使用。
 
 ### 长视频姿态检测工作流
 
-**文件**：`Long_Pose_detection_while_new.json`
+**文件**：`Long_Pose_detection_SD_offical.json` / `Long_Pose_detection_SDpose.json`
 
 **用途**：对长视频进行逐帧骨骼（body）和面部关键点检测，支持将检测骨骼与参考图人物的骨骼进行比例对齐（BodyRatioMapper），最终生成骨骼可视化视频、面部特征 JSON 和姿态 JSON 文件。适用于制作舞蹈骨骼动画、动作捕捉数据提取等场景。
+
+- `Long_Pose_detection_SD_offical.json`：使用官方 SDPoseOODProcessor 进行姿态识别
+- `Long_Pose_detection_SDpose.json`：使用 SDPose 流程进行姿态识别（配合自定义节点）
 
 **简要使用说明**：
 
@@ -550,7 +570,7 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
 - 该模块位于工作流下半部分（通常 mute 状态），包含 `InteractiveBatchCrop` 交互式裁剪、`SDPoseLoadJson` 加载 360° 关键点 JSON、`SDPoseResizeKeypoints` 缩放关键点、`SDPoseDrawKeypointsV2` 绘制姿态视频；
 - 配套文件（360° 关键点 JSON 等）需放置在 `output/video/360°` 目录下；
 - 用户可运行预处理模块生成 360° 环绕视角姿态视频批次，从中挑选合适角度的帧作为副参考图；
-- 复杂预处理建议使用主工作流（`Long_Pose_detection_while_new.json`）进行。
+- 复杂预处理建议使用主工作流（`Long_Pose_detection_SD_offical.json` 或 `Long_Pose_detection_SDpose.json`）进行。
 
 **本工作流使用到的第三方节点包**（不含本工作区 `ComfyUI-CustomNodeKit` 自身节点）：
 
@@ -568,6 +588,22 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
 | `pr-was-node-suite-comfyui-47064894` | `Image Filter Adjustments` 图像滤镜调整、`Random Number` 随机种子 |
 | `comfyui_memory_cleanup` | `RAMCleanup` / `VRAMCleanup` 内存/显存清理 |
 | `ComfyUI-EasyColorCorrector` | `BatchColorCorrection` 批量色彩校正 |
+
+### WanSCAIL2 多参考图生成长视频工作流
+
+**文件**：`test_WanSCAIL2_ref_pics_loop+context.json`
+
+**用途**：基于 Wan SCAIL/SCAIL-2 模型，使用多张参考图生成带有上下文窗口的长视频。支持多身份识别（通过 SAM3 追踪 + colored mask），可实现动画模式（Animation Mode）和替换模式（Replacement Mode）两种生成策略。
+
+**简要使用说明**：
+
+1. 在「模型、LoRA及VAE加载」区域加载 SCAIL 模型及相关组件；
+2. 加载参考图并通过 SAM3 生成参考图追踪数据；
+3. 加载驱动视频并通过 SAM3 生成驱动视频追踪数据；
+4. 使用 `Create SCAIL-2 Colored Mask (Multi Ref)` 节点生成 colored mask，选择合适的排序方式（left_to_right/area）确保多身份颜色一致性；
+5. 将 colored mask 和驱动视频接入 `Wan SCAIL To Video (Multi Ref)` 节点；
+6. 运行后逐段生成视频帧，利用上下文窗口实现长视频生成；
+7. 生成完成后将帧序列合成为视频文件。
 
 ---
 
@@ -595,27 +631,27 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
 [Reference Image] → WanAnimateToVideoCustom
 [Pose Video]       →  (pose_video 输入)
 [Face Video]       →  (face_video 输入)
-                      ↓
-              positive / negative / latent → [KSampler] → [VAE Decode] → 输出视频
+                       ↓
+               positive / negative / latent → [KSampler] → [VAE Decode] → 输出视频
 ```
 
 ### 2. SDPose 姿态可视化流水线
 
 ```
 [SDPose JSON 文件] → Load SDPose JSON
-                      ↓
-              [Estimate Yaw] → yaw_array
-                      ↓
-              [Resize Keypoints] → 统一尺寸
-                      ↓
-              [Draw Keypoints V2] → 可视化图像
+                       ↓
+               [Estimate Yaw] → yaw_array
+                       ↓
+               [Resize Keypoints] → 统一尺寸
+                       ↓
+               [Draw Keypoints V2] → 可视化图像 (支持 foot_mode=line/dots)
 ```
 
 ### 3. 上下文窗口视频生成
 
 ```
 [模型] → Custom Context Windows (Manual) → model (已封装)
-                                              ↓
+                                               ↓
 [prompt] → CLIP Text Encode → positive ──────┤
 [WanAnimateToVideoCustom] → positive/negative/latent → [KSampler] → [VAE Decode] → 视频
 ```
@@ -624,8 +660,27 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
 
 ```
 [多角度参考图] → Reference Image Selector ← yaw_angles ← [Estimate Yaw]
-                      ↓
-              selected_images → [WanAnimateToVideoCustom] reference_image
+                       ↓
+               selected_images → [WanAnimateToVideoCustom] reference_image
+```
+
+### 5. SCAIL/SCAIL-2 多参考图视频生成
+
+```
+[SAM3 参考图追踪] → ref_track_data ─┐
+[SAM3 驱动追踪]    → driving_data ──┤
+                                    ↓
+                   Create SCAIL-2 Colored Mask (Multi Ref)
+                                    ↓
+               pose_video_mask / reference_image_mask
+                                    ↓
+[多张参考图] → reference_image ────┤
+[驱动视频]   → pose_video ────────┤
+[条件]       → positive/negative ─┤
+                                  ↓
+                   Wan SCAIL To Video (Multi Ref)
+                                  ↓
+                  positive / negative / latent → [KSampler]
 ```
 
 ---
@@ -641,7 +696,7 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
 - comfyui-videohelpersuite — 视频工具
 - comfyui-custom-scripts — 实用节点
 
-同时，本项目中的 WanAnimate 多参考图视频生成逻辑、偏航角估计算法、上下文窗口调度策略、骨骼绘制引擎等核心逻辑均为自主实现。
+同时，本项目中的 WanAnimate 多参考图视频生成逻辑、偏航角估计算法、上下文窗口调度策略、骨骼绘制引擎、SCAIL/SCAIL-2 多参考图支持等核心逻辑均为自主实现。
 
 ---
 
