@@ -5,6 +5,7 @@ from typing_extensions import override
 
 import torch
 import torch.nn.functional as F
+import logging
 
 import nodes
 import node_helpers
@@ -208,12 +209,12 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                     ref_pixels.movedim(-1, 1), width, height, "area", "center"
                 ).movedim(1, -1)
                 concat_ref_latent = vae.encode(ref_pixels[:, :, :, :3])
-                # concat_ref_latent: (1, 16, N, H/8, W/8)
+                # concat_ref_latent: (1, 16, 4N-3, H/8, W/8)
             else:  # "逐帧编码"
                 ref_latent_parts = []
                 for i in range(num_refs):
                     single_ref = comfy.utils.common_upscale(
-                        reference_image[i:i+1].movedim(-1, 1), width, height, "bicubic", "center"
+                        reference_image[i:i+1].movedim(-1, 1), width, height, "area", "center"
                     ).movedim(1, -1)
                     if replacement_mode and reference_image_mask is not None:
                         mask_idx = min(i, reference_image_mask.shape[0] - 1)
@@ -264,6 +265,12 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
         if pose_video_mask is not None:
             mask_video_hw = comfy.utils.common_upscale(pose_video_mask[:length].movedim(-1, 1), width // 2, height // 2, "area", "center").movedim(1, -1)
             driving_mask_28ch = _extract_mask_to_28ch(mask_video_hw)
+            logging.info(
+                "[WanSCAIL_COND] driving_mask_28ch: shape=%s, val_range=[%.6f, %.6f], mean=%.6f",
+                list(driving_mask_28ch.shape),
+                driving_mask_28ch.min().item(), driving_mask_28ch.max().item(),
+                driving_mask_28ch.mean().item()
+            )
             positive = node_helpers.conditioning_set_values(positive, {"driving_mask_28ch": driving_mask_28ch})
             negative = node_helpers.conditioning_set_values(negative, {"driving_mask_28ch": driving_mask_28ch})
 
@@ -271,37 +278,67 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
         # Each ref mask after _extract_mask_to_28ch: (1, 1, 28, H_lat, W_lat)
         # Concatenate N masks in temporal dim (dim=1) → (1, N, 28, H_lat, W_lat)
         # Then append zeros for the T_lat video frames → (1, N+T_lat, 28, H_lat, W_lat)
+        # In "1+4n批量" mode, the mask should be expanded at pixel level (1st ×1, rest ×4)
+        # before _extract_mask_to_28ch, to match how the reference image is expanded.
+        # Both paths produce N frames of latent mask because _extract_mask_to_28ch does 4→1 compression:
+        #   "1+4n批量": (4N-3) pixel frames → 4→1 → N latent frames
+        #   "逐帧编码": N pixel frames → 4→1 → N latent frames
         if reference_image_mask is not None:
-            ref_mask_t_parts = []
-            num_masks = reference_image_mask.shape[0]
-            for i in range(num_masks):
+            if ref_encoding_mode == "1+4n批量":
+                # 1+4n pixel-level expansion: 1st mask ×1, rest ×4
+                mask_parts = [reference_image_mask[0:1]]
+                if reference_image_mask.shape[0] > 1:
+                    for i in range(1, reference_image_mask.shape[0]):
+                        mask_parts.append(reference_image_mask[i:i+1].repeat(4, 1, 1, 1))
+                masks_expanded = torch.cat(mask_parts, dim=0)  # (4N-3, H, W, 3)
+                # Upsample all together, then single _extract_mask_to_28ch call gets (4N-3)
+                # frames → internal 4→1 compression → N latent frames
                 ref_mask_hw = comfy.utils.common_upscale(
-                    reference_image_mask[i:i+1].movedim(-1, 1), width, height, "bicubic", "center"
+                    masks_expanded.movedim(-1, 1), width, height, "bicubic", "center"
                 ).movedim(1, -1)
-                ref_mask_1f = _extract_mask_to_28ch(ref_mask_hw)  # (1, 1, 28, H_lat, W_lat)
-                ref_mask_t_parts.append(ref_mask_1f)
+                ref_mask_concat = _extract_mask_to_28ch(ref_mask_hw)  # (1, N, 28, H_lat, W_lat)
+            else:  # "逐帧编码"
+                ref_mask_t_parts = []
+                for i in range(reference_image_mask.shape[0]):
+                    ref_mask_hw = comfy.utils.common_upscale(
+                        reference_image_mask[i:i+1].movedim(-1, 1), width, height, "bicubic", "center"
+                    ).movedim(1, -1)
+                    ref_mask_1f = _extract_mask_to_28ch(ref_mask_hw)  # (1, 1, 28, H_lat, W_lat)
+                    ref_mask_t_parts.append(ref_mask_1f)
+                # N pixel frames → N single-frame encodes → concat in dim=1 → (1, N, 28, H_lat, W_lat)
+                ref_mask_concat = torch.cat(ref_mask_t_parts, dim=1)
 
-            # Concatenate all ref masks along temporal dim
-            ref_mask_concat = torch.cat(ref_mask_t_parts, dim=1)  # (1, N, 28, H_lat, W_lat)
-
-            # Pad zeros for the video portion
+            # Pad with very small value to avoid zero boundary in ref_mask_28ch
             T_lat = latent.shape[2]
-            zeros = torch.zeros(
+            zeros = torch.full(
                 (1, T_lat, 28, ref_mask_concat.shape[-2], ref_mask_concat.shape[-1]),
+                fill_value=0.001,
                 device=ref_mask_concat.device, dtype=ref_mask_concat.dtype
             )
-            ref_mask_full = torch.cat([ref_mask_concat, zeros], dim=1)  # (1, N+T_lat, 28, H_lat, W_lat)
+            ref_mask_full = torch.cat([ref_mask_concat, zeros], dim=1)  # (1, N_ref_mask+T_lat, 28, H_lat, W_lat)
 
             positive = node_helpers.conditioning_set_values(positive, {"ref_mask_28ch": ref_mask_full})
             negative = node_helpers.conditioning_set_values(negative, {"ref_mask_28ch": ref_mask_full})
+
+        logging.info(
+            "[WanSCAIL_COND] video_frame_offset=%d, length=%d, latent_len=%d, pose_video=%s, pose_video_mask=%s",
+            video_frame_offset, length, latent.shape[2],
+            list(pose_video.shape) if pose_video is not None else "None",
+            list(pose_video_mask.shape) if pose_video_mask is not None else "None",
+        )
 
         if prev_trimmed is not None:
             pf = comfy.utils.common_upscale(prev_trimmed.movedim(-1, 1), width, height, "bicubic", "center").movedim(1, -1)
             prev_latent = vae.encode(pf[:, :, :, :3])
             prev_latent_frames  = min(prev_latent.shape[2], latent.shape[2])
             latent[:, :, :prev_latent_frames] = prev_latent[:, :, :prev_latent_frames].to(latent.dtype)
-            noise_mask = torch.ones((1, 1, latent.shape[2], latent.shape[-2], latent.shape[-1]), device=latent.device, dtype=latent.dtype)
+            noise_mask = torch.ones((1, 1, latent.shape[2], latent.shape[-2], latent.shape[-1]),
+                                    device=latent.device, dtype=latent.dtype)
             noise_mask[:, :, :prev_latent_frames] = 0.0
+            logging.info(
+                "[WanSCAIL] hard cut at latent frame %d",
+                prev_latent_frames
+            )
 
         out_latent = {"samples": latent}
         if noise_mask is not None:
