@@ -462,11 +462,28 @@ class IndexListContextHandler(ContextHandlerABC):
             original_list = window.original_indices
             center_min = min(original_list)
             center_max = max(original_list)
+            full_length = x_in.shape[self.dim]
+            overlap_len = min(self.context_overlap, len(original_list))
+            # 预计算首尾 ramp 修正
+            ramp_up = None
+            ramp_down = None
+            if overlap_len > 0:
+                if min(original_list) == 0:
+                    ramp_up = torch.linspace(0.0, 1.0, overlap_len, device=x_in.device, dtype=x_in.dtype)
+                if max(original_list) == full_length - 1:
+                    ramp_down = torch.linspace(1.0, 0.0, overlap_len, device=x_in.device, dtype=x_in.dtype)
             for i in range(len(body_out)):
                 for pos, idx in enumerate(original_list):
                     # bias = 1 - distance / max_distance，窗口中心权重最大
                     bias = 1 - abs(idx - (center_min + center_max) / 2) / ((center_max - center_min + 1e-2) / 2)
                     bias = max(1e-2, bias)
+                    # ---- 首尾 ramp 修正 ----
+                    if ramp_up is not None and pos < overlap_len:
+                        bias *= ramp_up[pos].item()
+                    if ramp_down is not None and pos >= len(original_list) - overlap_len:
+                        bias *= ramp_down[pos - (len(original_list) - overlap_len)].item()
+                    bias = max(1e-2, bias)
+                    # ---- 结束 ramp 修正 ----
                     bias_total = biases_final[i][idx]
                     prev_weight = bias_total / (bias_total + bias)
                     new_weight = bias / (bias_total + bias)
@@ -480,7 +497,26 @@ class IndexListContextHandler(ContextHandlerABC):
             # 为每个主体部分生成权重（长度 = len(window.original_indices)）
             weights = get_context_weights(len(window.original_indices), x_in.shape[self.dim],
                                           window.original_indices, self, sigma=timestep)
-            weights_tensor = match_weights_to_dim(weights, x_in, self.dim, device=x_in.device)
+            # 转 tensor
+            weights_t = torch.tensor(weights, device=x_in.device, dtype=x_in.dtype)
+
+            # ---- 首尾窗口 ramp 保护（参考 WanAnimatePlus 做法） ----
+            # 对首个窗口的左端 overlap 区：强制 ramp_up 0→1
+            # 对最后窗口的右端 overlap 区：强制 ramp_down 1→0
+            original_list = window.original_indices
+            full_length = x_in.shape[self.dim]
+            overlap_len = min(self.context_overlap, len(original_list))
+            if self.fuse_method.name == ContextFuseMethods.PYRAMID and overlap_len > 0:
+                if min(original_list) == 0:
+                    # 首窗口：左端 ramp_up
+                    ramp_up = torch.linspace(0.0, 1.0, overlap_len, device=x_in.device, dtype=x_in.dtype)
+                    weights_t[:overlap_len] = torch.maximum(weights_t[:overlap_len], ramp_up)
+                if max(original_list) == full_length - 1:
+                    # 尾窗口：右端 ramp_down
+                    ramp_down = torch.linspace(1.0, 0.0, overlap_len, device=x_in.device, dtype=x_in.dtype)
+                    weights_t[-overlap_len:] = torch.maximum(weights_t[-overlap_len:], ramp_down)
+
+            weights_tensor = match_weights_to_dim(weights_t.tolist(), x_in, self.dim, device=x_in.device)
 
             # 创建一个临时窗口，只包含原始索引，用于 add_window
             temp_window = IndexListContextWindow(window.original_indices, dim=self.dim, total_frames=window.total_frames)
@@ -698,6 +734,10 @@ def create_weights_pyramid(length: int, **kwargs) -> list[float]:
     else:
         max_weight = (length + 1) // 2
         weight_sequence = list(range(1, max_weight, 1)) + [max_weight] + list(range(max_weight - 1, 0, -1))
+    # Normalize to [0, 1] for consistent ramp overlay behavior
+    max_val = max(weight_sequence)
+    if max_val > 0:
+        weight_sequence = [w / max_val for w in weight_sequence]
     return weight_sequence
 
 

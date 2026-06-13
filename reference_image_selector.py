@@ -100,7 +100,7 @@ class ReferenceImageUtils:
     
     @classmethod
     def _build_batch_flat(cls, total_count, reference_images, info_lines, background_images=None):
-        """全量 1+4n 输出: 第0张×1 + (可选背景图块) + 其余每张×4"""
+        """全量 1+4n 输出: 第0张×1 + 前N-1张×4 + (可选背景图块) + 最后一张×4"""
         if total_count == 0:
             info_lines.append("背景图: 无")
             return (reference_images.clone(), info_lines)
@@ -109,14 +109,18 @@ class ReferenceImageUtils:
             return (reference_images.clone(), info_lines)
         
         parts = [reference_images[0:1]]
+        # 前 total_count-1 张（除最后一张）每张×4
+        for i in range(1, total_count - 1):
+            parts.append(reference_images[i:i+1].repeat(4, 1, 1, 1))
+        # 背景图插入到倒数第二张和最后一张之间
         bg_block = cls._build_background_block(background_images)
         if bg_block is not None:
             parts.append(bg_block)
             info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张 ×4 拼接)")
         else:
             info_lines.append("背景图: 无")
-        for i in range(1, total_count):
-            parts.append(reference_images[i:i+1].repeat(4, 1, 1, 1))
+        # 最后一张×4
+        parts.append(reference_images[total_count-1:total_count-1+1].repeat(4, 1, 1, 1))
         
         result = torch.cat(parts, dim=0)
         info_lines.append(f"输出图像张数: {result.shape[0]}")
@@ -124,11 +128,17 @@ class ReferenceImageUtils:
     
     @classmethod
     def _build_batch_ordered(cls, ordered_indices, reference_images, info_lines, background_images=None):
-        """按排序索引构建批次: 第0张×1 + (可选背景图块) + 其余每张×4"""
+        """按排序索引构建批次: 第0张×1 + 中间每张×4 + (可选背景图块) + 最后一张×4"""
         if len(ordered_indices) == 0:
             return reference_images[0:1].clone()
         
         parts = [reference_images[ordered_indices[0]:ordered_indices[0]+1].clone()]
+        
+        # 中间元素（索引 1 ~ N-2）每张×4
+        for idx in ordered_indices[1:-1]:
+            parts.append(reference_images[idx:idx+1].repeat(4, 1, 1, 1))
+        
+        # 背景图插入到中间元素和最后一个元素之间
         bg_block = cls._build_background_block(background_images)
         if bg_block is not None:
             parts.append(bg_block)
@@ -136,8 +146,8 @@ class ReferenceImageUtils:
         else:
             info_lines.append("背景图: 无")
         
-        for idx in ordered_indices[1:]:
-            parts.append(reference_images[idx:idx+1].repeat(4, 1, 1, 1))
+        # 最后一张×4
+        parts.append(reference_images[ordered_indices[-1]:ordered_indices[-1]+1].repeat(4, 1, 1, 1))
         
         return torch.cat(parts, dim=0)
     
@@ -393,16 +403,34 @@ class ReferenceImageSelector:
         ordered_indices = [main_index] + aux_indices
         info_lines.append(f"最终排序索引: {ordered_indices}")
 
-        # 构建输出：主参考图 + 背景图块（原始图片）+ 辅助参考图
+        # 构建输出：主参考图 + 前N-1张辅助参考图（原始图片）+ 背景图块 + 最后一张辅助参考图（原始图片）
         output_parts = [reference_images[main_index:main_index+1].clone()]
-        if background_images is not None and background_images.shape[0] > 0:
-            for i in range(background_images.shape[0]):
-                output_parts.append(background_images[i:i+1].clone())
-            info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张，原始图片直接插入)")
+        
+        # 辅助参考图分为前部(除最后一张)和尾部(最后一张)
+        if len(aux_indices) > 0:
+            # 前部：前 len(aux_indices)-1 张辅助参考图
+            for idx in aux_indices[:-1]:
+                output_parts.append(reference_images[idx:idx+1].clone())
+            # 背景图插入到前部和最后一张之间
+            if background_images is not None and background_images.shape[0] > 0:
+                for i in range(background_images.shape[0]):
+                    output_parts.append(background_images[i:i+1].clone())
+                info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张，原始图片直接插入)")
+            else:
+                info_lines.append("背景图: 无")
+            # 尾部：最后一张辅助参考图
+            output_parts.append(reference_images[aux_indices[-1]:aux_indices[-1]+1].clone())
         else:
-            info_lines.append("背景图: 无")
-        for idx in aux_indices:
-            output_parts.append(reference_images[idx:idx+1].clone())
+            # 没有辅助参考图：只有主参考图，背景图后面补主参考图副本
+            if background_images is not None and background_images.shape[0] > 0:
+                for i in range(background_images.shape[0]):
+                    output_parts.append(background_images[i:i+1].clone())
+                info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张，原始图片直接插入)")
+                output_parts.append(reference_images[main_index:main_index+1].clone())
+                info_lines.append("辅助参考图: 无, 在背景图后追加主参考图副本")
+            else:
+                info_lines.append("背景图: 无")
+        
         selected_images = torch.cat(output_parts, dim=0)
         info_lines.append(f"输出图像张数: {selected_images.shape[0]}")
 

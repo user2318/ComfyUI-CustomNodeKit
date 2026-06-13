@@ -139,7 +139,7 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                 io.Float.Input("pose_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Strength of the pose latent."),
                 io.Float.Input("pose_start", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Start step of the pose conditioning."),
                 io.Float.Input("pose_end", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="End step of the pose conditioning."),
-                io.Combo.Input("ref_encoding_mode", options=["1+4n批量", "逐帧编码"], default="1+4n批量", tooltip="参考图编码模式。1+4n批量=第1张×1其余×4后一次编码（默认,更接近训练）；逐帧编码=每张图独立编码后时间维拼接（高保真）。"),
+                io.Combo.Input("ref_encoding_mode", options=["1+4n批量", "逐帧编码", "混合编码"], default="1+4n批量", tooltip="参考图编码模式。1+4n批量=第1张×1其余×4后一次编码（默认,更接近训练）；逐帧编码=每张图独立编码后时间维拼接（高保真）；混合编码=前N-1张1+4n批量+最后1张逐帧编码（兼顾清晰度与减轻段间跳变）。"),
                 io.Image.Input("reference_image", optional=True, tooltip="Reference image(s). For multiple references, pass a batch of images (N, H, W, 3). Each image is independently encoded and added as a separate reference_latent."),
                 io.Image.Input("reference_image_mask", optional=True, tooltip="SCAIL-2 only. Colored reference mask(s) at the same resolution as reference_image. Should match the reference_image count."),
                 io.ClipVisionOutput.Input("clip_vision_output", optional=True, tooltip="CLIP vision features for conditioning. Model is trained with stretch resize to aspect ratio."),
@@ -210,7 +210,7 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                 ).movedim(1, -1)
                 concat_ref_latent = vae.encode(ref_pixels[:, :, :, :3])
                 # concat_ref_latent: (1, 16, 4N-3, H/8, W/8)
-            else:  # "逐帧编码"
+            elif ref_encoding_mode == "逐帧编码":
                 ref_latent_parts = []
                 for i in range(num_refs):
                     single_ref = comfy.utils.common_upscale(
@@ -226,6 +226,51 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                     ref_latent = vae.encode(single_ref[:, :, :, :3])
                     ref_latent_parts.append(ref_latent)
                 concat_ref_latent = torch.cat(ref_latent_parts, dim=2)
+                # concat_ref_latent: (1, 16, N, H/8, W/8)
+            else:  # "混合编码" — 前N-1张1+4n批量 + 最后1张逐帧编码
+                if num_refs == 1:
+                    # 只有1张参考图时退化为逐帧编码
+                    single_ref = comfy.utils.common_upscale(
+                        reference_image[0:1].movedim(-1, 1), width, height, "area", "center"
+                    ).movedim(1, -1)
+                    concat_ref_latent = vae.encode(single_ref[:, :, :, :3])
+                else:
+                    # 前 N-1 张: 1+4n 批量
+                    batch_parts = [reference_image[0:1]]
+                    for i in range(1, num_refs - 1):
+                        batch_parts.append(reference_image[i:i+1].repeat(4, 1, 1, 1))
+                    ref_pixels_batch = torch.cat(batch_parts, dim=0)
+                    if replacement_mode and reference_image_mask is not None:
+                        mask_parts = [reference_image_mask[0:1]]
+                        if reference_image_mask.shape[0] > 1:
+                            for i in range(1, min(num_refs - 1, reference_image_mask.shape[0])):
+                                mask_parts.append(reference_image_mask[i:i+1].repeat(4, 1, 1, 1))
+                        while len(mask_parts) < len(batch_parts):
+                            mask_parts.append(mask_parts[-1])
+                        ref_masks = torch.cat(mask_parts, dim=0)
+                        rm = comfy.utils.common_upscale(
+                            ref_masks.movedim(-1, 1), width, height, "nearest-exact", "center"
+                        ).movedim(1, -1)
+                        is_char = (rm[..., :3].max(dim=-1, keepdim=True).values > 0.1).to(ref_pixels_batch.dtype)
+                        ref_pixels_batch = ref_pixels_batch * is_char
+                    ref_pixels_batch = comfy.utils.common_upscale(
+                        ref_pixels_batch.movedim(-1, 1), width, height, "area", "center"
+                    ).movedim(1, -1)
+                    batch_latent = vae.encode(ref_pixels_batch[:, :, :, :3])
+                    # 最后1张: 逐帧编码
+                    last_ref = comfy.utils.common_upscale(
+                        reference_image[-1:].movedim(-1, 1), width, height, "area", "center"
+                    ).movedim(1, -1)
+                    if replacement_mode and reference_image_mask is not None:
+                        mask_idx = min(num_refs - 1, reference_image_mask.shape[0] - 1)
+                        rm = comfy.utils.common_upscale(
+                            reference_image_mask[mask_idx:mask_idx+1].movedim(-1, 1), width, height, "nearest-exact", "center"
+                        ).movedim(1, -1)
+                        is_char = (rm[..., :3].max(dim=-1, keepdim=True).values > 0.1).to(last_ref.dtype)
+                        last_ref = last_ref * is_char
+                    last_latent = vae.encode(last_ref[:, :, :, :3])
+                    # 拼接: (1, 16, N-1) + (1, 16, 1) = (1, 16, N)
+                    concat_ref_latent = torch.cat([batch_latent, last_latent], dim=2)
                 # concat_ref_latent: (1, 16, N, H/8, W/8)
 
         if concat_ref_latent is not None:
@@ -339,7 +384,6 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                 "[WanSCAIL] hard cut at latent frame %d",
                 prev_latent_frames
             )
-
         out_latent = {"samples": latent}
         if noise_mask is not None:
             out_latent["noise_mask"] = noise_mask

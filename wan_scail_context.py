@@ -68,6 +68,18 @@ def _apply_scail_model_patch():
                     list(ref_mask_latents.shape), n_ref, indices[:5],
                     ref_mask_latents.mean().item()
                 )
+                # --- 重叠区追踪日志 ---
+                if hasattr(window, "original_indices") and len(video_part.shape) >= 3:
+                    oi = window.original_indices
+                    if oi and len(oi) > 1:
+                        first_frame_val = video_part[:, :, oi[0]].mean().item()
+                        last_frame_val = video_part[:, :, oi[-1]].mean().item()
+                        logging.info(
+                            "[SCAIL_OVERLAP] ref_mask overlap boundary: window orig=[%d..%d], "
+                            "first_frame_mean=%.6f, last_frame_mean=%.6f",
+                            oi[0], oi[-1], first_frame_val, last_frame_val
+                        )
+                # --- 结束重叠区追踪 ---
                 video_part = video_part[:, :, indices]
                 ref_mask_latents = torch.cat([ref_part, video_part], dim=2)
                 logging.info(

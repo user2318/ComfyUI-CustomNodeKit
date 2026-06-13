@@ -2,7 +2,7 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
-当前版本：**1.4.1** — 新增 WanSCAILContextWindows 节点，优化 SCAIL mask 编码与参考帧接续逻辑。
+当前版本：**1.4.2** — 新增 WanSparseAttention 稀疏注意力节点、SCAIL 混合编码模式、参考图选择器背景图位置优化、上下文窗口金字塔融合边界修正。
 
 ## 目录
 
@@ -75,6 +75,7 @@ pip install -r requirements.txt
 |--------|------|------|
 | **Wan SCAIL To Video (Multi Ref)** | `model/conditioning/video_models` | SCAIL/SCAIL-2 多参考图视频生成 conditioning 节点。支持多张参考图自动编码、SCAIL-2 多身份 colored mask 注入、pose 视频引导、运动接续（prev_latent）等 |
 | **Create SCAIL-2 Colored Mask (Multi Ref)** | `conditioning/video_models/scail` | 渲染 SAM3 追踪数据为 SCAIL-2 使用的 colored mask。支持参考图和驱动视频的共享调色板排序（left_to_right/area），确保多人物场景下同一身份颜色一致 |
+| **WanSparseAttention** | `model/conditioning/video_models/scail` | SCAIL 稀疏注意力 & 因果注意力节点。通过注意力掩码限制 pose/ref/main tokens 间的交互，减少长视频生成的退化问题。支持多种注意力掩码策略：无掩码、pose禁止关注main、仅因果、pose禁止关注main+因果等 |
 
 ### SDPose 姿态系统
 
@@ -591,7 +592,7 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
 
 ### WanSCAIL2 多参考图生成长视频工作流
 
-**文件**：`test_WanSCAIL2_ref_pics_loop+context.json`
+**文件**：`WanSCAIL2_ref_pics_loop+context.json`
 
 **用途**：基于 Wan SCAIL/SCAIL-2 模型，使用多张参考图生成带有上下文窗口的长视频。支持多身份识别（通过 SAM3 追踪 + colored mask），可实现动画模式（Animation Mode）和替换模式（Replacement Mode）两种生成策略。
 
