@@ -253,7 +253,7 @@ class GD_BBoxDetect:
                 }),
                 "threshold": ("FLOAT", {
                     "default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "置信度阈值。越高越精确但可能漏检；越低检测越多但可能有误检"
+                    "tooltip": "置信度阈值。越高越精确但可能漏检；越低检测越多但可能有误检。Confidence threshold. Higher values are more accurate but may miss detections; lower values detect more but may include false positives."
                 }),
                 "mode": ([
                     "pass_all",
@@ -263,7 +263,7 @@ class GD_BBoxDetect:
                     "by_index",
                 ], {
                     "default": "pass_all",
-                    "tooltip": "pass_all=保留全部 | by_area=按面积选最大/最小 | by_position=按区域选 | track=跨帧追踪 | by_index=按索引选"
+                    "tooltip": "pass_all=保留全部 | by_area=按面积选最大/最小 | by_position=按区域选 | track=跨帧追踪 | by_index=按索引选。pass_all=keep all | by_area=select largest/smallest by area | by_position=select by region | track=cross-frame tracking | by_index=select by index."
                 }),
                 "strategy": ([
                     "largest",
@@ -271,11 +271,11 @@ class GD_BBoxDetect:
                     "highest_score",
                 ], {
                     "default": "largest",
-                    "tooltip": "largest=面积最大的 | smallest=面积最小的 | highest_score=置信度最高的（仅by_area/by_position模式有效）"
+                    "tooltip": "largest=面积最大的 | smallest=面积最小的 | highest_score=置信度最高的（仅by_area/by_position模式有效）。largest=largest area | smallest=smallest area | highest_score=highest confidence (only effective in by_area/by_position mode)."
                 }),
                 "index": ("INT", {
                     "default": 0, "min": -1, "max": 100, "step": 1,
-                    "tooltip": "by_index模式下选择第几个bbox（0=第一个，-1=最后一个）。注意：视频帧间索引可能不稳定"
+                    "tooltip": "by_index模式下选择第几个bbox（0=第一个，-1=最后一个）。注意：视频帧间索引可能不稳定。Select bbox by index in by_index mode (0=first, -1=last). Note: index may be unstable across video frames."
                 }),
                 "region": ([
                     "all",
@@ -286,15 +286,15 @@ class GD_BBoxDetect:
                     "bottom_half",
                 ], {
                     "default": "all",
-                    "tooltip": "by_position模式下筛选区域：left_half=左半侧 | right_half=右半侧 | center_third=中间1/3 | top_half=上半 | bottom_half=下半"
+                    "tooltip": "by_position模式下筛选区域：left_half=左半侧 | right_half=右半侧 | center_third=中间1/3 | top_half=上半 | bottom_half=下半。Filter region in by_position mode: left_half | right_half | center_third | top_half | bottom_half."
                 }),
                 "batch_size": ("INT", {
                     "default": 4, "min": 1, "max": 64, "step": 1,
-                    "tooltip": "每批处理的帧数。减小以节省显存：4GB显存→1, 6GB→2, 8GB→4(默认), 12GB+→8~16"
+                    "tooltip": "每批处理的帧数。减小以节省显存：4GB显存→1, 6GB→2, 8GB→4(默认), 12GB+→8~16。Frames per batch. Reduce to save VRAM: 4GB→1, 6GB→2, 8GB→4(default), 12GB+→8~16."
                 }),
                 "preview_count": ("INT", {
                     "default": 5, "min": 1, "max": 20, "step": 1,
-                    "tooltip": "预览帧数。自动选首帧+bbox最多帧+末帧+等间隔补足，不影响实际筛选结果"
+                    "tooltip": "预览帧数。自动选首帧+bbox最多帧+末帧+等间隔补足，不影响实际筛选结果。Preview frame count. Auto-selects first frame + frames with most bboxes + last frame + evenly spaced fill, does not affect actual filtering results."
                 }),
             },
         }

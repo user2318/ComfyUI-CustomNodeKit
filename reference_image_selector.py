@@ -283,14 +283,14 @@ class ReferenceImageSelector:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "reference_images": ("IMAGE",),
-                "angle_map": ("STRING", {"default": "", "multiline": False}),
+                "reference_images": ("IMAGE", {"tooltip": "参考图批次，用于按角度筛选和排序。Reference image batch for angle-based filtering and sorting."}),
+                "angle_map": ("STRING", {"default": "", "multiline": False, "tooltip": "角度映射 JSON，指定每张参考图对应的角度或范围。Angle map JSON specifying the angle or range for each reference image."}),
             },
             "optional": {
-                "yaw_angles": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0}),
-                "background_images": ("IMAGE",),
-                "select_references": ("BOOLEAN", {"default": True, "label_on": "筛选+排序", "label_off": "仅排序"}),
-                "allow_switch_main": ("BOOLEAN", {"default": True, "label_on": "允许更换", "label_off": "固定第一张"}),
+                "yaw_angles": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "tooltip": "目标偏航角，用于按角度筛选最匹配的参考图。Target yaw angle for filtering the best matching reference image."}),
+                "background_images": ("IMAGE", {"tooltip": "背景图批次，将直接拼接到选中参考图之后。Background image batch, appended directly after the selected references."}),
+                "select_references": ("BOOLEAN", {"default": True, "label_on": "筛选+排序", "label_off": "仅排序", "tooltip": "True=按角度筛选并排序；False=仅排序不筛选。True=filter and sort by angle; False=sort only without filtering."}),
+                "allow_switch_main": ("BOOLEAN", {"default": True, "label_on": "允许更换", "label_off": "固定第一张", "tooltip": "True=允许交换第一张主参考图；False=固定第一张不变。True=allow swapping the first main reference image; False=keep the first image fixed."}),
             },
         }
 
@@ -298,6 +298,7 @@ class ReferenceImageSelector:
     RETURN_NAMES = ("selected_images", "raw_reference_images", "info", "reference_angle_map")
     FUNCTION = "select"
     CATEGORY = "CustomNodes/SDPose"
+    DESCRIPTION = "通过角度映射对参考图进行筛选和排序，并支持拼接背景图。Filter and sort reference images by angle map, with optional background image concatenation."
 
     @staticmethod
     def _append_background(images, background_images, info_lines):

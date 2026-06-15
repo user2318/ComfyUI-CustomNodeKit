@@ -73,12 +73,12 @@ class InteractiveBatchCrop:
             "required": {
                 "crop_params": ("STRING", {"default": "", "multiline": False, "hidden": True}),
                 "node_id": ("STRING", {"default": "", "multiline": False, "hidden": True}),
-                "path": ("STRING", {"default": "", "multiline": False}),
+                "path": ("STRING", {"default": "", "multiline": False, "tooltip": "图片文件夹路径或用 | 分隔的多个文件路径。Folder path or multiple file paths separated by |."}),
                 "target_size": ("STRING", {"default": "", "multiline": False, "hidden": True}),
-                "max_preview": ("INT", {"default": 10, "min": 1, "max": 500}),
+                "max_preview": ("INT", {"default": 10, "min": 1, "max": 500, "tooltip": "前端预览中显示的最大图片数量。Maximum number of images shown in the frontend preview."}),
             },
             "optional": {
-                "images": ("IMAGE",),
+                "images": ("IMAGE", {"tooltip": "直接传入图片张量作为裁剪源（与 path 二选一）。Image tensor input as the crop source (alternative to path)."}),
             }
         }
 

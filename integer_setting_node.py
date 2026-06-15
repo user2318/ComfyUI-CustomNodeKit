@@ -20,6 +20,7 @@ class IntegerSettingNode:
                     "max": 99999999,
                     "step": 1,
                     "display": "number",
+                    "tooltip": "等差数列的起始值。The starting value of the arithmetic sequence.",
                 }),
                 "step": ("INT", {
                     "default": 1,
@@ -27,6 +28,7 @@ class IntegerSettingNode:
                     "max": 99999999,
                     "step": 1,
                     "display": "number",
+                    "tooltip": "等差数列的步进值（正数）。The step value of the arithmetic sequence (positive).",
                 }),
                 "value": ("INT", {
                     "default": 0,
@@ -34,6 +36,7 @@ class IntegerSettingNode:
                     "max": 99999999,
                     "step": 1,
                     "display": "number",
+                    "tooltip": "输入数值，会自动对齐到最接近的 start + step*n。Input value, automatically aligned to the nearest start + step*n.",
                 }),
             }
         }
@@ -43,6 +46,7 @@ class IntegerSettingNode:
     OUTPUT_NODE = False
     FUNCTION = "apply"
     CATEGORY = "CustomNodes/Utils"
+    DESCRIPTION = "将输入数值对齐到指定的等差数列（start + step*n）。Aligns the input value to the specified arithmetic sequence (start + step*n)."
 
     def apply(self, start, step, value):
         aligned = self._align_to_step(start, step, value)

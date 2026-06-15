@@ -306,7 +306,7 @@ class WanSCAILSparseAttention:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("MODEL", {"tooltip": "要应用稀疏注意力的 SCAIL 模型"}),
+                "model": ("MODEL", {"tooltip": "要应用稀疏注意力的 SCAIL 模型。The SCAIL model to apply sparse attention to."}),
                 "mask_type": (MASK_OPTIONS, {
                     "default": "pose_no_main",
                     "tooltip": "注意力掩码模式:\n"
@@ -314,17 +314,23 @@ class WanSCAILSparseAttention:
                                "  姿态不看主帧 (Pose→No Main): pose token 不 attend 主帧。推荐配合上下文采样。\n"
                                "  参考不看后半段主帧 (Ref→No Late Main): ref 不 attend 后半段主帧\n"
                                "  快速视频 (Fast Video): 组合局部窗口+约束\n"
-                               "  因果+全局前缀 (Causal+Prefix): ref 全局,其余 causal。推荐配合 previous_frames 接续",
+                               "  因果+全局前缀 (Causal+Prefix): ref 全局,其余 causal。推荐配合 previous_frames 接续。\n"
+                               "Attention mask type:\n"
+                               "  none: don't modify attention\n"
+                               "  pose_no_main: pose tokens don't attend main. Recommended with context sampling.\n"
+                               "  ref_no_late_main: ref doesn't attend late half of main\n"
+                               "  fast_video: combined local window + constraints\n"
+                               "  causal_with_global_prefix: ref global, rest causal. Recommended with previous_frames chaining.",
                 }),
             },
             "optional": {
                 "causal_window": ("INT", {
                     "default": -1, "min": -1, "max": 512,
-                    "tooltip": "Causal 滑窗大小，单位：帧 (仅 causal_with_global_prefix 模式有效。-1=严格 causal, >0=允许回头看 N 帧)",
+                    "tooltip": "Causal 滑窗大小，单位：帧 (仅 causal_with_global_prefix 模式有效。-1=严格 causal, >0=允许回头看 N 帧)。Causal window size in frames (only effective in causal_with_global_prefix mode. -1=strict causal, >0=allow looking back N frames).",
                 }),
                 "local_window": ("INT", {
                     "default": 1, "min": 1, "max": 512,
-                    "tooltip": "局部窗口大小，单位：帧（仅 fast_video 模式使用。1=前后各看 1 帧，2=前后各看 2 帧）",
+                    "tooltip": "局部窗口大小，单位：帧（仅 fast_video 模式使用。1=前后各看 1 帧，2=前后各看 2 帧）。Local window size in frames (only used in fast_video mode. 1=look 1 frame ahead/behind, 2=look 2 frames).",
                 }),
             },
         }
@@ -334,7 +340,7 @@ class WanSCAILSparseAttention:
     FUNCTION = "apply"
     CATEGORY = "model/attention"
     EXPERIMENTAL = True
-    DESCRIPTION = "为 SCAIL 模型应用稀疏注意力掩码，减轻视频续接劣化并节省计算。"
+    DESCRIPTION = "为 SCAIL 模型应用稀疏注意力掩码，减轻视频续接劣化并节省计算。Apply sparse attention masks to the SCAIL model, reducing video continuation degradation and saving computation."
 
     def apply(self, model, mask_type, causal_window=-1, local_window=1):
         _apply_all_patches()

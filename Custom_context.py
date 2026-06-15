@@ -859,35 +859,35 @@ class CustomWanContextWindowsManualNode:
         fuse_options = ContextFuseMethods.LIST_STATIC
         return {
             "required": {
-                "model": ("MODEL", {"tooltip": "The model to apply context windows to during sampling."}),
+                "model": ("MODEL", {"tooltip": "要应用上下文窗口的模型。The model to apply context windows to during sampling."}),
                 "context_length": ("INT", {"default": 81, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 4,
-                                           "tooltip": "The length of the context window (without prefix)."}),
+                                           "tooltip": "上下文窗口的长度（不含像素帧）。The length of the context window (without prefix)."}),
                 "context_overlap": ("INT", {"default": 30, "min": 0, "max": nodes.MAX_RESOLUTION,
-                                            "tooltip": "The overlap of the context window."}),
-                "context_schedule": (schedule_options, {"tooltip": "The schedule for generating windows."}),
+                                            "tooltip": "上下文窗口的重叠长度。The overlap of the context window."}),
+                "context_schedule": (schedule_options, {"tooltip": "生成窗口的计划。The schedule for generating windows."}),
                 "context_stride": ("INT", {"default": 1, "min": 1, "max": 10,
-                                           "tooltip": "The stride of the context window; only applicable to uniform schedules."}),
+                                           "tooltip": "上下文窗口的步长；仅适用于 uniform 计划。The stride of the context window; only applicable to uniform schedules."}),
                 "closed_loop": ("BOOLEAN", {"default": False,
-                                            "tooltip": "Whether to close the context window loop; only applicable to looped schedules."}),
+                                            "tooltip": "是否闭合上下文窗口循环；仅适用于循环计划。Whether to close the context window loop; only applicable to looped schedules."}),
                 "fuse_method": (fuse_options, {"default": ContextFuseMethods.PYRAMID,
-                                               "tooltip": "The method to use to fuse the context windows."}),
+                                               "tooltip": "融合上下文窗口的方法。The method to use to fuse the context windows."}),
                 "freenoise": ("BOOLEAN", {"default": False,
-                                          "tooltip": "Whether to apply FreeNoise noise shuffling, improves window blending."}),
+                                          "tooltip": "是否应用 FreeNoise 噪声混洗，改善窗口融合。Whether to apply FreeNoise noise shuffling, improves window blending."}),
                 "prefix_latent_num": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1,
                                               "tooltip": "前缀参考帧的 latent 数量。接参考图选择器 raw_reference_images 的图片数量即可（每张图片编码为1个 latent）。这些帧会作为稳定参考拼接到每个窗口前。"}),
                 "split_conds_to_windows": ("BOOLEAN", {"default": False,
-                                                       "tooltip": "Whether to split multiple conditionings to each window based on region index."}),
+                                                       "tooltip": "是否根据区域索引将多个 conditioning 拆分到每个窗口。Whether to split multiple conditionings to each window based on region index."}),
                 "causal_window_fix": ("BOOLEAN", {"default": True,
-                                                  "tooltip": "串行模式：在每个窗口前补上一窗口的denoised末帧，保留脚印等交互细节。会牺牲并行性（每次denoise step内窗口串行执行）。"}),
+                                                  "tooltip": "串行模式：在每个窗口前补上一窗口的denoised末帧，保留脚印等交互细节。会牺牲并行性（每次denoise step内窗口串行执行）。Serial mode: prepend the previous window's denoised last frame to each window, preserving interaction details like footprints. Sacrifices parallelism (windows execute serially within each denoise step)."}),
             },
             "optional": {
-                "window_reference_images": ("IMAGE", {"tooltip": "原始参考图批次（来自 ReferenceImageSelector 的 raw_reference_images 输出），用于动态前缀"}),
-                "latent_yaw_angles": ("FLOAT", {"tooltip": "下采样后的 latent 偏航角（来自 WanAnimateToVideoCustom 的 latent_yaw_angles 输出）"}),
-                "vae": ("VAE", {"tooltip": "VAE 编码器，用于将参考图编码为 latent"}),
-                "reference_angle_map": ("STRING", {"default": "", "multiline": False, "tooltip": "参考图角度映射 JSON（来自 ReferenceImageSelector 的 reference_angle_map 输出）"}),
+                "window_reference_images": ("IMAGE", {"tooltip": "原始参考图批次（来自 ReferenceImageSelector 的 raw_reference_images 输出），用于动态前缀。Raw reference image batch from ReferenceImageSelector's raw_reference_images output, used for dynamic prefix."}),
+                "latent_yaw_angles": ("FLOAT", {"tooltip": "下采样后的 latent 偏航角（来自 WanAnimateToVideoCustom 的 latent_yaw_angles 输出）。Downsampled latent yaw angles from WanAnimateToVideoCustom's latent_yaw_angles output."}),
+                "vae": ("VAE", {"tooltip": "VAE 编码器，用于将参考图编码为 latent。VAE encoder for encoding reference images into latents."}),
+                "reference_angle_map": ("STRING", {"default": "", "multiline": False, "tooltip": "参考图角度映射 JSON（来自 ReferenceImageSelector 的 reference_angle_map 输出）。Reference image angle map JSON from ReferenceImageSelector's reference_angle_map output."}),
                 "allow_switch_main": ("BOOLEAN", {"default": True, "label_on": "允许更换主参考图", "label_off": "固定第一张",
-                                                  "tooltip": "动态前缀模式下是否允许更换主参考图"}),
-                "background_images": ("IMAGE", {"tooltip": "可选的背景图，用于动态前缀的 1+4n 拼接"}),
+                                                  "tooltip": "动态前缀模式下是否允许更换主参考图。Whether to allow swapping the main reference image in dynamic prefix mode."}),
+                "background_images": ("IMAGE", {"tooltip": "可选的背景图，用于动态前缀的 1+4n 拼接。Optional background images for 1+4n concatenation in dynamic prefix."}),
             }
         }
 
@@ -896,7 +896,7 @@ class CustomWanContextWindowsManualNode:
     FUNCTION = "apply_context_windows"
     CATEGORY = "context"
     EXPERIMENTAL = True
-    DESCRIPTION = "Manually set context windows for WAN-like models (dim=2). Supports prefixing reference frames and dynamic prefix."
+    DESCRIPTION = "手动设置 WAN 类模型的上下文窗口（dim=2），支持前缀参考帧与动态前缀。Manually set context windows for WAN-like models (dim=2). Supports prefixing reference frames and dynamic prefix."
 
     def apply_context_windows(self, model, context_length, context_overlap, context_schedule,
                               context_stride, closed_loop, fuse_method, freenoise,

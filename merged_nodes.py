@@ -14,7 +14,7 @@ class PathCollectorNode:
         return {
             "required": {},
             "optional": {
-                "paths": ("STRING", {"default": "", "multiline": True, "tooltip": "输入多个路径，每行一个。可通过多文件选择器前端控件批量选择"}),
+                "paths": ("STRING", {"default": "", "multiline": True, "tooltip": "输入多个路径，每行一个。可通过多文件选择器前端控件批量选择。Enter multiple paths, one per line. Supports batch selection via the multi-file picker frontend control."}),
             },
         }
 
@@ -38,9 +38,9 @@ class IndexSelectorNode:
                     "multiline": False,
                     "default": "",
                     "hidden": True,         # 隐藏输入控件，仅显示连接点
-                    "tooltip": "来自路径收集器或其他来源的多行路径字符串，每行一个路径"
+                    "tooltip": "来自路径收集器或其他来源的多行路径字符串，每行一个路径。Multi-line path string from the path collector, one path per line."
                 }),
-                "index": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1, "tooltip": "选择第几条路径（从0开始）。超出范围时输出为空"}),
+                "index": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1, "tooltip": "选择第几条路径（从0开始）。超出范围时输出为空。Select which path by index (starting from 0). Outputs empty if out of range."}),
             },
         }
 
@@ -135,10 +135,10 @@ class PathValidatorNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "path": ("STRING", {"default": "", "multiline": False, "tooltip": "待验证的文件或文件夹路径，支持相对路径和绝对路径"}),
-                "create_if_missing": ("BOOLEAN", {"default": False, "tooltip": "当路径为文件夹且不存在时，是否自动创建该文件夹"}),
-                "path_prefix": ("STRING", {"default": "", "multiline": False, "tooltip": "相对路径的前缀目录。若path为相对路径且此前缀不为空，将拼接为完整路径"}),
-                "extension_filter": ("STRING", {"default": "", "multiline": False, "tooltip": "统计文件数量时的扩展名过滤。多个扩展名用英文逗号分隔，如 'png,jpg'。留空则统计所有文件"}),
+                "path": ("STRING", {"default": "", "multiline": False, "tooltip": "待验证的文件或文件夹路径，支持相对路径和绝对路径。File or folder path to validate, supports relative and absolute paths."}),
+                "create_if_missing": ("BOOLEAN", {"default": False, "tooltip": "当路径为文件夹且不存在时，是否自动创建该文件夹。Whether to automatically create the folder if it does not exist."}),
+                "path_prefix": ("STRING", {"default": "", "multiline": False, "tooltip": "相对路径的前缀目录。若path为相对路径且此前缀不为空，将拼接为完整路径。Prefix directory for relative paths. If path is relative and prefix is not empty, they will be joined into a full path."}),
+                "extension_filter": ("STRING", {"default": "", "multiline": False, "tooltip": "统计文件数量时的扩展名过滤。多个扩展名用英文逗号分隔，如 'png,jpg'。留空则统计所有文件。Extension filter for file counting. Separate multiple extensions with commas, e.g. 'png,jpg'. Leave empty to count all files."}),
             },
         }
 
@@ -231,23 +231,23 @@ class FolderImageLoaderNode:
                 "folder_path": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "tooltip": "包含图片文件的文件夹路径。支持绝对路径，或相对于ComfyUI根目录的相对路径。仅读取本目录下的图片，不会检索子目录。"
+                    "tooltip": "包含图片文件的文件夹路径。支持绝对路径，或相对于ComfyUI根目录的相对路径。仅读取本目录下的图片，不会检索子目录。Folder path containing image files. Supports absolute paths or relative paths to the ComfyUI root directory. Only reads images from this directory, not subdirectories."
                 }),
                 "size_mode": (["resize_to_first", "filter_same_size"], {
                     "default": "resize_to_first",
-                    "tooltip": "图片尺寸处理方式：resize_to_first — 所有图片统一缩放至第一张图的宽高；filter_same_size — 仅加载与第一张图尺寸完全相同的图片，尺寸不同的会被跳过并在控制台提示。"
+                    "tooltip": "图片尺寸处理方式：resize_to_first — 所有图片统一缩放至第一张图的宽高；filter_same_size — 仅加载与第一张图尺寸完全相同的图片，尺寸不同的会被跳过并在控制台提示。Size mode: resize_to_first — resize all images to the first image's dimensions; filter_same_size — only load images exactly matching the first image's dimensions."
                 }),
                 "skip_first_n": ("INT", {
                     "default": 0,
                     "min": 0,
                     "step": 1,
-                    "tooltip": "跳过文件夹排序靠前的N张图片。默认0表示不跳过。"
+                    "tooltip": "跳过文件夹排序靠前的N张图片。默认0表示不跳过。Skip the first N images in the folder. Default 0 means no skip."
                 }),
                 "load_count": ("INT", {
                     "default": 0,
                     "min": 0,
                     "step": 1,
-                    "tooltip": "最多载入的图片数量。设置为0表示不限制，载入全部符合条件的图片。如果该值大于文件夹内实际图片数量，则全量输出。"
+                    "tooltip": "最多载入的图片数量。设置为0表示不限制，载入全部符合条件的图片。如果该值大于文件夹内实际图片数量，则全量输出。Maximum number of images to load. Set to 0 for unlimited (loads all matching images). If the value exceeds the actual count, all images are output."
                 }),
             },
         }
@@ -395,10 +395,10 @@ class ImageBatchConcatNode:
             "required": {},
             "optional": {
                 "images_a": ("IMAGE", {
-                    "tooltip": "第一个图像批次。images_b将拼接到此批次后方。如果仅此路有输入，将直接透传输出。"
+                    "tooltip": "第一个图像批次。images_b将拼接到此批次后方。如果仅此路有输入，将直接透传输出。First image batch. images_b will be concatenated after this batch. If only this input is provided, it will be passed through directly."
                 }),
                 "images_b": ("IMAGE", {
-                    "tooltip": "第二个图像批次。将被拼接到images_a后方构成完整批次。如果仅此路有输入，将直接透传输出。"
+                    "tooltip": "第二个图像批次。将被拼接到images_a后方构成完整批次。如果仅此路有输入，将直接透传输出。Second image batch. It will be concatenated after images_a to form the complete batch. If only this input is provided, it will be passed through directly."
                 }),
             },
         }
@@ -442,22 +442,22 @@ class ImageBatchResizeNode:
                     "default": 512,
                     "min": 1,
                     "step": 1,
-                    "tooltip": "目标宽度（像素）"
+                    "tooltip": "目标宽度（像素）。Target width (pixels)."
                 }),
                 "height": ("INT", {
                     "default": 512,
                     "min": 1,
                     "step": 1,
-                    "tooltip": "目标高度（像素）"
+                    "tooltip": "目标高度（像素）。Target height (pixels)."
                 }),
                 "crop_mode": (["disabled", "center", "top", "bottom", "left", "right"], {
                     "default": "disabled",
-                    "tooltip": "裁剪模式。disabled：直接拉伸不保持比例；center/top/bottom/left/right：先等比缩放覆盖目标再按方向裁剪。"
+                    "tooltip": "裁剪模式。disabled：直接拉伸不保持比例；center/top/bottom/left/right：先等比缩放覆盖目标再按方向裁剪。Crop mode: disabled — stretch directly without aspect ratio; center/top/bottom/left/right — scale to cover then crop from the specified direction."
                 }),
             },
             "optional": {
                 "images": ("IMAGE", {
-                    "tooltip": "输入图像批次。无输入或输入无效时输出None。"
+                    "tooltip": "输入图像批次。无输入或输入无效时输出None。Input image batch. Outputs None when no input or invalid input."
                 }),
             },
         }
@@ -547,8 +547,8 @@ class SingleFrameVAEEncode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "vae": ("VAE",),
+                "images": ("IMAGE", {"tooltip": "输入图像批次，每帧将单独编码。Input image batch, each frame will be encoded independently."}),
+                "vae": ("VAE", {"tooltip": "VAE 模型，用于将图像编码为潜在空间。VAE model used to encode images into latent space."}),
             }
         }
     

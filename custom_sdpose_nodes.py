@@ -260,9 +260,9 @@ class SDPoseSaveJson:
             },
             "optional": {
                 "fps": ("FLOAT", {"default": 0, "min": 0, "max": 120, "step": 1,
-                                  "tooltip": "若 >0，将 fps 写入 JSON 头部；=0 则存为裸数组（兼容旧版）" }),
+                                  "tooltip": "若 >0，将 fps 写入 JSON 头部；=0 则存为裸数组（兼容旧版）。If >0, writes fps to JSON header; =0 saves as raw array (backward compatible)." }),
                 "overwrite": ("BOOLEAN", {"default": True,
-                                          "tooltip": "True=覆盖上次文件（向后兼容）；False=自动递增编号不覆盖" }),
+                                          "tooltip": "True=覆盖上次文件（向后兼容）；False=自动递增编号不覆盖。True=overwrite previous file (backward compatible); False=auto-increment without overwriting." }),
             }
         }
     RETURN_TYPES = ()
@@ -301,18 +301,18 @@ class SDPoseLoadJson:
             "optional": {
                 "target_fps": ("FLOAT", {
                     "default": 0, "min": 0, "max": 120, "step": 1,
-                    "tooltip": "目标帧率：0=全部读取；>0 时根据 JSON 中的 fps 自动抽帧/补帧"
+                    "tooltip": "目标帧率：0=全部读取；>0 时根据 JSON 中的 fps 自动抽帧/补帧。Target FPS: 0=read all; >0=auto sample/upsample based on JSON fps."
                 }),
                 "interp_method": ([
                     "interpolate",
                     "duplicate"
                 ], {
                     "default": "interpolate",
-                    "tooltip": "仅升帧（补帧）时有效：interpolate=线性插值，duplicate=复制最近帧"
+                    "tooltip": "仅升帧（补帧）时有效：interpolate=线性插值，duplicate=复制最近帧。Only effective for upsampling: interpolate=linear interpolation, duplicate=copy nearest frame."
                 }),
                 "fix_empty_frames": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "启用后，自动检测并修复 people 为空的帧，用前后有效帧插值填充，消除黑帧"
+                    "tooltip": "启用后，自动检测并修复 people 为空的帧，用前后有效帧插值填充，消除黑帧。When enabled, auto-detects and fixes empty frames by interpolating from valid neighboring frames, eliminating black frames."
                 }),
             }
         }
@@ -393,24 +393,24 @@ class SDPoseResampleKeypoints:
                 "pose_keypoints": ("POSE_KEYPOINT",),
                 "input_fps": ("FLOAT", {
                     "default": 0, "min": 0, "max": 120, "step": 1,
-                    "tooltip": "输入关键点的原始帧率：0=未知（不处理）；>0 时根据 ratio = input_fps / output_fps 进行抽帧/补帧"
+                    "tooltip": "输入关键点的原始帧率：0=未知（不处理）；>0 时根据 ratio = input_fps / output_fps 进行抽帧/补帧。Input keypoint original FPS: 0=unknown (no processing); >0=downsample/upsample based on ratio = input_fps / output_fps."
                 }),
                 "output_fps": ("FLOAT", {
                     "default": 0, "min": 0, "max": 120, "step": 1,
-                    "tooltip": "目标输出帧率：0=不处理；>0 时对输入进行重采样"
+                    "tooltip": "目标输出帧率：0=不处理；>0 时对输入进行重采样。Target output FPS: 0=no processing; >0=resample input to this FPS."
                 }),
                 "interp_method": ([
                     "interpolate",
                     "duplicate"
                 ], {
                     "default": "interpolate",
-                    "tooltip": "仅升帧（补帧）时有效：interpolate=线性插值，duplicate=复制最近帧"
+                    "tooltip": "仅升帧（补帧）时有效：interpolate=线性插值，duplicate=复制最近帧。Only effective for upsampling: interpolate=linear interpolation, duplicate=copy nearest frame."
                 }),
             },
             "optional": {
                 "fix_empty_frames": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "启用后，自动检测并修复 people 为空的帧，用前后有效帧插值填充，消除黑帧"
+                    "tooltip": "启用后，自动检测并修复 people 为空的帧，用前后有效帧插值填充，消除黑帧。When enabled, auto-detects and fixes empty frames by interpolating from valid neighboring frames, eliminating black frames."
                 }),
             }
         }
@@ -525,15 +525,15 @@ class SDPoseDrawKeypointsV2:
                 "score_threshold": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "max_frames": ("INT", {"default": 2500, "min": 1, "max": 5000, "step": 1}),
                 "mouth_mode": (["draw_all", "no_draw", "inner_lip_only"], {"default": "draw_all"}),
-                "enable_yaw_thickness": ("BOOLEAN", {"default": False, "tooltip": "开启后根据偏航角动态调整骨骼粗细：正面(0°/±180°)最粗，侧面(±90°)最细"}),
-                "yaw_thickness_min": ("INT", {"default": 1, "min": 1, "max": 20, "step": 1, "tooltip": "侧面(±90°)时的最细粗细，自动受 stick_width 约束（不会高于 stick_width）"}),
-                "foot_mode": (["dots", "line"], {"default": "dots", "tooltip": "脚部绘制模式：dots=三个彩色圆点（原有行为），line=从踝关节到脚尖画一条骨骼线"}),
-                "color_scheme": (["v4_custom", "standard", "monochrome"], {"default": "v4_custom", "tooltip": "骨骼配色方案：v4_custom=自定义V4方案(默认), standard=标准OpenPose彩虹配色, monochrome=统一灰色"}),
+                "enable_yaw_thickness": ("BOOLEAN", {"default": False, "tooltip": "开启后根据偏航角动态调整骨骼粗细：正面(0°/±180°)最粗，侧面(±90°)最细。When enabled, dynamically adjusts bone thickness based on yaw angle: front (0°/±180°) thickest, side (±90°) thinnest."}),
+                "yaw_thickness_min": ("INT", {"default": 1, "min": 1, "max": 20, "step": 1, "tooltip": "侧面(±90°)时的最细粗细，自动受 stick_width 约束（不会高于 stick_width）。Minimum thickness at side view (±90°), automatically constrained by stick_width (won't exceed stick_width)."}),
+                "foot_mode": (["dots", "line"], {"default": "dots", "tooltip": "脚部绘制模式：dots=三个彩色圆点（原有行为），line=从踝关节到脚尖画一条骨骼线。Foot drawing mode: dots=three colored dots (original behavior), line=draw a bone line from ankle to toe."}),
+                "color_scheme": (["v4_custom", "standard", "monochrome"], {"default": "v4_custom", "tooltip": "骨骼配色方案：v4_custom=自定义V4方案(默认), standard=标准OpenPose彩虹配色, monochrome=统一灰色。Color scheme: v4_custom=custom V4 (default), standard=standard OpenPose rainbow, monochrome=uniform gray."}),
             },
             "optional": {
-                "yaw_angles": ("FLOAT", { "tooltip": "来自 SDPoseEstimateYawSimple/Advanced 的 yaw_array，用于动态调整骨骼粗细和遮挡顺序" }),
+                "yaw_angles": ("FLOAT", { "tooltip": "来自 SDPoseEstimateYawSimple/Advanced 的 yaw_array，用于动态调整骨骼粗细和遮挡顺序。Yaw array from SDPoseEstimateYawSimple/Advanced, used for dynamic bone thickness and occlusion ordering." }),
                 "hand_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01,
-                                         "tooltip": "手部骨骼缩放比例，1.0=原始大小。对手部骨骼（从手腕向外）进行缩放，手腕位置保持不动避免错位"}),
+                                         "tooltip": "手部骨骼缩放比例，1.0=原始大小。对手部骨骼（从手腕向外）进行缩放，手腕位置保持不动避免错位。Hand bone scale ratio, 1.0=original size. Scales hand bones from wrist outward while keeping wrist position fixed."}),
             },
         }
 
@@ -641,13 +641,13 @@ class SDPoseResizeKeypoints:
                 "new_height": ("INT", {"default": 512, "min": 1, "max": 8192, "step": 1}),
                 "keep_aspect_ratio": ("BOOLEAN", {"default": True}),
                 "allow_crop": ("BOOLEAN", {"default": False,
-                                           "tooltip": "当保持宽高比且比例不匹配时，基于关键点包围盒智能裁剪，保证不丢失关键点"}),
+                                           "tooltip": "当保持宽高比且比例不匹配时，基于关键点包围盒智能裁剪，保证不丢失关键点。When keeping aspect ratio and proportions don't match, smart-crop based on keypoint bounding box to ensure no keypoints are lost."}),
                 "padding_top": ("INT", {"default": 10, "min": 0, "max": 200, "step": 1,
-                                        "tooltip": "【仅在允许裁剪时有效】包围盒向上扩展的像素数"}),
+                                        "tooltip": "【仅在允许裁剪时有效】包围盒向上扩展的像素数。Only effective when crop is enabled. Pixels to extend the bounding box upward."}),
                 "padding_bottom": ("INT", {"default": 10, "min": 0, "max": 200, "step": 1,
-                                           "tooltip": "【仅在允许裁剪时有效】包围盒向下扩展的像素数"}),
+                                           "tooltip": "【仅在允许裁剪时有效】包围盒向下扩展的像素数。Only effective when crop is enabled. Pixels to extend the bounding box downward."}),
                 "score_threshold": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01,
-                                              "tooltip": "【仅在允许裁剪时有效】参与包围盒计算的最低关键点置信度"}),
+                                              "tooltip": "【仅在允许裁剪时有效】参与包围盒计算的最低关键点置信度。Only effective when crop is enabled. Minimum keypoint confidence for bounding box calculation."}),
             },
         }
 

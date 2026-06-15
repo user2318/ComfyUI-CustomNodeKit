@@ -93,8 +93,8 @@ class VideoFrameCounter:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "video_path": ("STRING", {"default": "", "multiline": False}),
-                "fps": ("FLOAT", {"default": 0, "min": 0, "max": 120.0, "step": 0.01}),
+                "video_path": ("STRING", {"default": "", "multiline": False, "tooltip": "视频文件的路径。Path to the video file."}),
+                "fps": ("FLOAT", {"default": 0, "min": 0, "max": 120.0, "step": 0.01, "tooltip": "目标帧率，设为0则自动使用视频自身的帧率。Target frame rate, set to 0 to use the video's original frame rate."}),
             }
         }
 
@@ -102,6 +102,7 @@ class VideoFrameCounter:
     RETURN_NAMES = ("frames", "fps")
     FUNCTION = "count_frames"
     CATEGORY = "video"
+    DESCRIPTION = "获取视频的帧数和帧率信息。Get the frame count and frame rate information of a video."
 
     def count_frames(self, video_path: str, fps: float) -> Tuple[int, float]:
         video_path = resolve_path(video_path)
@@ -118,15 +119,15 @@ class ImageSequenceToVideo:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "folder_path": ("STRING", {"default": "", "multiline": False}),
+                "folder_path": ("STRING", {"default": "", "multiline": False, "tooltip": "包含图片序列的文件夹路径。Folder path containing the image sequence."}),
             },
             "optional": {
-                "fps": ("FLOAT", {"default": 0, "min": 0, "max": 120.0, "step": 0.01}),
-                "total_frames": ("INT", {"default": 0, "min": 0, "max": 1000000, "step": 1}),
-                "audio_source": ("STRING", {"default": "", "multiline": False}),
-                "output_path_prefix": ("STRING", {"default": "video/temp", "multiline": False}),
-                "start_frame_offset": ("INT", {"default": 0, "min": 0, "max": 1000000, "step": 1}),
-                "crf": ("INT", {"default": 23, "min": 0, "max": 51, "step": 1}),   # 新增 CRF 参数
+                "fps": ("FLOAT", {"default": 0, "min": 0, "max": 120.0, "step": 0.01, "tooltip": "输出视频帧率，设为0则根据音频时长自动推导。Output video frame rate, set to 0 to auto-calculate based on audio duration."}),
+                "total_frames": ("INT", {"default": 0, "min": 0, "max": 1000000, "step": 1, "tooltip": "使用的总帧数，设为0则使用文件夹中所有图片。Total frames to use, set to 0 to use all images in the folder."}),
+                "audio_source": ("STRING", {"default": "", "multiline": False, "tooltip": "音频文件路径，用于为视频添加背景音。Audio file path to add as background to the video."}),
+                "output_path_prefix": ("STRING", {"default": "video/temp", "multiline": False, "tooltip": "输出文件路径前缀，相对于 ComfyUI 输出目录。Output file path prefix, relative to the ComfyUI output directory."}),
+                "start_frame_offset": ("INT", {"default": 0, "min": 0, "max": 1000000, "step": 1, "tooltip": "从音频的起始偏移帧数，用于跳过音频开头。Frame offset from the start of the audio, used to skip the beginning of the audio."}),
+                "crf": ("INT", {"default": 23, "min": 0, "max": 51, "step": 1, "tooltip": "视频编码质量（CRF值），越低质量越高，建议18-28。Video encoding quality (CRF value), lower is better quality, recommended 18-28."}),
             }
         }
 
@@ -135,6 +136,7 @@ class ImageSequenceToVideo:
     FUNCTION = "generate_video"
     CATEGORY = "video"
     OUTPUT_NODE = True
+    DESCRIPTION = "将图片序列合成为视频，支持音频同步和帧率控制。Combine image sequences into a video, with audio synchronization and frame rate control."
 
 
     def generate_video(self, folder_path: str,

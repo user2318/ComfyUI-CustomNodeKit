@@ -28,6 +28,149 @@ DEFAULT_PALETTE = [
 ]
 
 
+_SCAIL_ROPE_PATCH_APPLIED = False
+
+
+def _apply_rope_downsample_patch():
+    """Patch WanModel.rope_encode + SCAILWanModel.rope_encode to implement
+    'full-res RoPE first, then avg_pool2d downsample' for the pose branch only.
+
+    Original SCAIL-2 path:
+    1. Build full-resolution RoPE grid at 2x the pose latent spatial extent
+    2. avg_pool2d(2,2) on real/imag parts to downsample the RoPE field
+    3. Recombine into final half-res pose RoPE
+
+    Only the pose branch gets the downsampled RoPE — main/reserved frames
+    use the standard non-downsampled RoPE.
+    """
+    global _SCAIL_ROPE_PATCH_APPLIED
+    if _SCAIL_ROPE_PATCH_APPLIED:
+        return
+    try:
+        import comfy.ldm.wan.model as _mod
+
+        # ---- Patch WanModel.rope_encode (base class) ----
+        # Adds avg_pool2d logic when _scail_rope_downsample flag is set in transformer_options
+        _orig_wan_rope = _mod.WanModel.rope_encode
+
+        def _patched_wan_rope(self, t, h, w, t_start=0, steps_t=None, steps_h=None, steps_w=None,
+                              device=None, dtype=None, transformer_options={}, source_id=0):
+            need_downsample = transformer_options.get("_scail_rope_downsample", False)
+            if not need_downsample:
+                return _orig_wan_rope(self, t, h, w, t_start, steps_t, steps_h, steps_w,
+                                       device, dtype, transformer_options, source_id)
+
+            # --- Full-resolution RoPE generation (2x spatial) ---
+            h2 = h * 2
+            w2 = w * 2
+            steps_h2 = steps_h * 2 if steps_h is not None else None
+            steps_w2 = steps_w * 2 if steps_w is not None else None
+
+            freqs_2x = _orig_wan_rope(self, t, h2, w2, t_start, steps_t, steps_h2, steps_w2,
+                                       device, dtype, transformer_options, source_id)
+            # --- Infer spatial decomposition ---
+            patch_size = self.patch_size
+            t_p = steps_t if steps_t is not None else ((t + patch_size[0] // 2) // patch_size[0])
+            h_p_2x = steps_h2 if steps_h2 is not None else ((h2 + patch_size[1] // 2) // patch_size[1])
+            w_p_2x = steps_w2 if steps_w2 is not None else ((w2 + patch_size[2] // 2) // patch_size[2])
+
+            # --- avg_pool2d downsample on spatial dimensions ---
+            d_rope = freqs_2x.shape[3]
+            freqs_grid = freqs_2x.reshape(1, t_p, h_p_2x, w_p_2x, d_rope, 2, 2)
+
+            cos = freqs_grid[..., 0, 0].contiguous()
+            sin = freqs_grid[..., 1, 0].contiguous()
+
+            B, Tp, H2, W2, D = cos.shape
+            cos_4d = cos.permute(0, 1, 4, 2, 3).reshape(1, Tp * D, H2, W2)
+            sin_4d = sin.permute(0, 1, 4, 2, 3).reshape(1, Tp * D, H2, W2)
+
+            cos_pooled = F.avg_pool2d(cos_4d, 2, 2)
+            sin_pooled = F.avg_pool2d(sin_4d, 2, 2)
+
+            H, W = cos_pooled.shape[2], cos_pooled.shape[3]
+
+            cos_5d = cos_pooled.reshape(1, Tp, D, H, W).permute(0, 1, 3, 4, 2)
+            sin_5d = sin_pooled.reshape(1, Tp, D, H, W).permute(0, 1, 3, 4, 2)
+
+            freqs_out_grid = torch.stack([
+                torch.stack([cos_5d, -sin_5d], dim=-1),
+                torch.stack([sin_5d,  cos_5d], dim=-1),
+            ], dim=-2)
+
+            return freqs_out_grid.reshape(1, Tp * H * W, 1, d_rope, 2, 2)
+
+        _mod.WanModel.rope_encode = _patched_wan_rope
+
+        # ---- Patch SCAILWanModel.rope_encode to inject flag ONLY into pose branch ----
+        _orig_scail_rope = _mod.SCAILWanModel.rope_encode
+
+        def _patched_scail_rope(self, t, h, w, t_start=0, steps_t=None, steps_h=None, steps_w=None,
+                                 device=None, dtype=None, pose_latents=None, reference_latent=None,
+                                 ref_mask_flag=None, transformer_options={}):
+            if pose_latents is None:
+                # No pose → no downsample needed, pass through
+                return _orig_scail_rope(self, t, h, w, t_start, steps_t, steps_h, steps_w,
+                                         device, dtype, pose_latents=None,
+                                         reference_latent=reference_latent,
+                                         ref_mask_flag=ref_mask_flag,
+                                         transformer_options=transformer_options)
+
+            F_pose, H_pose, W_pose = pose_latents.shape[-3], pose_latents.shape[-2], pose_latents.shape[-1]
+            h_scale = h / H_pose
+            w_scale = w / W_pose
+            ref_t_patches = 0
+
+            # --- Replacement mode path ---
+            if ref_mask_flag is not None and not bool(ref_mask_flag):
+                REF_ROPE_H = 120.0
+                POSE_ROPE_W = 120.0
+                if reference_latent is not None:
+                    ref_t_patches = (reference_latent.shape[2] + (self.patch_size[0] // 2)) // self.patch_size[0]
+                main_t_patches = t - ref_t_patches
+
+                parts = []
+                if ref_t_patches > 0:
+                    ref_tf = {"rope_options": {"shift_y": REF_ROPE_H, "shift_x": 0.0, "scale_y": 1.0, "scale_x": 1.0}}
+                    parts.append(_mod.WanModel.rope_encode(self, ref_t_patches, h, w, t_start=0, device=device, dtype=dtype, transformer_options=ref_tf))
+                if main_t_patches > 0:
+                    parts.append(_mod.WanModel.rope_encode(self, main_t_patches, h, w, t_start=0, device=device, dtype=dtype, transformer_options=transformer_options))
+                if F_pose > 0:
+                    # Pose branch: generate full-resolution RoPE then avg_pool2d downsample.
+                    # No scale/shift on coordinates — dense 0..N-1 grid with x-offset=120.0,
+                    # matching WanAnimatePlus commit 22555324 (Original SCAIL-2 path).
+                    pose_tf = {"rope_options": {"shift_y": 0.0, "shift_x": 120.0, "scale_y": 1.0, "scale_x": 1.0},
+                               "_scail_rope_downsample": True}
+                    parts.append(_mod.WanModel.rope_encode(self, F_pose, H_pose, W_pose, t_start=0, device=device, dtype=dtype, transformer_options=pose_tf))
+                return torch.cat(parts, dim=1)
+
+            # --- Animation mode path (default) ---
+            if reference_latent is not None:
+                ref_t_patches = (reference_latent.shape[2] + (self.patch_size[0] // 2)) // self.patch_size[0]
+
+            # Main frames: NO downsample
+            main_freqs = _mod.WanModel.rope_encode(self, t, h, w, t_start=t_start, steps_t=steps_t, steps_h=steps_h, steps_w=steps_w,
+                                                    device=device, dtype=dtype, transformer_options=transformer_options)
+
+            # Pose frames: WITH downsample (only if there are pose frames)
+            if F_pose > 0:
+                # No scale/shift — dense 0..N-1 grid with x-offset=120.0 (Original SCAIL-2 path)
+                pose_tf = {"rope_options": {"shift_y": 0.0, "shift_x": 120.0, "scale_y": 1.0, "scale_x": 1.0},
+                           "_scail_rope_downsample": True}
+                pose_freqs = _mod.WanModel.rope_encode(self, F_pose, H_pose, W_pose, t_start=t_start + ref_t_patches,
+                                                        device=device, dtype=dtype, transformer_options=pose_tf)
+                return torch.cat([main_freqs, pose_freqs], dim=1)
+
+            return main_freqs
+
+        _mod.SCAILWanModel.rope_encode = _patched_scail_rope
+
+        _SCAIL_ROPE_PATCH_APPLIED = True
+        logging.info("[WanSCAIL_MultiRef] RoPE pose-only downsample patch applied")
+    except Exception as e:
+        logging.warning("[WanSCAIL_MultiRef] Failed to patch RoPE downsample: %s", e)
+
+
 def _unpack(track_data):
     packed = track_data["packed_masks"]
     if packed is None or packed.shape[1] == 0:
@@ -133,25 +276,25 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                 io.Int.Input("height", default=896, min=32, max=nodes.MAX_RESOLUTION, step=32),
                 io.Int.Input("length", default=81, min=1, max=nodes.MAX_RESOLUTION, step=4),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
-                io.Image.Input("pose_video", optional=True, tooltip="Video used for pose conditioning. Will be downscaled to half the resolution of the main video."),
-                io.Image.Input("pose_video_mask", optional=True, tooltip="SCAIL-2 only. Colored per-identity SAM3 mask video at the same resolution as pose_video."),
-                io.Boolean.Input("replacement_mode", default=False, optional=True, tooltip="SCAIL-2 only. False = Animation Mode (pose_video_mask should have black background). True = Replacement Mode (pose_video_mask should have white background)."),
-                io.Float.Input("pose_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Strength of the pose latent."),
-                io.Float.Input("pose_start", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Start step of the pose conditioning."),
-                io.Float.Input("pose_end", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="End step of the pose conditioning."),
-                io.Combo.Input("ref_encoding_mode", options=["1+4n批量", "逐帧编码", "混合编码"], default="1+4n批量", tooltip="参考图编码模式。1+4n批量=第1张×1其余×4后一次编码（默认,更接近训练）；逐帧编码=每张图独立编码后时间维拼接（高保真）；混合编码=前N-1张1+4n批量+最后1张逐帧编码（兼顾清晰度与减轻段间跳变）。"),
-                io.Image.Input("reference_image", optional=True, tooltip="Reference image(s). For multiple references, pass a batch of images (N, H, W, 3). Each image is independently encoded and added as a separate reference_latent."),
-                io.Image.Input("reference_image_mask", optional=True, tooltip="SCAIL-2 only. Colored reference mask(s) at the same resolution as reference_image. Should match the reference_image count."),
-                io.ClipVisionOutput.Input("clip_vision_output", optional=True, tooltip="CLIP vision features for conditioning. Model is trained with stretch resize to aspect ratio."),
-                io.Int.Input("video_frame_offset", default=0, min=0, max=nodes.MAX_RESOLUTION, step=1, tooltip="Cumulative output frame this chunk begins at. Wire from the previous chunk's video_frame_offset output."),
-                io.Int.Input("previous_frame_count", default=5, min=1, max=nodes.MAX_RESOLUTION, step=4, tooltip="Tail frames of previous_frames to anchor. SCAIL-2 trained at 5 (81-frame chunks, 76-frame step)."),
-                io.Image.Input("previous_frames", optional=True, tooltip="SCAIL-2 only. Full decoded output of the previous chunk. Only the last previous_frame_count are used as the extension anchor."),
+                io.Image.Input("pose_video", optional=True, tooltip="用于姿态 conditioning 的视频，将降低分辨率至主视频的一半。Video used for pose conditioning. Will be downscaled to half the resolution of the main video."),
+                io.Image.Input("pose_video_mask", optional=True, tooltip="仅 SCAIL-2。与 pose_video 同分辨率的 SAM3 逐人彩色遮罩视频。SCAIL-2 only. Colored per-identity SAM3 mask video at the same resolution as pose_video."),
+                io.Boolean.Input("replacement_mode", default=False, optional=True, tooltip="仅 SCAIL-2。False=动画模式(pose_video_mask应为黑色背景)；True=替换模式(pose_video_mask应为白色背景)。SCAIL-2 only. False = Animation Mode (black bg). True = Replacement Mode (white bg)."),
+                io.Float.Input("pose_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="姿态 latent 的强度。Strength of the pose latent."),
+                io.Float.Input("pose_start", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="姿态 conditioning 的起始步。Start step of the pose conditioning."),
+                io.Float.Input("pose_end", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="姿态 conditioning 的结束步。End step of the pose conditioning."),
+                io.Combo.Input("ref_encoding_mode", options=["1+4n批量", "逐帧编码", "混合编码"], default="1+4n批量", tooltip="参考图编码模式。1+4n批量=第1张×1其余×4后一次编码（默认,更接近训练）；逐帧编码=每张图独立编码后时间维拼接（高保真）；混合编码=前N-1张1+4n批量+最后1张逐帧编码（兼顾清晰度与减轻段间跳变）。Reference encoding mode: 1+4n batch=1st×1 rest×4 then batch encode (default, closer to training); per-frame=independent encode then temporal concat (high fidelity); hybrid=first N-1 as 1+4n batch + last frame independently."),
+                io.Image.Input("reference_image", optional=True, tooltip="参考图输入，多张参考图以批次形式传入 (N, H, W, 3)。每张图独立编码后作为单独的 reference_latent 添加。Reference image(s). For multiple references, pass a batch of images (N, H, W, 3). Each image is independently encoded and added as a separate reference_latent."),
+                io.Image.Input("reference_image_mask", optional=True, tooltip="仅 SCAIL-2。与 reference_image 同分辨率的彩色参考遮罩。应与 reference_image 数量匹配。SCAIL-2 only. Colored reference mask(s) at the same resolution as reference_image. Should match the reference_image count."),
+                io.ClipVisionOutput.Input("clip_vision_output", optional=True, tooltip="用于 conditioning 的 CLIP 视觉特征。模型使用拉伸缩放至宽高比进行训练。CLIP vision features for conditioning. Model is trained with stretch resize to aspect ratio."),
+                io.Int.Input("video_frame_offset", default=0, min=0, max=nodes.MAX_RESOLUTION, step=1, tooltip="当前块开始的累计输出帧偏移。从上一块的 video_frame_offset 输出接入。Cumulative output frame this chunk begins at. Wire from the previous chunk's video_frame_offset output."),
+                io.Int.Input("previous_frame_count", default=5, min=1, max=nodes.MAX_RESOLUTION, step=4, tooltip="用于锚定的上一块尾帧数。SCAIL-2 训练使用 5（81帧块，76帧步长）。Tail frames of previous_frames to anchor. SCAIL-2 trained at 5 (81-frame chunks, 76-frame step)."),
+                io.Image.Input("previous_frames", optional=True, tooltip="仅 SCAIL-2。上一块的完整解码输出。仅最后 previous_frame_count 帧用作扩展锚定。SCAIL-2 only. Full decoded output of the previous chunk. Only the last previous_frame_count are used as the extension anchor."),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
                 io.Conditioning.Output(display_name="negative"),
-                io.Latent.Output(display_name="latent", tooltip="Empty latent of the generation size."),
-                io.Int.Output(display_name="video_frame_offset", tooltip="Adjusted offset + length. Wire into the next chunk."),
+                io.Latent.Output(display_name="latent", tooltip="生成尺寸的空 latent 张量。Empty latent of the generation size."),
+                io.Int.Output(display_name="video_frame_offset", tooltip="调整后的偏移量 + 长度。接入下一块。Adjusted offset + length. Wire into the next chunk."),
             ],
             is_experimental=True,
         )
@@ -161,6 +304,10 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                 video_frame_offset, previous_frame_count, replacement_mode=False, ref_encoding_mode="1+4n批量",
                 reference_image=None, clip_vision_output=None, pose_video=None,
                 pose_video_mask=None, reference_image_mask=None, previous_frames=None) -> io.NodeOutput:
+        # RoPE downsample patch: full-res RoPE first, then avg_pool2d downsample.
+        # Matches WanAnimatePlus commit 22555324 (Original SCAIL-2 path).
+        _apply_rope_downsample_patch()
+
         latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8], device=comfy.model_management.intermediate_device())
         noise_mask = None
 
@@ -204,9 +351,9 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                     is_char = (rm[..., :3].max(dim=-1, keepdim=True).values > 0.1).to(ref_pixels.dtype)
                     ref_pixels = ref_pixels * is_char
 
-                # Batch upsample + VAE encode
+                # Batch upsample + VAE encode (bicubic for upsampling, matching official node)
                 ref_pixels = comfy.utils.common_upscale(
-                    ref_pixels.movedim(-1, 1), width, height, "area", "center"
+                    ref_pixels.movedim(-1, 1), width, height, "bicubic", "center"
                 ).movedim(1, -1)
                 concat_ref_latent = vae.encode(ref_pixels[:, :, :, :3])
                 # concat_ref_latent: (1, 16, 4N-3, H/8, W/8)
@@ -214,7 +361,7 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                 ref_latent_parts = []
                 for i in range(num_refs):
                     single_ref = comfy.utils.common_upscale(
-                        reference_image[i:i+1].movedim(-1, 1), width, height, "area", "center"
+                        reference_image[i:i+1].movedim(-1, 1), width, height, "bicubic", "center"
                     ).movedim(1, -1)
                     if replacement_mode and reference_image_mask is not None:
                         mask_idx = min(i, reference_image_mask.shape[0] - 1)
@@ -231,7 +378,7 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                 if num_refs == 1:
                     # 只有1张参考图时退化为逐帧编码
                     single_ref = comfy.utils.common_upscale(
-                        reference_image[0:1].movedim(-1, 1), width, height, "area", "center"
+                        reference_image[0:1].movedim(-1, 1), width, height, "bicubic", "center"
                     ).movedim(1, -1)
                     concat_ref_latent = vae.encode(single_ref[:, :, :, :3])
                 else:
@@ -254,12 +401,12 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                         is_char = (rm[..., :3].max(dim=-1, keepdim=True).values > 0.1).to(ref_pixels_batch.dtype)
                         ref_pixels_batch = ref_pixels_batch * is_char
                     ref_pixels_batch = comfy.utils.common_upscale(
-                        ref_pixels_batch.movedim(-1, 1), width, height, "area", "center"
+                        ref_pixels_batch.movedim(-1, 1), width, height, "bicubic", "center"
                     ).movedim(1, -1)
                     batch_latent = vae.encode(ref_pixels_batch[:, :, :, :3])
                     # 最后1张: 逐帧编码
                     last_ref = comfy.utils.common_upscale(
-                        reference_image[-1:].movedim(-1, 1), width, height, "area", "center"
+                        reference_image[-1:].movedim(-1, 1), width, height, "bicubic", "center"
                     ).movedim(1, -1)
                     if replacement_mode and reference_image_mask is not None:
                         mask_idx = min(num_refs - 1, reference_image_mask.shape[0] - 1)
@@ -391,30 +538,30 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
 
 
 class SCAIL2ColoredMaskMultiRef(io.ComfyNode):
-    """Render SAM3 tracks for the driving pose video and (optionally) the reference
-    image(s) into the colored masks WanSCAILToVideoMultiRef consumes. Shared `sort_by`
-    across both outputs guarantees identity K maps to the same color on both
-    sides, for multi-person workflow consistency.
-    reference_image_mask is always rendered black-bg (model convention)
-    pose_video_mask bg follows replacement_mode: black = Animation Mode, white = Replacement Mode
+    """渲染 SAM3 追踪数据为彩色遮罩（支持多参考图）。
+    与 WanSCAILToVideoMultiRef 配合使用。
+
+    reference_image_mask 始终为黑底（模型约定）。
+    pose_video_mask 背景色按 replacement_mode 变化：
+    - False(动画模式)=黑底
+    - True(替换模式)=白底
     """
 
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="SCAIL2ColoredMaskMultiRef",
-            display_name="Create SCAIL-2 Colored Mask (Multi-Ref)",
+            node_id="SCAIL2ColoredMaskMultiRef_CK",
+            display_name="Create SCAIL-2 Colored Mask (MultiRef)",
             category="conditioning/video_models/scail",
             inputs=[
-                SAM3TrackData.Input("driving_track_data", tooltip="SAM3 track of the driving pose video. Will be rendered into the pose_video_mask output."),
-                SAM3TrackData.Input("ref_track_data", optional=True,
-                                    tooltip="SAM3 track of the reference image(s). If multiple references, pass multiple ref_track_data inputs (future)."),
+                SAM3TrackData.Input("driving_track_data", tooltip="驱动姿态视频的 SAM3 追踪数据。将渲染为 pose_video_mask 输出。SAM3 track of the driving pose video."),
+                SAM3TrackData.Input("ref_track_data", optional=True, tooltip="参考图的 SAM3 追踪数据。SAM3 track of the reference image."),
                 io.String.Input("object_indices", default="",
-                                tooltip="Comma-separated list of person indices to include (e.g. '0,2,3'). Applied to both reference and pose video masks. Empty = all."),
+                                tooltip="逗号分隔的人物索引列表（如 '0,2,3'）。同时应用于参考图和姿态视频遮罩。空=全部。Comma-separated person indices (e.g. '0,2,3'). Applied to both ref and pose masks. Empty=all."),
                 io.Combo.Input("sort_by", options=["none", "left_to_right", "area"], default="left_to_right",
-                               tooltip="Order in which palette colors are assigned to the tracked objects (applied to both reference and pose video so each identity keeps the same color). left_to_right = leftmost object (by first-frame centroid) gets the first color; area = biggest object (by first-frame mask area) gets the first color; none = keep SAM3's order."),
+                               tooltip="调色板分配到追踪对象的顺序（同时应用于参考图和姿态视频，确保同一个人物颜色一致）。left_to_right=由左至右（按首帧质心）；area=按面积从大到小；none=保持 SAM3 原始顺序。"),
                 io.Boolean.Input("replacement_mode", default=False,
-                                 tooltip="False = mask_video has black bg (Animation Mode). True = white bg (Replacement Mode). Set the matching replacement_mode on WanSCAILToVideoMultiRef. reference_image_mask is always black-bg regardless."),
+                                 tooltip="False=动画模式(pose_video_mask=黑底, reference_image_mask=白底)；True=替换模式(pose_video_mask=白底, reference_image_mask=黑底)。"),
             ],
             outputs=[
                 io.Image.Output("pose_video_mask"),
@@ -443,14 +590,17 @@ class SCAIL2ColoredMaskMultiRef(io.ComfyNode):
             return td
 
         drv = _prep(driving_track_data)
+        # Animation: driving=black, ref=white. Replacement: driving=white, ref=black.
         mask_video = _render_colored_masks(drv, "white" if replacement_mode else "black")
+        ref_bg = "black" if replacement_mode else "white"
 
         if ref_track_data is not None:
             ref = _prep(ref_track_data)
-            reference_image_mask = _render_colored_masks(ref, "black")
+            reference_image_mask = _render_colored_masks(ref, ref_bg)
         else:
             H, W = drv["orig_size"]
-            reference_image_mask = torch.zeros(1, H, W, 3, device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
+            fill_value = 1.0 if ref_bg == "white" else 0.0
+            reference_image_mask = torch.full((1, H, W, 3), fill_value, device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
 
         return io.NodeOutput(mask_video, reference_image_mask)
 
@@ -470,9 +620,9 @@ async def comfy_entrypoint() -> SCAILExtensionMultiRef:
 
 NODE_CLASS_MAPPINGS = {
     "WanSCAILToVideoMultiRef": WanSCAILToVideoMultiRef,
-    "SCAIL2ColoredMaskMultiRef": SCAIL2ColoredMaskMultiRef,
+    "SCAIL2ColoredMaskMultiRef_CK": SCAIL2ColoredMaskMultiRef,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanSCAILToVideoMultiRef": "Wan SCAIL To Video (Multi Ref)",
-    "SCAIL2ColoredMaskMultiRef": "Create SCAIL-2 Colored Mask (Multi Ref)",
+    "SCAIL2ColoredMaskMultiRef_CK": "Create SCAIL-2 Colored Mask (MultiRef)",
 }

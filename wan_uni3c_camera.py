@@ -263,7 +263,7 @@ class WanUni3CLoader:
         return {
             "required": {
                 "model_name": (folder_paths.get_filename_list("controlnet"), {
-                    "tooltip": "Uni3C ControlNet 模型文件，放在 ComfyUI/models/controlnet 文件夹"
+                    "tooltip": "Uni3C ControlNet 模型文件，放在 ComfyUI/models/controlnet 文件夹。Uni3C ControlNet model file, placed in ComfyUI/models/controlnet folder."
                 }),
             },
             "optional": {
@@ -332,17 +332,17 @@ class WanUni3CApply:
             "required": {
                 "model": ("MODEL",),
                 "uni3c_controlnet": ("UNI3C_CONTROLNET",),
-                "render_latent": ("LATENT", {"tooltip": "预渲染的参考视频潜空间张量 (B, C, T, H, W)"}),
+                "render_latent": ("LATENT", {"tooltip": "预渲染的参考视频潜空间张量 (B, C, T, H, W)。Pre-rendered reference video latent tensor (B, C, T, H, W)."}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
-                "render_mask": ("MASK", {"tooltip": "可选的渲染遮罩（实验性）"}),
+                "render_mask": ("MASK", {"tooltip": "可选的渲染遮罩（实验性）。Optional render mask (experimental)."}),
                 "trim_latent": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1,
-                    "tooltip": "参考图占用的 latent 帧数（从 WanAnimateToVideoCustom 的 trim_latent 接入），用于时序对齐"}),
-                "positive": ("CONDITIONING", {"tooltip": "可选：传入 conditioning 自动提取 concat_latent_image，替代 WanAnimateChannelPack 节点"}),
-                "negative": ("CONDITIONING", {"tooltip": "可选：传入 conditioning 自动提取 concat_latent_image，替代 WanAnimateChannelPack 节点"}),
+                    "tooltip": "参考图占用的 latent 帧数（从 WanAnimateToVideoCustom 的 trim_latent 接入），用于时序对齐。Number of latent frames occupied by reference images (connect from WanAnimateToVideoCustom's trim_latent), used for temporal alignment."}),
+                "positive": ("CONDITIONING", {"tooltip": "可选：传入 conditioning 自动提取 concat_latent_image，替代 WanAnimateChannelPack 节点。Optional: pass conditioning to auto-extract concat_latent_image, replacing the WanAnimateChannelPack node."}),
+                "negative": ("CONDITIONING", {"tooltip": "可选：传入 conditioning 自动提取 concat_latent_image，替代 WanAnimateChannelPack 节点。Optional: pass conditioning to auto-extract concat_latent_image, replacing the WanAnimateChannelPack node."}),
             }
         }
     RETURN_TYPES = ("MODEL",)

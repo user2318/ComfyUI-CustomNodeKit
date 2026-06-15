@@ -296,34 +296,34 @@ class WanSCAILContextWindowsNode:
         return {
             "required": {
                 "model": ("MODEL", {
-                    "tooltip": "应用上下文窗口的模型（SCAIL 模型）"
+                    "tooltip": "应用上下文窗口的模型（SCAIL 模型）。The model to apply context windows to (SCAIL model)."
                 }),
                 "context_length": ("INT", {
                     "default": 81, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 4,
-                    "tooltip": "上下文窗口长度（像素帧）。建议设为 SCAIL 的 length 参数值（如81）。"
+                    "tooltip": "上下文窗口长度（像素帧）。建议设为 SCAIL 的 length 参数值（如81）。Context window length (pixel frames). Recommended to match SCAIL's length parameter (e.g. 81)."
                 }),
                 "context_overlap": ("INT", {
                     "default": 30, "min": 0, "max": nodes.MAX_RESOLUTION,
-                    "tooltip": "窗口间重叠帧数（像素帧）。"
+                    "tooltip": "窗口间重叠帧数（像素帧）。Overlap between windows (pixel frames)."
                 }),
                 "context_schedule": (schedule_options, {
-                    "tooltip": "窗口生成策略。static_standard=固定窗口（推荐）。"
+                    "tooltip": "窗口生成策略。static_standard=固定窗口（推荐）。Window generation schedule. static_standard=fixed windows (recommended)."
                 }),
                 "context_stride": ("INT", {
                     "default": 1, "min": 1, "max": 10,
-                    "tooltip": "窗口步进（仅对 uniform 策略有效）。"
+                    "tooltip": "窗口步进（仅对 uniform 策略有效）。Window stride (only effective for uniform schedules)."
                 }),
                 "closed_loop": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "是否闭环窗口（仅 looped 策略有效）。"
+                    "tooltip": "是否闭环窗口（仅 looped 策略有效）。Whether to close the window loop (only effective for looped schedules)."
                 }),
                 "fuse_method": (fuse_options, {
                     "default": ContextFuseMethods.PYRAMID,
-                    "tooltip": "窗口融合方法。"
+                    "tooltip": "窗口融合方法。Window fusion method."
                 }),
                 "freenoise": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "FreeNoise 噪声混洗，改善窗口间融合。"
+                    "tooltip": "FreeNoise 噪声混洗，改善窗口间融合。FreeNoise noise shuffling, improves inter-window blending."
                 }),
             },
         }

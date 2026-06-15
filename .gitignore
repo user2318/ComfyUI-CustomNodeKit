@@ -31,6 +31,10 @@ Thumbs.db
 # PR description (not for upload)
 PR_submission_description.md
 
+# SCAIL analysis notes (local only)
+SCAIL_MultiRef_分析总结.md
+SCAIL_MultiRef_ContextWindow_Summary.md
+
 # local distribution folder (not for upload)
 local1/
 PROGRESS_README.md 
