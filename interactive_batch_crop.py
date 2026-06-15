@@ -477,7 +477,10 @@ async def get_tensor_preview(request):
     b64 = base64.b64encode(buf.getvalue()).decode()
     return web.json_response({"image": f"data:image/png;base64,{b64}", "total": batch.shape[0]})
 
-# tkinter 文件夹选择弹窗（需用户交互）
+# 文件/文件夹选择弹窗
+# 注意: 依赖 tkinter（Python 标准 GUI 库）。
+# 如果使用 ComfyUI 官方 Release 便携版，嵌入式 Python 可能缺少 tkinter。
+# 解决方案: 运行 install.py 或重启 ComfyUI 后会自动从 NuGet 下载缺失组件。
 @PromptServer.instance.routes.post("/interactive_crop/select_folder")
 async def select_folder(request):
     """只弹窗选择单个目录（单选），不循环多选"""
@@ -495,6 +498,10 @@ async def select_folder(request):
         root.destroy()
 
         return web.json_response({"path": dir_path if dir_path else ""})
+    except ImportError:
+        return web.json_response({
+            "error": "tkinter 不可用。请重启 ComfyUI，本插件将在启动时自动下载并安装 tkinter 组件。"
+        }, status=500)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -513,6 +520,10 @@ async def select_files(request):
             return web.json_response({"paths": ""})
         paths_str = "|".join(file_paths)
         return web.json_response({"paths": paths_str, "count": len(file_paths)})
+    except ImportError:
+        return web.json_response({
+            "error": "tkinter 不可用。请重启 ComfyUI，本插件将在启动时自动下载并安装 tkinter 组件。"
+        }, status=500)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
