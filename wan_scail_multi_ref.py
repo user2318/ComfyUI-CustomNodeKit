@@ -54,11 +54,11 @@ def _apply_rope_downsample_patch():
         _orig_wan_rope = _mod.WanModel.rope_encode
 
         def _patched_wan_rope(self, t, h, w, t_start=0, steps_t=None, steps_h=None, steps_w=None,
-                              device=None, dtype=None, transformer_options={}, source_id=0):
+                              device=None, dtype=None, transformer_options={}):
             need_downsample = transformer_options.get("_scail_rope_downsample", False)
             if not need_downsample:
                 return _orig_wan_rope(self, t, h, w, t_start, steps_t, steps_h, steps_w,
-                                       device, dtype, transformer_options, source_id)
+                                       device, dtype, transformer_options)
 
             # --- Full-resolution RoPE generation (2x spatial) ---
             h2 = h * 2
@@ -67,7 +67,7 @@ def _apply_rope_downsample_patch():
             steps_w2 = steps_w * 2 if steps_w is not None else None
 
             freqs_2x = _orig_wan_rope(self, t, h2, w2, t_start, steps_t, steps_h2, steps_w2,
-                                       device, dtype, transformer_options, source_id)
+                                       device, dtype, transformer_options)
             # --- Infer spatial decomposition ---
             patch_size = self.patch_size
             t_p = steps_t if steps_t is not None else ((t + patch_size[0] // 2) // patch_size[0])
