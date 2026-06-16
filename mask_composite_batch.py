@@ -206,9 +206,10 @@ class MaskCompositeRef:
                 ones = torch.ones((backgrounds.shape[0], bg_h, bg_w, 3), dtype=torch.float32)
                 return (backgrounds.clone(), ones)
             else:
+                # images 被截断为 [:0] 后仍是 4D (0, H, W, 3)，取其空间形状
                 return (
-                    torch.empty((0,), dtype=torch.float32),
-                    torch.empty((0,), dtype=torch.float32),
+                    torch.empty((0, *images.shape[1:]), dtype=torch.float32),
+                    torch.empty((0, *images.shape[1:]), dtype=torch.float32),
                 )
 
         # 目标尺寸：以 images 为准

@@ -1,34 +1,64 @@
 """
 AutoColorDriftCorrection - 自动色彩漂移校正节点
 
-原理：利用接续生成中重叠帧（前5帧与上一段末尾5帧相同）的差异，
-计算出本段发生的色彩偏移量，然后对本段所有新生成帧做全局统一的校正。
+原理：对接续生成中每段的新生成帧做逐帧线性回归，检测
+RGB三通道的漂移趋势，然后对本段所有新生成帧做精确的
+逐帧校正。前 overlap_count 帧（重叠帧）保持不动。
 
 优势：
-- 全局统一校正 → 无帧间闪烁
-- 自动检测偏移量 → 零参数也可用
+- 线性回归 + 逐帧校正 → 更精准，非头尾近似
+- 全局统一参数 → 无帧间闪烁
 - PyTorch 直算 → GPU毫秒级处理
-- 渐进应用 → 无接缝感
+- 重叠帧不动 → 无接缝感
 
 使用方式：
-1) 接 prev_frames → 以上一段末尾帧为基准，校正本段的段间累积偏移（推荐）
-2) 不接 prev_frames → 以本段前 overlap_count 帧为自参考，
-   校正本段内部的漂移趋势（适用于无法提供上一段帧的场景）
-
-校正模式：
-- subtract（减法模式）→ pixel -= delta * weight，对亮部和暗部同等处理
-- scale（缩放模式）→ pixel *= (1 - delta/128 * weight)，对暗部影响小，更自然
+1) 接 prev_frames → 以上一段末尾帧为基准
+2) 不接 prev_frames + reference_mode=segment_self → 段内自参考
+3) 不接 prev_frames + reference_mode=first_segment_cache →
+   缓存第一段为固定基准（推荐，不需要额外接线）
 """
 
 import torch
 import json
 
+# 类变量缓存：存储第一段尾帧均值作为固定基准
+_first_segment_cache = None
+
+
+def _linear_regression(frame_means):
+    """对帧均值序列做最小二乘法线性回归
+    
+    Args:
+        frame_means: (N, 3) tensor, N帧的RGB均值
+    
+    Returns:
+        slopes: (3,) 每帧漂移速率
+        intercepts: (3,) 截距（第0帧的回归值）
+    """
+    N = frame_means.shape[0]
+    if N <= 1:
+        return torch.zeros(3, device=frame_means.device), frame_means[0] if N == 1 else torch.zeros(3, device=frame_means.device)
+    
+    # x = [0, 1, 2, ..., N-1]
+    x = torch.arange(N, device=frame_means.device, dtype=frame_means.dtype)
+    x_mean = x.mean()
+    y_mean = frame_means.mean(dim=0)  # (3,)
+    
+    # 最小二乘: slope = sum((x-x_mean)*(y-y_mean)) / sum((x-x_mean)^2)
+    x_centered = x - x_mean
+    y_centered = frame_means - y_mean  # (N, 3)
+    
+    numerator = (x_centered.view(-1, 1) * y_centered).sum(dim=0)  # (3,)
+    denominator = (x_centered ** 2).sum()
+    
+    slopes = numerator / denominator if denominator > 0 else torch.zeros(3, device=frame_means.device)
+    intercepts = y_mean - slopes * x_mean
+    
+    return slopes, intercepts
+
 
 class AutoColorDriftCorrection:
-    """自动色彩漂移校正节点
-    
-    检测每段接续生成中发生的色彩偏移并自动纠正。
-    """
+    """自动色彩漂移校正节点"""
 
     OUTPUT_NODE = False
     
@@ -41,24 +71,28 @@ class AutoColorDriftCorrection:
                 }),
                 "overlap_count": ("INT", {
                     "default": 5, "min": 1, "max": 20, "step": 1,
-                    "tooltip": "重叠帧数量，默认5（与工作流中的片段间重叠帧数一致）。"
+                    "tooltip": "重叠帧数量，默认5。前 overlap_count 帧保持不动，从第 overlap_count+1 帧开始校正。"
                 }),
             },
             "optional": {
                 "prev_frames": ("IMAGE", {
-                    "tooltip": "（可选）上一段末尾的重叠帧。接入后以上一段为基准校正段间累积偏移。不接则以本段前N帧为自参考。"
+                    "tooltip": "（可选）上一段末尾的重叠帧。接入后以上一段为基准。"
+                }),
+                "reference_mode": (["segment_self", "first_segment_cache"], {
+                    "default": "segment_self",
+                    "tooltip": "不接prev_frames时的参考基准：segment_self=段内自参考；first_segment_cache=缓存第一段为固定基准(推荐)。"
                 }),
                 "correction_mode": (["subtract", "scale"], {
                     "default": "subtract",
-                    "tooltip": "subtract=减法校正(对所有亮度同等处理)；scale=缩放校正(暗部影响小，更自然)。"
+                    "tooltip": "subtract=减法校正；scale=缩放校正(暗部影响小)。"
                 }),
                 "max_correction": ("FLOAT", {
-                    "default": 0.05, "min": 0.0, "max": 0.5, "step": 0.005,
-                    "tooltip": "单通道最大相对校正幅度（相对于像素值128）。0.05=最大移动6.4个像素值。防止意外场景差异导致过度校正。"
+                    "default": 0.15, "min": 0.0, "max": 0.5, "step": 0.005,
+                    "tooltip": "单通道最大校正幅度。0.15=最多校正19.2像素值。"
                 }),
                 "strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "校正强度。1.0=完整校正，0.5=一半校正，0.0=不校正。"
+                    "tooltip": "校正强度。1.0=完整校正，0.5=一半。"
                 }),
             }
         }
@@ -67,165 +101,164 @@ class AutoColorDriftCorrection:
     RETURN_NAMES = ("corrected_images", "drift_info")
     FUNCTION = "correct"
     CATEGORY = "CustomNodes/Video"
-    DESCRIPTION = "利用重叠帧自动检测色彩漂移并做全局统一校正，无帧间闪烁。"
+    DESCRIPTION = "利用线性回归精确检测色彩漂移趋势并做逐帧校正，重叠帧保持不动。"
 
     def correct(self, images, overlap_count=5,
-                prev_frames=None, correction_mode="subtract",
-                max_correction=0.05, strength=1.0):
+                prev_frames=None, reference_mode="segment_self",
+                correction_mode="subtract",
+                max_correction=0.15, strength=1.0):
+        global _first_segment_cache
+
         info_lines = []
-        info_lines.append(f"输入帧数: {images.shape[0]}")
-        info_lines.append(f"重叠帧数设定: {overlap_count}")
-        info_lines.append(f"校正模式: {correction_mode}")
+        B, H, W, C = images.shape
+        info_lines.append(f"输入帧数: {B}, 重叠帧数: {overlap_count}")
 
         # ==================== 安全检查 ====================
-        B, H, W, C = images.shape
         if C != 3:
-            info_lines.append(f"警告: 输入图像通道数={C}，期望3通道RGB")
+            info_lines.append(f"警告: 通道数={C}，期望3")
+            return (images, "\n".join(info_lines))
+        if B <= overlap_count:
+            info_lines.append(f"警告: 帧数({B}) <= 重叠帧数({overlap_count})，无新生成帧")
             return (images, "\n".join(info_lines))
 
-        # 检查 images 是否至少有 overlap_count+1 帧（至少1帧新内容）
-        if images.shape[0] <= overlap_count:
-            info_lines.append(
-                f"警告: 当前段帧数({images.shape[0]}) <= 重叠帧数({overlap_count})，没有需要校正的新帧"
-            )
-            return (images, "\n".join(info_lines))
+        # ==================== 对新生成帧做线性回归 ====================
+        # 新生成帧 = images[overlap_count:]
+        new_frames = images[overlap_count:]  # (N, H, W, C), N = B - overlap_count
+        N = new_frames.shape[0]
+        
+        # 计算每帧的RGB均值
+        frame_means = new_frames.mean(dim=(1, 2))  # (N, C)
+        
+        # 线性回归
+        slopes, intercepts = _linear_regression(frame_means)
+        
+        info_lines.append(f"新生成帧数: {N}")
+        info_lines.append(f"回归斜率(每帧): R={slopes[0]:+.4f} G={slopes[1]:+.4f} B={slopes[2]:+.4f}")
+        info_lines.append(f"回归截距(首帧): R={intercepts[0]:.2f} G={intercepts[1]:.2f} B={intercepts[2]:.2f}")
 
-        # ==================== 模式选择 & 计算偏移量 ====================
+        # ==================== 计算基准偏移 ====================
         has_prev_frames = prev_frames is not None
-        # images 取前 overlap_count 帧
-        curr_head = images[:overlap_count]  # (overlap_count, H, W, C)
-
+        # 本段首帧新生成帧的回归值（即新生成帧第0帧的预期颜色）
+        # 校正的目标是让本段首帧新生成帧的颜色 ≈ 基准色
+        new_start_mean = intercepts  # 回归截距 = 新生成帧第0帧的预期值
+        
         if has_prev_frames:
-            # 模式1：以上一段为基准
+            # --- 模式1: 以上一段尾帧为基准 ---
             if prev_frames.shape[0] < overlap_count:
-                info_lines.append(
-                    f"警告: 上一段帧数({prev_frames.shape[0]}) < 重叠帧数({overlap_count})，跳过校正"
-                )
+                info_lines.append(f"警告: prev_frames({prev_frames.shape[0]}) < overlap({overlap_count})")
                 return (images, "\n".join(info_lines))
-            
-            # prev_frames 取最后 overlap_count 帧
             prev_tail = prev_frames[-overlap_count:]
-            prev_mean = prev_tail.mean(dim=(0, 1, 2))
-            curr_mean = curr_head.mean(dim=(0, 1, 2))
-            
-            # 偏移量: 当前段 - 上一段
-            delta = curr_mean - prev_mean
-            ref_description = f"上一段末尾{overlap_count}帧"
+            ref_mean = prev_tail.mean(dim=(0, 1, 2))
             ref_type = "prev_frames"
-            
-            info_lines.append(
-                f"{ref_description}均值: R={prev_mean[0]:.2f} G={prev_mean[1]:.2f} B={prev_mean[2]:.2f}"
-            )
+            info_lines.append("基准: 上一段尾帧")
+        elif reference_mode == "first_segment_cache":
+            # --- 模式2: 缓存第一段尾帧为固定基准 ---
+            if _first_segment_cache is None:
+                # 第一段：缓存尾帧，跳过校正
+                first_tail = images[-overlap_count:] if B >= overlap_count * 2 else new_frames[:overlap_count]
+                _first_segment_cache = first_tail.mean(dim=(0, 1, 2)).clone()
+                info_lines.append("第一段初始化: 缓存尾帧为基准")
+                info_lines.append(f"缓存: R={_first_segment_cache[0]:.2f} G={_first_segment_cache[1]:.2f} B={_first_segment_cache[2]:.2f}")
+                info_lines.append("第一段跳过校正")
+                return (images, "\n".join(info_lines))
+            ref_mean = _first_segment_cache
+            ref_type = "first_segment_cache"
+            info_lines.append("基准: 第一段缓存")
         else:
-            # 模式2：以本段前 overlap_count 帧为自参考
-            curr_mean = curr_head.mean(dim=(0, 1, 2))
-            
-            # 取本段最后 overlap_count 帧作为"偏移后的"状态
-            segment_tail = images[-overlap_count:]
-            tail_mean = segment_tail.mean(dim=(0, 1, 2))
-            
-            # 漂移 = 尾帧均值 - 头帧均值（本段内部的漂移趋势）
-            delta = tail_mean - curr_mean
-            
-            ref_description = f"本段前{overlap_count}帧（自参考）"
-            ref_type = "self_reference"
-            
-            info_lines.append(
-                f"{ref_description}均值: R={curr_mean[0]:.2f} G={curr_mean[1]:.2f} B={curr_mean[2]:.2f}"
-            )
-            info_lines.append(
-                f"本段尾{overlap_count}帧均值: R={tail_mean[0]:.2f} G={tail_mean[1]:.2f} B={tail_mean[2]:.2f}"
-            )
+            # --- 模式3: 段内自参考 ---
+            # 基准 = 回归截距本身，delta=0只靠斜率校正
+            ref_mean = new_start_mean
+            ref_type = "segment_self"
+            info_lines.append("基准: 段内自参考(仅斜率)")
 
-        info_lines.append(
-            f"当前段前{overlap_count}帧均值: R={curr_mean[0]:.2f} G={curr_mean[1]:.2f} B={curr_mean[2]:.2f}"
-        )
-        info_lines.append(
-            f"检测偏移量: R={delta[0]:+.2f} G={delta[1]:+.2f} B={delta[2]:+.2f}"
-        )
+        # ==================== 计算偏移量 ====================
+        if ref_type == "segment_self":
+            # 段内自参考：只校正段内趋势，不拉基准
+            base_offset = torch.zeros(3, device=images.device)
+        else:
+            # 其他模式：校正新生成帧首帧与基准的差距
+            base_offset = new_start_mean - ref_mean  # 正=偏蓝/亮，需要减去
 
-        # ==================== 钳制和强度 ====================
+        # 总漂移: 基准偏移 + 逐帧趋势
+        # 对第 t 帧(从0开始)：drift[t] = base_offset + slopes * t
+        # 第0帧的漂移 = base_offset，最后一帧的漂移 = base_offset + slopes * (N-1)
+
+        info_lines.append(f"基准偏移: R={base_offset[0]:+.2f} G={base_offset[1]:+.2f} B={base_offset[2]:+.2f}")
+        total_drift_end = base_offset + slopes * (N - 1)
+        info_lines.append(f"尾帧总偏移: R={total_drift_end[0]:+.2f} G={total_drift_end[1]:+.2f} B={total_drift_end[2]:+.2f}")
+
+        # ==================== 钳制 ====================
         max_abs_delta = max_correction * 128.0
-        delta_clamped = torch.clamp(delta, -max_abs_delta, max_abs_delta)
-        delta_applied = delta_clamped * strength
+        # 钳制基准偏移
+        base_clamped = torch.clamp(base_offset, -max_abs_delta, max_abs_delta)
+        # 钳制斜率（基于最大帧数的总漂移量）
+        max_slope_delta = max_abs_delta / max(N, 1) * 2  # 允许斜率总漂移2倍于基准
+        slopes_clamped = torch.clamp(slopes, -max_slope_delta, max_slope_delta)
+        
+        base_applied = base_clamped * strength
+        slopes_applied = slopes_clamped * strength
 
-        info_lines.append(
-            f"校正后偏移量(钳制后): R={delta_applied[0]:+.2f} G={delta_applied[1]:+.2f} B={delta_applied[2]:+.2f}"
-        )
-        if has_prev_frames:
-            br_drift = (curr_mean[2]/curr_mean[0] - prev_mean[2]/prev_mean[0]) * 100
-        else:
-            br_drift = 0.0
-        info_lines.append(f"B/R比率偏移: {br_drift:+.2f}%")
+        info_lines.append(f"基准偏移(钳制后): R={base_applied[0]:+.2f} G={base_applied[1]:+.2f} B={base_applied[2]:+.2f}")
+        info_lines.append(f"斜率(钳制后): R={slopes_applied[0]:+.4f} G={slopes_applied[1]:+.4f} B={slopes_applied[2]:+.4f}")
 
         # ==================== 应用校正 ====================
         result = images.clone()
-
-        # 前 overlap_count 帧不动（重叠帧，不需要校正）
-        # 从 overlap_count 到最后一帧应用校正
-        num_correct_frames = B - overlap_count
-
-        if num_correct_frames > 0:
-            # 生成渐进权重：从0线性渐变到1
-            weights = torch.linspace(0, 1, num_correct_frames,
-                                     device=images.device, dtype=images.dtype)
-            # reshape for broadcasting: (N, 1, 1, 1)
-            weights = weights.view(-1, 1, 1, 1)
-
-            # 提取需要校正的帧
-            frames_to_correct = result[overlap_count:]  # (N, H, W, C)
-            
-            # delta_applied shape: (C,) → reshape to (1, 1, 1, 3)
-            delta_reshaped = delta_applied.view(1, 1, 1, 3)
-
-            if correction_mode == "scale":
-                # 缩放模式: pixel *= (1 - delta/128 * weight)
-                # 将 delta_applied 转换为相对于128的比例
-                # 例如 delta_applied = [-3, 0, +2] 表示 R要+3/128=+2.3%, B要-2/128=-1.6%
-                scale_factors = 1.0 - (delta_reshaped / 128.0) * weights
-                corrected = frames_to_correct * scale_factors
-                info_lines.append(f"缩放校正因子范围: R=[{1 - abs(float(delta_applied[0])/128):.4f}, 1.0] "
-                                  f"B=[{1 - abs(float(delta_applied[2])/128):.4f}, 1.0]")
-            else:
-                # 减法模式: pixel = pixel - delta * weight（默认）
-                corrected = frames_to_correct - delta_reshaped * weights
-
-            # 钳制到 [0, 1] （ComfyUI IMAGE 是 float32 [0,1] 范围）
-            corrected = torch.clamp(corrected, 0.0, 1.0)
-
-            # 写回
-            result[overlap_count:] = corrected
-
-            info_lines.append(
-                f"校正帧范围: [{overlap_count+1}-{B}] (共{num_correct_frames}帧)"
-            )
-            info_lines.append(
-                f"渐进权重: 从{overlap_count+1}帧(权重0)渐变到{B}帧(权重1)"
-            )
+        # 前 overlap_count 帧不动
+        frames_to_correct = result[overlap_count:]  # (N, H, W, C)
+        
+        # 对每帧生成精确的漂移量
+        # t = [0, 1, 2, ..., N-1]
+        t = torch.arange(N, device=images.device, dtype=images.dtype)
+        # drift_per_frame[t] = base_applied + slopes_applied * t
+        drift_per_frame = base_applied.view(1, 3) + slopes_applied.view(1, 3) * t.view(-1, 1)  # (N, 3)
+        drift_per_frame = drift_per_frame.view(N, 1, 1, 3)  # (N, 1, 1, 3)
+        
+        if correction_mode == "scale":
+            # 缩放模式: pixel *= (1 - drift/128)
+            scale_factors = 1.0 - drift_per_frame / 128.0
+            corrected = frames_to_correct * scale_factors
         else:
-            info_lines.append("没有需要校正的新帧")
+            # 减法模式: pixel -= drift
+            corrected = frames_to_correct - drift_per_frame
+        
+        corrected = torch.clamp(corrected, 0.0, 1.0)
+        result[overlap_count:] = corrected
+        
+        br_ratio_drift = 0.0
+        if ref_type != "segment_self" and ref_mean[0] > 0:
+            br_ratio_drift = (new_start_mean[2]/new_start_mean[0] - ref_mean[2]/ref_mean[0]) * 100
 
-        # 构建偏移量JSON
+        info_lines.append(f"校正帧: [{overlap_count+1}-{B}] ({N}帧)")
+        info_lines.append(f"B/R比率偏移: {br_ratio_drift:+.2f}%")
+
+        # ==================== 输出 ====================
         drift_data = {
-            "mode": ref_type,
+            "ref_mode": ref_type,
             "correction_type": correction_mode,
-            "drift_r": float(delta[0]),
-            "drift_g": float(delta[1]),
-            "drift_b": float(delta[2]),
-            "drift_r_applied": float(delta_applied[0]),
-            "drift_g_applied": float(delta_applied[1]),
-            "drift_b_applied": float(delta_applied[2]),
+            "slope_r": float(slopes[0]),
+            "slope_g": float(slopes[1]),
+            "slope_b": float(slopes[2]),
+            "base_offset_r": float(base_offset[0]),
+            "base_offset_g": float(base_offset[1]),
+            "base_offset_b": float(base_offset[2]),
+            "total_drift_r": float(total_drift_end[0]),
+            "total_drift_g": float(total_drift_end[1]),
+            "total_drift_b": float(total_drift_end[2]),
             "overlap_count": overlap_count,
             "strength": strength,
-            "frames_corrected": num_correct_frames,
+            "frames_corrected": N,
             "max_correction_pct": max_correction * 100,
         }
         drift_json = json.dumps(drift_data, indent=2)
-
-        info = "\n".join(info_lines)
-        info += f"\n\nDrift JSON:\n{drift_json}"
+        info = "\n".join(info_lines) + f"\n\nDrift JSON:\n{drift_json}"
 
         return (result, info)
+
+
+def reset_first_segment_cache():
+    """重置第一段缓存（调试用）"""
+    global _first_segment_cache
+    _first_segment_cache = None
 
 
 # ComfyUI 节点注册

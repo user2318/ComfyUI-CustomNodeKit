@@ -2,7 +2,7 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
-当前版本：**1.5.0** — 新增 SCAIL-2 混合编码模式、参考图选择器背景图位置优化、MaskCompositeRef 遮罩批次合成节点。
+当前版本：**1.5.2** — 色彩漂移校正重写为线性回归逐帧校正、新增 first_segment_cache 固定基准模式、reference_image_selector 背景图自动 resize、适配 reference_latents API 变更。
 
 ## 目录
 

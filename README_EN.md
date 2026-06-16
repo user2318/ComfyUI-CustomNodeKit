@@ -2,7 +2,7 @@
 
 A set of custom nodes for ComfyUI, covering video generation, pose processing, interactive image operations, and common workflow utilities.
 
-Current version: **1.4.2** — Added WanSparseAttention sparse attention node, SCAIL hybrid encoding mode, reference image selector background position optimization, context window pyramid fusion boundary fix.
+Current version: **1.5.2** — Color drift correction rewritten with linear regression per-frame correction, new first_segment_cache fixed baseline mode, background images auto-resize in reference_image_selector, adapted to reference_latents API changes.
 
 ## Table of Contents
 

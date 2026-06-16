@@ -89,13 +89,20 @@ class ReferenceImageUtils:
         return max(counts, key=counts.get)
     
     @classmethod
-    def _build_background_block(cls, background_images):
-        """将每张背景图复制4份, 拼接成块; 无效输入返回 None"""
+    def _build_background_block(cls, background_images, target_h=None, target_w=None):
+        """将每张背景图复制4份, 拼接成块; 无效输入返回 None.
+        若指定 target_h/target_w, 自动 resize 背景图到该尺寸."""
         if background_images is None or background_images.shape[0] == 0:
             return None
         parts = []
         for i in range(background_images.shape[0]):
-            parts.append(background_images[i:i+1].repeat(4, 1, 1, 1))
+            bg = background_images[i:i+1]
+            if target_h is not None and target_w is not None:
+                if bg.shape[1] != target_h or bg.shape[2] != target_w:
+                    bg = torch.nn.functional.interpolate(
+                        bg.movedim(-1, 1), size=(target_h, target_w), mode='bicubic'
+                    ).movedim(1, -1)
+            parts.append(bg.repeat(4, 1, 1, 1))
         return torch.cat(parts, dim=0)
     
     @classmethod
@@ -113,7 +120,8 @@ class ReferenceImageUtils:
         for i in range(1, total_count - 1):
             parts.append(reference_images[i:i+1].repeat(4, 1, 1, 1))
         # 背景图插入到倒数第二张和最后一张之间
-        bg_block = cls._build_background_block(background_images)
+        ref_h, ref_w = reference_images.shape[1], reference_images.shape[2]
+        bg_block = cls._build_background_block(background_images, target_h=ref_h, target_w=ref_w)
         if bg_block is not None:
             parts.append(bg_block)
             info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张 ×4 拼接)")
@@ -139,7 +147,11 @@ class ReferenceImageUtils:
             parts.append(reference_images[idx:idx+1].repeat(4, 1, 1, 1))
         
         # 背景图插入到中间元素和最后一个元素之间
-        bg_block = cls._build_background_block(background_images)
+        if len(parts) > 0:
+            ref_h, ref_w = parts[0].shape[1], parts[0].shape[2]
+        else:
+            ref_h, ref_w = reference_images.shape[1], reference_images.shape[2]
+        bg_block = cls._build_background_block(background_images, target_h=ref_h, target_w=ref_w)
         if bg_block is not None:
             parts.append(bg_block)
             info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张 ×4 拼接)")
@@ -200,7 +212,7 @@ class ReferenceImageUtils:
             solo_idx = candidate_indices[0]
             info_lines.append(f"仅1张候选参考图(索引{solo_idx}), 输出1张")
             solo_img = reference_images[solo_idx:solo_idx+1].clone()
-            bg_block = cls._build_background_block(background_images)
+            bg_block = cls._build_background_block(background_images, target_h=solo_img.shape[1], target_w=solo_img.shape[2])
             if bg_block is None:
                 info_lines.append("背景图: 无")
                 return (solo_img, info_lines)
@@ -302,12 +314,18 @@ class ReferenceImageSelector:
 
     @staticmethod
     def _append_background(images, background_images, info_lines):
-        """将 background_images 拼接到 images 末尾（如果存在）"""
+        """将 background_images 拼接到 images 末尾（如果存在），自动 resize 到 images 尺寸"""
         if background_images is not None and background_images.shape[0] > 0:
             parts = [images]
+            ref_h, ref_w = images.shape[1], images.shape[2]
             for i in range(background_images.shape[0]):
-                parts.append(background_images[i:i+1].clone())
-            info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张，原始图片直接插入)")
+                bg = background_images[i:i+1].clone()
+                if bg.shape[1] != ref_h or bg.shape[2] != ref_w:
+                    bg = torch.nn.functional.interpolate(
+                        bg.movedim(-1, 1), size=(ref_h, ref_w), mode='bicubic'
+                    ).movedim(1, -1)
+                parts.append(bg)
+            info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张)")
             return torch.cat(parts, dim=0)
         info_lines.append("背景图: 无")
         return images
@@ -414,9 +432,15 @@ class ReferenceImageSelector:
                 output_parts.append(reference_images[idx:idx+1].clone())
             # 背景图插入到前部和最后一张之间
             if background_images is not None and background_images.shape[0] > 0:
+                ref_h, ref_w = output_parts[0].shape[1], output_parts[0].shape[2]
                 for i in range(background_images.shape[0]):
-                    output_parts.append(background_images[i:i+1].clone())
-                info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张，原始图片直接插入)")
+                    bg = background_images[i:i+1].clone()
+                    if bg.shape[1] != ref_h or bg.shape[2] != ref_w:
+                        bg = torch.nn.functional.interpolate(
+                            bg.movedim(-1, 1), size=(ref_h, ref_w), mode='bicubic'
+                        ).movedim(1, -1)
+                    output_parts.append(bg)
+                info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张)")
             else:
                 info_lines.append("背景图: 无")
             # 尾部：最后一张辅助参考图
@@ -424,9 +448,15 @@ class ReferenceImageSelector:
         else:
             # 没有辅助参考图：只有主参考图，背景图后面补主参考图副本
             if background_images is not None and background_images.shape[0] > 0:
+                ref_h, ref_w = output_parts[0].shape[1], output_parts[0].shape[2]
                 for i in range(background_images.shape[0]):
-                    output_parts.append(background_images[i:i+1].clone())
-                info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张，原始图片直接插入)")
+                    bg = background_images[i:i+1].clone()
+                    if bg.shape[1] != ref_h or bg.shape[2] != ref_w:
+                        bg = torch.nn.functional.interpolate(
+                            bg.movedim(-1, 1), size=(ref_h, ref_w), mode='bicubic'
+                        ).movedim(1, -1)
+                    output_parts.append(bg)
+                info_lines.append(f"背景图使用: 有 ({background_images.shape[0]} 张)")
                 output_parts.append(reference_images[main_index:main_index+1].clone())
                 info_lines.append("辅助参考图: 无, 在背景图后追加主参考图副本")
             else:

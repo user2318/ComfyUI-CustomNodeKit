@@ -240,12 +240,15 @@ def _apply_all_patches():
                            sam_latents=None, **kwargs):
                 transformer_options.pop(_CACHE_KEY, None)
 
-                ref_lat = kwargs.get("reference_latent", None)
+                ref_lat = kwargs.get("reference_latents", None)
                 if ref_lat is not None:
-                    rpt = (ref_lat.shape[2] + (self.patch_size[0] // 2)) // self.patch_size[0]
-                    rph = (ref_lat.shape[3] + (self.patch_size[1] // 2)) // self.patch_size[1]
-                    rpw = (ref_lat.shape[4] + (self.patch_size[2] // 2)) // self.patch_size[2]
-                    transformer_options["_sparse_ref_len"] = rpt * rph * rpw
+                    # reference_latents in kwargs is list[tensor]; extract first element
+                    ref_tensor = ref_lat[0] if isinstance(ref_lat, list) and len(ref_lat) > 0 else ref_lat
+                    if isinstance(ref_tensor, torch.Tensor):
+                        rpt = (ref_tensor.shape[2] + (self.patch_size[0] // 2)) // self.patch_size[0]
+                        rph = (ref_tensor.shape[3] + (self.patch_size[1] // 2)) // self.patch_size[1]
+                        rpw = (ref_tensor.shape[4] + (self.patch_size[2] // 2)) // self.patch_size[2]
+                        transformer_options["_sparse_ref_len"] = rpt * rph * rpw
 
                 mpt = (x.shape[2] + (self.patch_size[0] // 2)) // self.patch_size[0]
                 mph = (x.shape[3] + (self.patch_size[1] // 2)) // self.patch_size[1]

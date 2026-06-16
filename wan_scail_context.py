@@ -51,7 +51,7 @@ def _apply_scail_model_patch():
                              transformer_options={}, pose_latents=None, ref_mask_latents=None,
                              sam_latents=None, **kwargs):
             window = transformer_options.get("context_window", None) if transformer_options else None
-            ref_latent_kw = kwargs.get("reference_latent", None)
+            ref_latent_kw = kwargs.get("reference_latents", None)
 
             # ComfyUI renames conditioning dict key "ref_mask_28ch" → model named param
             # "ref_mask_latents" via Python function argument binding.
@@ -59,7 +59,8 @@ def _apply_scail_model_patch():
             # We slice it here to match the windowed x.
             if ref_mask_latents is not None and window is not None and hasattr(window, "index_list"):
                 # ref_mask_latents: (B, 28, N+T_full, H, W) — ComfyUI movedim'ed to channel-first
-                n_ref = ref_latent_kw.shape[2] if ref_latent_kw is not None else 0
+                # n_ref = total frames in ref_mask_latents minus video frames = N
+                n_ref = max(0, ref_mask_latents.shape[2] - window.total_frames)
                 indices = window.index_list
                 ref_part = ref_mask_latents[:, :, :n_ref]
                 video_part = ref_mask_latents[:, :, n_ref:]
@@ -72,15 +73,19 @@ def _apply_scail_model_patch():
                 if hasattr(window, "original_indices") and len(video_part.shape) >= 3:
                     oi = window.original_indices
                     if oi and len(oi) > 1:
-                        first_frame_val = video_part[:, :, oi[0]].mean().item()
-                        last_frame_val = video_part[:, :, oi[-1]].mean().item()
+                        max_idx = video_part.shape[2] - 1
+                        idx0 = min(oi[0], max_idx)
+                        idx1 = min(oi[-1], max_idx)
+                        first_frame_val = video_part[:, :, idx0].mean().item()
+                        last_frame_val = video_part[:, :, idx1].mean().item()
                         logging.info(
                             "[SCAIL_OVERLAP] ref_mask overlap boundary: window orig=[%d..%d], "
                             "first_frame_mean=%.6f, last_frame_mean=%.6f",
                             oi[0], oi[-1], first_frame_val, last_frame_val
                         )
                 # --- 结束重叠区追踪 ---
-                video_part = video_part[:, :, indices]
+                safe_indices = [i for i in indices if i < video_part.shape[2]]
+                video_part = video_part[:, :, safe_indices]
                 ref_mask_latents = torch.cat([ref_part, video_part], dim=2)
                 logging.info(
                     "[SCAIL_DEBUG] ref_mask_latents: sliced=%s, mean=%.6f",
