@@ -41,9 +41,6 @@ analyze_v2.py
 drift_analysis.py
 v2_analysis.txt
 
-# Old file - functionality merged into custom_sdpose_nodes.py
-sdpose_yaw.py
-
 # local distribution folder (not for upload)
 local1/
 PROGRESS_README.md 
