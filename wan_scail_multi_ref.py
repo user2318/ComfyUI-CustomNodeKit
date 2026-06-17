@@ -425,6 +425,16 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
             negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [concat_ref_latent]}, append=True)
 
         if clip_vision_output is not None:
+            logging.info(f"[DEBUG wan_scail_multi_ref] clip_vision_output type: {type(clip_vision_output)}")
+            if hasattr(clip_vision_output, 'penultimate_hidden_states'):
+                hs = clip_vision_output.penultimate_hidden_states
+                logging.info(f"[DEBUG wan_scail_multi_ref] penultimate_hidden_states shape: {hs.shape}, dtype: {hs.dtype}, mean={hs.mean().item():.6f}, std={hs.std().item():.6f}, min={hs.min().item():.6f}, max={hs.max().item():.6f}")
+            if hasattr(clip_vision_output, 'last_hidden_state'):
+                hs = clip_vision_output.last_hidden_state
+                logging.info(f"[DEBUG wan_scail_multi_ref] last_hidden_state shape: {hs.shape}, mean={hs.mean().item():.6f}, std={hs.std().item():.6f}")
+            if hasattr(clip_vision_output, 'image_embeds'):
+                ie = clip_vision_output.image_embeds
+                logging.info(f"[DEBUG wan_scail_multi_ref] image_embeds shape: {ie.shape}, mean={ie.mean().item():.6f}, std={ie.std().item():.6f}")
             positive = node_helpers.conditioning_set_values(positive, {"clip_vision_output": clip_vision_output})
             negative = node_helpers.conditioning_set_values(negative, {"clip_vision_output": clip_vision_output})
 
