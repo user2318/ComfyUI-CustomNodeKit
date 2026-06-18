@@ -278,7 +278,8 @@ class SDPoseSaveJson:
         full_output_folder, filename, counter, subfolder, filename_prefix = \
             folder_paths.get_save_image_path(filename_prefix, self.output_dir, pose_kps[0]["canvas_width"], pose_kps[0]["canvas_height"])
         if overwrite:
-            file = f"{filename}_{counter:05}.json"
+            # 使用固定文件名，open('w') 天然覆盖已有文件
+            file = f"{filename}.json"
         else:
             file = f"{filename}_{counter:05}_.json"
         if fps > 0:
