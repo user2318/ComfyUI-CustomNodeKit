@@ -22,6 +22,9 @@ Thumbs.db
 # Backup files
 *.bak
 
+# local_backup (not for upload)
+local_backup/
+
 # Git
 .git/
 
@@ -45,3 +48,6 @@ v2_analysis.txt
 local1/
 PROGRESS_README.md 
 test_yaw_improved/
+
+# Local development notes (not for upload)
+md/
