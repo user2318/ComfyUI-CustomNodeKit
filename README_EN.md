@@ -2,7 +2,7 @@
 
 A set of custom nodes for ComfyUI, covering video generation, pose processing, interactive image operations, and common workflow utilities.
 
-Current version: **1.5.3** — New AutoColorDriftCorrection V2 color drift correction node, new CLIP Vision Multi-Ref Switch node, new WanSparseAttention sparse attention node.
+Current version: **1.5.6** — New AutoColorDriftCorrection V3.1 color drift correction node, new CLIP Vision Multi-Ref Switch node, new WanSparseAttention sparse attention node.
 
 ## Table of Contents
 
@@ -79,7 +79,7 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 | **Create SCAIL-2 Colored Mask (Multi Ref)** | `conditioning/video_models/scail` | Renders SAM3 tracking data into SCAIL-2 colored masks. Supports shared palette sorting (left_to_right/area) for reference images and driving video, ensuring consistent identity coloring across multi-person scenes |
 | **WanSparseAttention** | `model/conditioning/video_models/scail` | SCAIL sparse attention & causal attention node. Uses attention masks to limit interactions between pose/ref/main tokens, reducing degeneration in long video generation. Supports multiple attention mask strategies: no mask, pose-disabled-from-main, causal-only, pose-disabled-from-main+causal, etc. |
 | **CLIP Vision Multi-Ref Switch** | `conditioning/video_models/scail` | Multi-image CLIP feature concatenation node. Concatenates batch CLIP vision features in token dimension, enabling all reference images to contribute to conditioning |
-| **Auto Color Drift Correction V2** | `CustomNodes/Video` | Self-aligned color drift correction node. Uses per-segment linear regression + overlap frame alignment (prev_frames or self_overlap) to eliminate inter-segment color jumps |
+| **Auto Color Drift Correction V3.1** | `CustomNodes/Video` | Self-aligned color drift correction node V3.1. Three-layer correction: ① intra-segment drift detection (auto mode identifies jumps, bypasses if no drift); ② seam alignment eliminates inter-segment jumps; ③ bump correction for intra-segment oscillation + adaptive EMA template learning |
 
 ### SDPose Pose System
 

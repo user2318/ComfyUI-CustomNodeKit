@@ -124,3 +124,11 @@
 | 类名 | 显示名 |
 |------|--------|
 | `WanSCAILSparseAttention` | Wan SCAIL Sparse Attention |
+
+---
+
+## color_drift_correction.py
+
+| 类名 | 显示名 |
+|------|--------|
+| `AutoColorDriftCorrection` | Auto Color Drift Correction V3.1 (漂移检测) |

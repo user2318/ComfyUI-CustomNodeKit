@@ -2,7 +2,7 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
-当前版本：**1.5.3** — 新增 AutoColorDriftCorrection V2 色彩漂移校正节点、新增 CLIP Vision Multi-Ref Switch 多参考图 CLIP 特征合并节点、新增 WanSparseAttention 稀疏注意力节点。
+当前版本：**1.5.6** — 新增 AutoColorDriftCorrection V3.1 色彩漂移校正节点、新增 CLIP Vision Multi-Ref Switch 多参考图 CLIP 特征合并节点、新增 WanSparseAttention 稀疏注意力节点。
 
 ## 目录
 
@@ -83,7 +83,7 @@ pip install -r requirements.txt
 | **Create SCAIL-2 Colored Mask (Multi Ref)** | `conditioning/video_models/scail` | 渲染 SAM3 追踪数据为 SCAIL-2 使用的 colored mask。支持参考图和驱动视频的共享调色板排序（left_to_right/area），确保多人物场景下同一身份颜色一致 |
 | **Wan SCAIL Sparse Attention** | `conditioning/video_models/scail` | SCAIL 稀疏注意力节点，通过注意力掩码限制 pose/ref/main token 之间的交互，减少长视频生成中的退化现象。支持多种注意力掩码策略 |
 | **CLIP Vision Multi-Ref Switch** | `conditioning/video_models/scail` | 多参考图 CLIP 特征合并节点。将批次中 N 张图的 CLIP Vision 特征拼接到 token 维度，使所有参考图都参与 conditioning |
-| **Auto Color Drift Correction V2** | `CustomNodes/Video` | 自对齐色彩漂移校正节点。利用段内线性回归 + 重叠帧对齐（prev_frames 或 self_overlap），消除多段视频生成中的段间色彩跳变 |
+| **Auto Color Drift Correction V3.1** | `CustomNodes/Video` | 自对齐色彩漂移校正节点 V3.1。三层校正：① 段内漂移检测（auto模式自动识别跳变，无漂移则旁路输出）；② 接缝对齐消除段间跳变；③ 隆起校正修正段内震荡 + 自适应EMA学习模板 |
 
 ### SDPose 姿态系统
 
