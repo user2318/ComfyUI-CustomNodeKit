@@ -117,8 +117,6 @@ def _apply_rope_downsample_patch():
                                          transformer_options=transformer_options)
 
             F_pose, H_pose, W_pose = pose_latents.shape[-3], pose_latents.shape[-2], pose_latents.shape[-1]
-            h_scale = h / H_pose
-            w_scale = w / W_pose
             ref_t_patches = 0
 
             # --- Replacement mode path ---
@@ -128,20 +126,21 @@ def _apply_rope_downsample_patch():
                 if reference_latent is not None:
                     ref_t_patches = (reference_latent.shape[2] + (self.patch_size[0] // 2)) // self.patch_size[0]
                 main_t_patches = t - ref_t_patches
+                video_t_start = max(ref_t_patches - 1, 0)
 
                 parts = []
                 if ref_t_patches > 0:
                     ref_tf = {"rope_options": {"shift_y": REF_ROPE_H, "shift_x": 0.0, "scale_y": 1.0, "scale_x": 1.0}}
                     parts.append(_mod.WanModel.rope_encode(self, ref_t_patches, h, w, t_start=0, device=device, dtype=dtype, transformer_options=ref_tf))
                 if main_t_patches > 0:
-                    parts.append(_mod.WanModel.rope_encode(self, main_t_patches, h, w, t_start=0, device=device, dtype=dtype, transformer_options=transformer_options))
+                    parts.append(_mod.WanModel.rope_encode(self, main_t_patches, h, w, t_start=video_t_start, device=device, dtype=dtype, transformer_options=transformer_options))
                 if F_pose > 0:
                     # Pose branch: generate full-resolution RoPE then avg_pool2d downsample.
                     # No scale/shift on coordinates — dense 0..N-1 grid with x-offset=120.0,
                     # matching WanAnimatePlus commit 22555324 (Original SCAIL-2 path).
                     pose_tf = {"rope_options": {"shift_y": 0.0, "shift_x": 120.0, "scale_y": 1.0, "scale_x": 1.0},
                                "_scail_rope_downsample": True}
-                    parts.append(_mod.WanModel.rope_encode(self, F_pose, H_pose, W_pose, t_start=0, device=device, dtype=dtype, transformer_options=pose_tf))
+                    parts.append(_mod.WanModel.rope_encode(self, F_pose, H_pose, W_pose, t_start=video_t_start, device=device, dtype=dtype, transformer_options=pose_tf))
                 return torch.cat(parts, dim=1)
 
             # --- Animation mode path (default) ---
