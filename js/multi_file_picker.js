@@ -495,12 +495,17 @@ app.registerExtension({
                         body: JSON.stringify({ mode: 'file', multi: true })
                     });
                     const result = await resp.json();
+                    if (result.error) {
+                        alert('选择文件失败：' + result.error);
+                        return;
+                    }
                     const paths = result.paths || [];
                     if (paths.length > 0) {
                         this._insertAt(this.selectedIndex, paths);
                     }
                 } catch (err) {
                     console.error('选择文件失败:', err);
+                    alert('选择文件失败，请查看控制台了解详情。');
                 }
             }
 
@@ -512,12 +517,17 @@ app.registerExtension({
                         body: JSON.stringify({ mode: 'directory', multi: true })
                     });
                     const result = await resp.json();
+                    if (result.error) {
+                        alert('选择目录失败：' + result.error);
+                        return;
+                    }
                     const paths = result.paths || [];
                     if (paths.length > 0) {
                         this._insertAt(this.selectedIndex, paths);
                     }
                 } catch (err) {
                     console.error('选择目录失败:', err);
+                    alert('选择目录失败，请查看控制台了解详情。');
                 }
             }
 

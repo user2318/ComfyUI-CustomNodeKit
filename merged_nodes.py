@@ -118,6 +118,8 @@ async def select_file(request):
             root.destroy()
             return web.json_response({"paths": [dir_path] if dir_path else []})
 
+    except ImportError:
+        return web.json_response({"error": "tkinter 不可用。请运行 install.py 安装 tkinter 组件，或重启 ComfyUI 后重试。"}, status=500)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
