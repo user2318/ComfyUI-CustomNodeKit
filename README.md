@@ -2,7 +2,7 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
-当前版本：**1.5.6** — 新增 AutoColorDriftCorrection V3.1 色彩漂移校正节点、新增 CLIP Vision Multi-Ref Switch 多参考图 CLIP 特征合并节点、新增 WanSparseAttention 稀疏注意力节点。
+当前版本：**1.5.9** — 重建节点架构，统一节点分组逻辑，优化视频姿态检测与色彩校正流程。
 
 ## 目录
 

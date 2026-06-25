@@ -10,6 +10,7 @@ from typing import List, Tuple, Optional
 import folder_paths
 import comfy.utils
 from imageio_ffmpeg import get_ffmpeg_exe
+from PIL import Image
 
 FFMPEG_PATH = get_ffmpeg_exe()
 BASE_DIR = folder_paths.base_path
@@ -442,6 +443,7 @@ class VideoGridCompose:
     LAYOUT_OPTIONS = ["水平排列", "垂直排列", "田字格2×2", "左一右N", "上一+下N"]
     AUDIO_OPTIONS = ["无音频", "视频1", "视频2", "视频3", "视频4"]
     MATCH_OPTIONS = ["自适应(填满)", "自适应(保持比例)", "统一到最大", "统一到最小"]
+    DURATION_OPTIONS = ["自动(最短)", "自动(最长)", "视频1", "视频2", "视频3", "视频4"]
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -477,6 +479,10 @@ class VideoGridCompose:
                     "max": 51,
                     "step": 1,
                     "tooltip": "编码质量，越低质量越高（建议18-28）"
+                }),
+                "duration_mode": (cls.DURATION_OPTIONS, {
+                    "default": "自动(最短)",
+                    "tooltip": "时长同步模式：以哪一路输入为基准对齐时长。自动(最短)=以最短时长为准；自动(最长)=以最长时长为准；视频N=以第N路视频的时长为准。若选中的是图片则跳过执行。Duration sync mode: which input to use as duration reference. Auto(shortest)=use shortest duration; Auto(longest)=use longest duration; VideoN=use the Nth video's duration. Skips execution if the selected source is an image."
                 }),
                 "output_path_prefix": ("STRING", {
                     "default": "video/grid_output",
@@ -594,6 +600,58 @@ class VideoGridCompose:
             f"[{labels[0]}][bottom]vstack=inputs=2[out]"
         )
     
+    def _is_image_file(self, file_path: str) -> bool:
+        """使用 PIL 自动检测文件是否为图片。尝试打开，能打开就是图片。"""
+        try:
+            with Image.open(file_path) as img:
+                img.verify()
+            return True
+        except Exception:
+            return False
+    
+    def _get_resolution_from_image(self, file_path: str) -> Tuple[int, int]:
+        """获取图片分辨率"""
+        with Image.open(file_path) as img:
+            return img.size  # (width, height)
+    
+    def _get_duration_for_input(self, file_path: str, is_image: bool) -> Optional[float]:
+        """获取输入时长。图片返回 None，视频返回秒数。"""
+        if is_image:
+            return None
+        try:
+            duration, _ = get_video_info(file_path)
+            return duration
+        except Exception:
+            return None
+    
+    def _determine_target_duration(self, is_images: List[bool], durations: List[Optional[float]], 
+                                    duration_mode: str) -> Tuple[Optional[float], int]:
+        """
+        根据 duration_mode 确定基准时长。
+        返回 (target_duration, source_index)，source_index 仅对"视频N"模式有意义。
+        如果选中的主时长源是图片，返回 (None, -1)。
+        """
+        if duration_mode.startswith("视频"):
+            idx = int(duration_mode.replace("视频", "")) - 1  # "视频1" -> 0
+            if idx < len(is_images):
+                if is_images[idx]:
+                    # 选中的是图片
+                    return None, idx
+                dur = durations[idx]
+                if dur is not None and dur > 0:
+                    return dur, idx
+            return None, idx
+        
+        # 自动模式：收集所有视频的时长
+        video_durations = [d for d in durations if d is not None and d > 0]
+        if not video_durations:
+            return None, -1
+        
+        if duration_mode == "自动(最长)":
+            return max(video_durations), -1
+        else:  # "自动(最短)"
+            return min(video_durations), -1
+    
     def _check_layout_availability(self, layout: str, num_videos: int) -> str:
         """检查布局是否可用，不可用时降级"""
         if layout == "田字格2×2" and num_videos != 4:
@@ -692,6 +750,7 @@ class VideoGridCompose:
                 match_method: str = "自适应(填满)",
                 fps: float = 25.0,
                 crf: int = 23,
+                duration_mode: str = "自动(最短)",
                 output_path_prefix: str = "video/grid_output") -> Tuple[str]:
         
         # ==============================
@@ -718,39 +777,48 @@ class VideoGridCompose:
             for p in missing:
                 logging.warning(f"文件不存在，已跳过: {p}")
         
-        num_videos = len(valid_paths)
-        if num_videos == 0:
-            raise ValueError("没有有效的视频文件可供处理")
+        num_inputs = len(valid_paths)
+        if num_inputs == 0:
+            raise ValueError("没有有效的文件可供处理")
         
-        logging.info(f"有效视频数量: {num_videos}")
+        logging.info(f"有效输入数量: {num_inputs}")
         for i, p in enumerate(valid_paths):
-            logging.info(f"  视频{i+1}: {p}")
+            logging.info(f"  输入{i+1}: {p}")
         
         # ==============================
-        # 2. 单视频透传
+        # 2. 检测每个输入的类型（图片/视频）并获取信息
         # ==============================
-        if num_videos == 1:
-            logging.info("仅1路视频，直接透传原路径")
+        is_images = [self._is_image_file(p) for p in valid_paths]
+        resolutions = []
+        durations = []  # 视频时长；图片为 None
+        max_fps = 0.0
+        
+        for i, (p, is_img) in enumerate(zip(valid_paths, is_images)):
+            if is_img:
+                w, h = self._get_resolution_from_image(p)
+                resolutions.append((w, h))
+                durations.append(None)
+                logging.info(f"  输入{i+1} (图片): {w}x{h}")
+            else:
+                w, h = get_video_resolution(p)
+                resolutions.append((w, h))
+                dur, vfps = get_video_info(p)
+                durations.append(dur)
+                max_fps = max(max_fps, vfps)
+                logging.info(f"  输入{i+1} (视频): {w}x{h}, {dur:.2f}s, {vfps:.2f}fps")
+        
+        # ==============================
+        # 3. 单输入透传
+        # ==============================
+        if num_inputs == 1:
+            logging.info("仅1路输入，直接透传原路径")
             return (valid_paths[0],)
         
         # ==============================
-        # 3. 布局降级检查
+        # 4. 布局降级检查
         # ==============================
-        effective_layout = self._check_layout_availability(layout, num_videos)
+        effective_layout = self._check_layout_availability(layout, num_inputs)
         logging.info(f"布局: {layout} -> 生效布局: {effective_layout}")
-        
-        # ==============================
-        # 4. 获取所有视频信息
-        # ==============================
-        resolutions = []
-        max_fps = 0.0
-        for p in valid_paths:
-            w, h = get_video_resolution(p)
-            resolutions.append((w, h))
-            _, vfps = get_video_info(p)
-            max_fps = max(max_fps, vfps)
-        
-        logging.info(f"各视频分辨率: {resolutions}")
         
         # ==============================
         # 5. 确定帧率
@@ -761,55 +829,154 @@ class VideoGridCompose:
         # ==============================
         # 6. 计算目标尺寸和瓦片尺寸
         # ==============================
-        base_w, base_h = self._determine_target_size(resolutions, match_method, effective_layout, num_videos)
+        base_w, base_h = self._determine_target_size(resolutions, match_method, effective_layout, num_inputs)
         logging.info(f"基准尺寸: {base_w}x{base_h}")
         
         tile_sizes = self._calculate_tile_sizes(effective_layout, resolutions, base_w, base_h)
         logging.info(f"瓦片尺寸: {tile_sizes}")
         
         # ==============================
-        # 7. 构建 filter_complex
+        # 7. 处理时长同步
         # ==============================
-        scale_filters = []
-        labels = []
-        for i in range(num_videos):
+        target_duration, source_idx = self._determine_target_duration(is_images, durations, duration_mode)
+        
+        # 检查选中主时长源是否为图片
+        if target_duration is None and not duration_mode.startswith("自动"):
+            # 只有指定"视频N"且选中图片时才跳过
+            logging.warning(f"主时长源 ({duration_mode}) 是图片，没有时长信息，跳过执行")
+            return ("",)
+        
+        if target_duration is None:
+            # 自动模式下没有有效视频时长（全是图片），取最长图片静止时长
+            # 用 5 秒作为默认时长
+            target_duration = 5.0
+            logging.info(f"所有输入均为图片，使用默认时长 {target_duration}s")
+        
+        logging.info(f"目标时长: {target_duration:.2f}s (模式: {duration_mode})")
+        
+        # ==============================
+        # 8. 构建 ffmpeg 输入命令与 filter_complex
+        # ==============================
+        ffmpeg_inputs = []
+        filter_parts = []
+        map_labels = []
+        input_index = 0  # ffmpeg 输入流索引
+        
+        for i in range(num_inputs):
+            is_img = is_images[i]
+            path = valid_paths[i]
             tw, th = tile_sizes[i]
             sw, sh = resolutions[i]
-            scale_filter = self._build_scale_filter(i, sw, sh, tw, th, match_method)
-            scale_filters.append(scale_filter)
-            labels.append(f"s{i}")
+            dur = durations[i]
+            
+            if is_img:
+                # 图片输入：用 -loop 1 -t 将其转为指定时长的静止视频流
+                ffmpeg_inputs.extend([
+                    "-loop", "1",
+                    "-t", str(target_duration),
+                    "-i", path
+                ])
+                # 图片直接从输入流缩放
+                label = f"s{i}"
+                scale_filter = self._build_scale_filter(input_index, sw, sh, tw, th, match_method)
+                filter_parts.append(scale_filter)
+                map_labels.append(label)
+                input_index += 1
+            else:
+                # 视频输入
+                ffmpeg_inputs.extend(["-i", path])
+                
+                # 先缩放，再时长对齐
+                scale_part = self._build_scale_filter(input_index, sw, sh, tw, th, match_method)
+                filter_parts.append(scale_part)
+                
+                # _build_scale_filter 输出的标签格式为 s{input_index}
+                current_label = f"s{input_index}"
+                
+                # 时长对齐处理
+                if dur is not None and abs(dur - target_duration) > 0.05:
+                    if dur > target_duration:
+                        # 比基准长 → 截断
+                        trim_label = f"tr{i}"
+                        filter_parts.append(
+                            f"[{current_label}]trim=end={target_duration},setpts=PTS[{trim_label}]"
+                        )
+                        current_label = trim_label
+                    else:
+                        # 比基准短 → 冻结最后一帧补齐
+                        tpad_label = f"tp{i}"
+                        pad_duration = target_duration - dur
+                        filter_parts.append(
+                            f"[{current_label}]tpad=stop_mode=clone:stop_duration={pad_duration}[{tpad_label}]"
+                        )
+                        current_label = tpad_label
+                
+                map_labels.append(current_label)
+                input_index += 1
         
-        # 拼接滤镜
+        # 布局拼接滤镜
         if effective_layout == "水平排列":
-            compose_filter = self._build_hstack_filter(num_videos, labels)
+            compose_filter = self._build_hstack_filter(num_inputs, map_labels)
         elif effective_layout == "垂直排列":
-            compose_filter = self._build_vstack_filter(num_videos, labels)
+            compose_filter = self._build_vstack_filter(num_inputs, map_labels)
         elif effective_layout == "田字格2×2":
-            compose_filter = self._build_grid2x2_filter(labels)
+            compose_filter = self._build_grid2x2_filter(map_labels)
         elif effective_layout == "左一右N":
-            compose_filter = self._build_left_right_filter(labels)
+            compose_filter = self._build_left_right_filter(map_labels)
         elif effective_layout == "上一+下N":
-            compose_filter = self._build_top_bottom_filter(labels)
+            compose_filter = self._build_top_bottom_filter(map_labels)
         else:
-            compose_filter = self._build_hstack_filter(num_videos, labels)
+            compose_filter = self._build_hstack_filter(num_inputs, map_labels)
         
-        filter_complex = ';'.join(scale_filters + [compose_filter])
-        logging.info(f"filter_complex: {filter_complex}")
+        filter_parts.append(compose_filter)
         
         # ==============================
-        # 8. 处理音频
+        # 9. 处理音频（含时长对齐）
         # ==============================
         audio_label = audio_source.strip()
         has_audio = audio_label != "无音频" and audio_label in self.AUDIO_OPTIONS
         
+        audio_input_idx = -1
+        audio_map_label = None
         if has_audio:
+            # "视频N" 直接对应第 N 行输入（1-based），不跳过图片
             audio_idx = self.AUDIO_OPTIONS.index(audio_label) - 1  # "视频1"->0, "视频2"->1, ...
-            if audio_idx >= num_videos:
-                logging.warning(f"音频来源 {audio_label} 超出视频数量 {num_videos}，将不使用音频")
+            if audio_idx < num_inputs:
+                audio_input_idx = audio_idx
+                # 检查该行是否是图片（图片没有音频流）
+                if is_images[audio_idx]:
+                    logging.warning(f"音频来源 {audio_label} 是图片，没有音频轨道，将不使用音频")
+                    has_audio = False
+                else:
+                    # 对音频做时长对齐（在 filter_complex 中处理）
+                    audio_dur = durations[audio_input_idx]  # 原始音频时长
+                    if audio_dur is not None and abs(audio_dur - target_duration) > 0.05:
+                        audio_label_name = f"audio_out"
+                        if audio_dur > target_duration:
+                            # 比基准长 → 截断
+                            filter_parts.append(
+                                f"[{audio_input_idx}:a:0]atrim=end={target_duration}[{audio_label_name}]"
+                            )
+                        else:
+                            # 比基准短 → 补静音
+                            pad_dur = target_duration - audio_dur
+                            filter_parts.append(
+                                f"[{audio_input_idx}:a:0]apad=pad_dur={pad_dur}[{audio_label_name}]"
+                            )
+                        audio_map_label = audio_label_name
+                    # else: 时长一致，直接映射原始流（audio_map_label=None）
+            else:
+                logging.warning(f"音频来源 {audio_label} 超出输入数量 {num_inputs}，将不使用音频")
                 has_audio = False
         
+        # 在所有拼接后添加 pad 确保宽高为偶数（libx264 要求）
+        filter_parts.append("[out]pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:color=black[final_out]")
+        
+        filter_complex = ';'.join(filter_parts)
+        logging.info(f"filter_complex: {filter_complex}")
+        
         # ==============================
-        # 9. 构建输出路径
+        # 10. 构建输出路径
         # ==============================
         output_dir = folder_paths.get_output_directory()
         rel_path = Path(output_path_prefix)
@@ -826,23 +993,27 @@ class VideoGridCompose:
         logging.info(f"输出视频路径: {final_path}")
         
         # ==============================
-        # 10. 构建 ffmpeg 命令
+        # 11. 构建 ffmpeg 命令
         # ==============================
         cmd = [FFMPEG_PATH, "-y", "-loglevel", "info"]
         
         # 输入文件
-        for p in valid_paths:
-            cmd.extend(["-i", p])
+        cmd.extend(ffmpeg_inputs)
         
         # filter_complex
         cmd.extend(["-filter_complex", filter_complex])
         
-        # 视频映射
-        cmd.extend(["-map", "[out]"])
+        # 视频映射（从 pad 后的 final_out 取）
+        cmd.extend(["-map", "[final_out]"])
         
         # 音频映射
-        if has_audio:
-            cmd.extend(["-map", f"{audio_idx}:a:0?"])
+        if has_audio and audio_input_idx >= 0:
+            if audio_map_label:
+                # 经过 atrim/apad 处理后的音频流
+                cmd.extend(["-map", f"[{audio_map_label}]"])
+            else:
+                # 原始音频流（时长与目标一致）
+                cmd.extend(["-map", f"{audio_input_idx}:a:0?"])
             cmd.extend(["-c:a", "aac", "-b:a", "192k"])
         
         # 编码参数
@@ -851,23 +1022,15 @@ class VideoGridCompose:
             "-crf", str(crf),
             "-r", str(effective_fps),
             "-pix_fmt", "yuv420p",
-            "-shortest",
             str(final_path)
         ])
         
         logging.info(f"ffmpeg 命令: {' '.join(cmd)}")
         
         # ==============================
-        # 11. 执行并显示进度
+        # 12. 执行
         # ==============================
-        # 先粗略估算总时长
-        total_duration = 0
-        for p in valid_paths:
-            d, _ = get_video_info(p)
-            if total_duration == 0 or d < total_duration:
-                total_duration = d
-        
-        pbar = comfy.utils.ProgressBar(int(total_duration * 10))
+        pbar = comfy.utils.ProgressBar(int(target_duration * 10))
         
         process = subprocess.Popen(
             cmd,

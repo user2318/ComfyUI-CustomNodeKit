@@ -2,7 +2,7 @@
 
 A set of custom nodes for ComfyUI, covering video generation, pose processing, interactive image operations, and common workflow utilities.
 
-Current version: **1.5.6** — New AutoColorDriftCorrection V3.1 color drift correction node, new CLIP Vision Multi-Ref Switch node, new WanSparseAttention sparse attention node.
+Current version: **1.5.9** — Rebuilt node architecture, unified node grouping logic, optimized video pose detection and color correction workflow.
 
 ## Table of Contents
 

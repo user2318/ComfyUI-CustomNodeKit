@@ -15,18 +15,31 @@ class PathCollectorNode:
             "required": {},
             "optional": {
                 "paths": ("STRING", {"default": "", "multiline": True, "tooltip": "输入多个路径，每行一个。可通过多文件选择器前端控件批量选择。Enter multiple paths, one per line. Supports batch selection via the multi-file picker frontend control."}),
+                "index": ("INT", {"default": 0, "min": 0, "max": 9999, "step": 1, "tooltip": "选择要输出的行号（从1开始）。0=输出所有行；1=输出第1行；2=输出第2行；以此类推。超出范围时输出空字符串。Select which line number to output (starting from 1). 0=output all lines; 1=output line 1; 2=output line 2; etc. Outputs empty string if out of range."}),
             },
         }
 
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("combined_paths",)
+    RETURN_NAMES = ("paths_out",)
     FUNCTION = "combine_paths"
     CATEGORY = "Custom Nodes"
     OUTPUT_NODE = False
 
-    def combine_paths(self, paths=""):
-        # 直接返回多行文本，去除首尾空白行
-        return (paths.strip(),)
+    def combine_paths(self, paths="", index=0):
+        paths = paths.strip()
+        if index == 0:
+            # 输出所有行（原行为）
+            return (paths,)
+        
+        # 按行分割（支持 \r\n 和 \n）
+        lines = paths.replace("\r\n", "\n").split("\n")
+        
+        # 从1开始索引，但内部用0-based
+        if 1 <= index <= len(lines):
+            return (lines[index - 1],)
+        else:
+            # 超出范围 → 输出空字符串
+            return ("",)
 
 
 class IndexSelectorNode:
