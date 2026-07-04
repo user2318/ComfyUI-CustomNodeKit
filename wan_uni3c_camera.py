@@ -424,28 +424,62 @@ class WanUni3CApply:
             
             nonlocal cn_data
             
-            # embeddings（与原始 forward_orig 一致）
-            x_p = self_model.patch_embedding(x.float()).to(x.dtype)
-            x_p, motion_vec = self_model.after_patch_embedding(x_p, pose_latents, face_pixel_values)
-            grid_sizes = x_p.shape[2:]
-            x_p = x_p.flatten(2).transpose(1, 2)
-            original_seq_len = x_p.shape[1]
+            # 检测是否为 SCAIL 系列模型（SCAIL/SCAIL2）
+            is_scail = hasattr(self_model, 'patch_embedding_pose')
             
-            # time embeddings（关键：e 就是 KJ 传入 ControlNet 的 temb）
+            # 保存原始 x 用于 ControlNet 噪声提取（SCAIL 路径可能修改 x）
+            x_orig_for_noise = x
+            motion_vec = None  # 仅 WanAnimate 使用
+            
+            if is_scail:
+                # === SCAIL/SCAIL2 路径 ===
+                # 参考 SCAILWanModel.forward_orig 的 embedding 逻辑
+                if kwargs.get("reference_latent") is not None:
+                    x = torch.cat((kwargs["reference_latent"], x), dim=2)
+                
+                x_p = self_model.patch_embedding(x.float()).to(x.dtype)
+                if kwargs.get("ref_mask_latents") is not None:  # SCAIL-2 additive mask stream
+                    x_p = x_p + self_model.patch_embedding_mask(kwargs["ref_mask_latents"].float()).to(x.dtype)
+                grid_sizes = x_p.shape[2:]
+                transformer_options["grid_sizes"] = grid_sizes
+                x_p = x_p.flatten(2).transpose(1, 2)
+                
+                scail_pose_seq_len = 0
+                if pose_latents is not None:
+                    scail_x = self_model.patch_embedding_pose(pose_latents.float()).to(x_p.dtype)
+                    if kwargs.get("sam_latents") is not None:  # SCAIL-2 additive mask stream
+                        scail_x = scail_x + self_model.patch_embedding_mask(kwargs["sam_latents"].float()).to(x_p.dtype)
+                    scail_x = scail_x.flatten(2).transpose(1, 2)
+                    scail_pose_seq_len = scail_x.shape[1]
+                    x_p = torch.cat([x_p, scail_x], dim=1)
+                    del scail_x
+                
+                # original_seq_len = 非 pose 部分的 token 数（main video + ref tokens）
+                original_seq_len = x_p.shape[1] - scail_pose_seq_len
+                full_ref = None
+            else:
+                # === 原始 WanAnimate 路径（保持不变） ===
+                x_p = self_model.patch_embedding(x.float()).to(x.dtype)
+                x_p, motion_vec = self_model.after_patch_embedding(x_p, pose_latents, face_pixel_values)
+                grid_sizes = x_p.shape[2:]
+                x_p = x_p.flatten(2).transpose(1, 2)
+                original_seq_len = x_p.shape[1]
+                
+                # full ref（WanAnimate 风格）
+                full_ref = None
+                if self_model.ref_conv is not None:
+                    full_ref = kwargs.get("reference_latent", None)
+                    if full_ref is not None:
+                        full_ref = self_model.ref_conv(full_ref).flatten(2).transpose(1, 2)
+                        x_p = torch.concat((full_ref, x_p), dim=1)
+            
+            # time embeddings（共用）
             e = self_model.time_embedding(
                 sinusoidal_embedding_1d(self_model.freq_dim, t.flatten()).to(dtype=x_p[0].dtype))
             e = e.reshape(t.shape[0], -1, e.shape[-1])
             e0 = self_model.time_projection(e).unflatten(2, (6, self_model.dim))
             
-            # full ref
-            full_ref = None
-            if self_model.ref_conv is not None:
-                full_ref = kwargs.get("reference_latent", None)
-                if full_ref is not None:
-                    full_ref = self_model.ref_conv(full_ref).flatten(2).transpose(1, 2)
-                    x_p = torch.concat((full_ref, x_p), dim=1)
-            
-            # context
+            # context（共用）
             context = self_model.text_embedding(context)
             context_img_len = None
             if clip_fea is not None:
@@ -454,7 +488,7 @@ class WanUni3CApply:
                     context = torch.concat([context_clip, context], dim=1)
                 context_img_len = clip_fea.shape[-2]
             
-            # ===== step_percentage 计算 =====
+            # ===== step_percentage 计算（共用） =====
             sigmas = transformer_options.get("sigmas", None)
             if sigmas is not None:
                 if cn_data["total_steps"] is None:
@@ -468,7 +502,7 @@ class WanUni3CApply:
             in_range = cn_data["start_pct"] <= step_pct <= cn_data["end_pct"]
             skip = cn_data["skip_cn"] or not in_range
             
-            # ===== ControlNet 推理（每 step 一次，基于完整视频） =====
+            # ===== ControlNet 推理（每 step 一次，基于完整视频，共用） =====
             uni3c_controlnet_states = None
             if not skip:
                 try:
@@ -480,8 +514,8 @@ class WanUni3CApply:
                     window = transformer_options.get("context_window", None)
                     
                     # 构建 render_latent_input（基于完整视频，不按窗口切片）
-                    # 用 x（patch 之前的原始输入）的初始噪声拼接 render_latent
-                    noise_part = x[0:1].to(device=device, dtype=cn_data["dtype"])
+                    # 用 x_orig_for_noise（patch 之前的原始输入）的初始噪声拼接 render_latent
+                    noise_part = x_orig_for_noise[0:1].to(device=device, dtype=cn_data["dtype"])
                     # 始终只取前 16 通道
                     noise_part = noise_part[:, :16]
                     # 补零到 20 通道
@@ -532,7 +566,7 @@ class WanUni3CApply:
                     traceback.print_exc()
                     uni3c_controlnet_states = None
             
-            # ===== Block 循环 + 注入（与 KJ 完全一致，异步预取 CPU→GPU） =====
+            # ===== Block 循环 + 注入（共用，异步预取 CPU→GPU） =====
             # 预取第一块控制信号（与第一个 block 计算重叠）
             cs_prefetched = None
             if uni3c_controlnet_states is not None and len(uni3c_controlnet_states) > 0:
@@ -548,7 +582,7 @@ class WanUni3CApply:
                 
                 x_p = block(x_p, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
                 
-                # 注入 control_states（block 后，face_adapter 前，与 KJ 完全相同）
+                # 注入 control_states（block 后，face_adapter 前）
                 if cs is not None:
                     cs_dim = cs.shape[-1]
                     x_dim = x_p.shape[-1]
@@ -558,17 +592,35 @@ class WanUni3CApply:
                         else:
                             pad_cs = torch.zeros(*cs.shape[:-1], x_dim - cs_dim, device=cs.device, dtype=cs.dtype)
                             cs = torch.cat([cs, pad_cs], dim=-1)
-                    x_p[:, :original_seq_len] += cs[:, :original_seq_len] * cn_data["strength"]
+                    if is_scail:
+                        # SCAIL 路径：cs 只有 video token，需跳过 ref tokens
+                        # cs.shape[1] = video token 数
+                        # original_seq_len = ref token 数 + video token 数
+                        ref_token_len = original_seq_len - cs.shape[1]
+                        x_p[:, ref_token_len:original_seq_len] += cs * cn_data["strength"]
+                    else:
+                        # WanAnimate 路径：原逻辑不变
+                        x_p[:, :original_seq_len] += cs[:, :original_seq_len] * cn_data["strength"]
                 
-                # face_adapter
-                if i % 5 == 0 and motion_vec is not None:
+                # face_adapter（仅 WanAnimate）
+                if not is_scail and i % 5 == 0 and motion_vec is not None:
                     x_p = x_p + self_model.face_adapter.fuser_blocks[i // 5](x_p, motion_vec)
             
             # head
             x_p = self_model.head(x_p, e)
-            if full_ref is not None:
-                x_p = x_p[:, full_ref.shape[1]:]
-            x_p = self_model.unpatchify(x_p, grid_sizes)
+            
+            # 后处理（按模型类型分流）
+            if is_scail:
+                if scail_pose_seq_len > 0:
+                    x_p = x_p[:, :-scail_pose_seq_len]
+                x_p = self_model.unpatchify(x_p, grid_sizes)
+                if kwargs.get("reference_latent") is not None:
+                    x_p = x_p[:, :, kwargs["reference_latent"].shape[2]:]
+            else:
+                if full_ref is not None:
+                    x_p = x_p[:, full_ref.shape[1]:]
+                x_p = self_model.unpatchify(x_p, grid_sizes)
+            
             return x_p
         
         # 绑定补丁函数到实例方法

@@ -1,5 +1,5 @@
 """
-AutoColorDriftCorrection V4.0 - 接缝对齐 + 段内趋势线性补偿
+AutoColorDriftCorrection V4.1 - 接缝对齐 + 段内趋势线性补偿
 
 核心策略：
 1. 接缝对齐（seam_strength）：修正段间跳变 —— 基础校正
@@ -13,6 +13,13 @@ V4.0 改进（基于真实数据实测验证）：
 - 接缝淡入帧数自适应（fade_frames = min(overlap_count, 5)），大重叠更平滑
 - standard 模式下也可使用斜率线性补偿（不再依赖预设模板）
 - 简化参数，移除 bump_learning_rate，合并为 drift_trend_strength
+
+V4.1 修复：
+- 修复 auto 模式跳变检测：有 prev_frames 时改在接缝处对比（overlap_frames[-1] vs new_frames[0]），
+  不再用多帧平均稀释跳变值（prev_frames[-5] vs overlap_frames 是相同内容，diff≈0）
+- 修复接缝对齐计算：同样改为接缝处对比（overlap_frames[-fade_frames:] vs new_frames[:fade_frames]）
+- 修复有 prev_frames 时 seam_strength 参数被忽略的问题
+- 调高 max_offset 默认值 0.01→0.02，上限 0.02→0.05
 """
 
 import torch
@@ -74,8 +81,8 @@ class AutoColorDriftCorrection:
                     "tooltip": "段内趋势校正强度。基于检测到的RGB漂移斜率做线性反向补偿。0=禁用。"
                 }),
                 "max_offset": ("FLOAT", {
-                    "default": 0.01, "min": 0.001, "max": 0.02, "step": 0.001,
-                    "tooltip": "最大单通道偏移钳制值。0.01≈2.6像素值。"
+                    "default": 0.02, "min": 0.001, "max": 0.05, "step": 0.001,
+                    "tooltip": "最大单通道偏移钳制值。0.02≈5.1像素值。"
                 }),
             }
         }
@@ -84,14 +91,14 @@ class AutoColorDriftCorrection:
     RETURN_NAMES = ("corrected_images", "drift_info")
     FUNCTION = "correct"
     CATEGORY = "CustomNodes/Video"
-    DESCRIPTION = "V4.0: 接缝对齐 + 段内趋势自适应线性补偿。基于真实数据优化，完全自适应。不需跨段学习。"
+    DESCRIPTION = "V4.1: 接缝对齐 + 段内趋势自适应线性补偿。修复 auto 模式跳变检测帧索引问题。"
 
     def correct(self, images, mode="standard", overlap_count=5,
                 prev_frames=None, seam_strength=0.0, drift_trend_strength=0.0,
-                max_offset=0.01):
+                max_offset=0.02):
         info_lines = []
         B, H, W, C = images.shape
-        info_lines.append(f"V4.0 输入帧数: {B}, 重叠帧数: {overlap_count}, 模式: {mode}")
+        info_lines.append(f"V4.1 输入帧数: {B}, 重叠帧数: {overlap_count}, 模式: {mode}")
 
         # ========== off 模式：完全旁路 ==========
         if mode == "off":
@@ -114,6 +121,8 @@ class AutoColorDriftCorrection:
         new_frames = images[overlap_count:]  # (N, H, W, 3)
         overlap_frames = images[:overlap_count]  # (overlap, H, W, 3)
         N = new_frames.shape[0]
+        # 自适应淡入帧数：重叠数越大，淡入越平滑
+        fade_frames = min(overlap_count, 5)
 
         # ========== 检测段内漂移斜率（线性回归） ==========
         # 计算新帧序列的 RGB 均值趋势
@@ -124,26 +133,18 @@ class AutoColorDriftCorrection:
 
         # ========== auto 模式：自动决策 ==========
         if mode == "auto":
-            # --- 1. 段间/段内跳变检测 ---
-            if prev_frames is not None and prev_frames.shape[0] >= overlap_count:
-                prev_slice = prev_frames[-overlap_count:]
-                curr_slice = new_frames[:overlap_count]
-                ref_mean = prev_slice.mean(dim=(0, 1, 2))
-                curr_mean = curr_slice.mean(dim=(0, 1, 2))
-                jump_vec = curr_mean - ref_mean
-                info_lines.append("段间跳变检测: prev_frames尾{}帧 vs 当前段前{}帧".format(overlap_count, overlap_count))
-                info_lines.append(f"  prev均值: R={ref_mean[0]:.4f} G={ref_mean[1]:.4f} B={ref_mean[2]:.4f}")
-                info_lines.append(f"  当前均值: R={curr_mean[0]:.4f} G={curr_mean[1]:.4f} B={curr_mean[2]:.4f}")
-            else:
-                # 无 prev_frames 时，用段内自有重叠帧检测
-                last_overlap = overlap_frames[-1:]   # 重叠区域最后一帧
-                first_new = new_frames[:1]           # 新帧第一帧
-                ref_mean = last_overlap.mean(dim=(0, 1, 2))
-                curr_mean = first_new.mean(dim=(0, 1, 2))
-                jump_vec = curr_mean - ref_mean
-                info_lines.append("段内跳变检测(无prev_frames): 重叠末帧 vs 新帧首帧")
-                info_lines.append(f"  重叠末帧均值: R={ref_mean[0]:.4f} G={ref_mean[1]:.4f} B={ref_mean[2]:.4f}")
-                info_lines.append(f"  新帧首帧均值: R={curr_mean[0]:.4f} G={curr_mean[1]:.4f} B={curr_mean[2]:.4f}")
+            # --- 1. 段间跳变检测（接缝处精确检测） ---
+            # V4.1: 统一在接缝处检测，不依赖多帧平均也不依赖 prev_frames 配对
+            # 数据布局：overlap_frames 是图像帧拷贝 = prev_frames[-overlap_count:]
+            # 跳变位置在 overlap_frames[-1] → new_frames[0] 之间
+            last_overlap = overlap_frames[-1:]   # 重叠区域最后一帧
+            first_new = new_frames[:1]           # 新帧第一帧
+            ref_mean = last_overlap.mean(dim=(0, 1, 2))
+            curr_mean = first_new.mean(dim=(0, 1, 2))
+            jump_vec = curr_mean - ref_mean
+            info_lines.append("段间跳变检测(接缝处): 重叠末帧 vs 新帧首帧")
+            info_lines.append(f"  重叠末帧均值: R={ref_mean[0]:.4f} G={ref_mean[1]:.4f} B={ref_mean[2]:.4f}")
+            info_lines.append(f"  新帧首帧均值: R={curr_mean[0]:.4f} G={curr_mean[1]:.4f} B={curr_mean[2]:.4f}")
 
             local_jump = max(abs(float(jump_vec[i])) for i in range(3))
             info_lines.append(f"  跳变量: R={float(jump_vec[0]):+.6f} G={float(jump_vec[1]):+.6f} B={float(jump_vec[2]):+.6f} max={local_jump:.6f}")
@@ -162,9 +163,6 @@ class AutoColorDriftCorrection:
                 info_lines.append(f"auto: 无显著跳变, seam_strength=0（跳过接缝对齐）")
 
             # --- 2. 段内趋势强度：基于斜率自动决策 ---
-            # 斜率 0.00001（极弱）→ 0.0
-            # 斜率 0.00005（中等）→ 0.3
-            # 斜率 0.00020（明显）→ 0.8
             if max_slope > 0.00003:
                 auto_trend = min(0.8, max(0.2, max_slope * 4000))
                 drift_trend_strength = auto_trend
@@ -177,20 +175,20 @@ class AutoColorDriftCorrection:
         has_prev = prev_frames is not None
         base_offset = torch.zeros(3, device=images.device)
         ref_type = "none"
-        # 自适应淡入帧数：重叠数越大，淡入越平滑
-        fade_frames = min(overlap_count, 5)
 
         if has_prev:
             if prev_frames.shape[0] >= overlap_count:
-                prev_slice = prev_frames[-overlap_count:]
-                curr_slice = new_frames[:overlap_count]
-                prev_mean = prev_slice.mean(dim=(0, 1, 2))
-                curr_mean = curr_slice.mean(dim=(0, 1, 2))
+                # V4.1: 接缝对齐在接缝处精确计算
+                # 用 fade_frames 帧做小范围均值，比单帧更抗噪，又不会像 overlap_count 帧那样稀释跳变
+                prev_tail = overlap_frames[-fade_frames:]
+                curr_head = new_frames[:fade_frames]
+                prev_mean = prev_tail.mean(dim=(0, 1, 2))
+                curr_mean = curr_head.mean(dim=(0, 1, 2))
                 base_offset = curr_mean - prev_mean
                 ref_type = "prev_frame"
-                info_lines.append(f"基准: prev_frames (上一段尾{overlap_count}帧 vs 当前段前{overlap_count}帧)")
-                info_lines.append(f"prev均值: R={prev_mean[0]:.4f} G={prev_mean[1]:.4f} B={prev_mean[2]:.4f}")
-                info_lines.append(f"当前均值: R={curr_mean[0]:.4f} G={curr_mean[1]:.4f} B={curr_mean[2]:.4f}")
+                info_lines.append(f"基准: prev_frames (重叠尾{fade_frames}帧 vs 新帧头{fade_frames}帧)")
+                info_lines.append(f"重叠尾均值: R={prev_mean[0]:.4f} G={prev_mean[1]:.4f} B={prev_mean[2]:.4f}")
+                info_lines.append(f"新帧头均值: R={curr_mean[0]:.4f} G={curr_mean[1]:.4f} B={curr_mean[2]:.4f}")
                 info_lines.append(f"段间偏移: R={base_offset[0]:+.6f} G={base_offset[1]:+.6f} B={base_offset[2]:+.6f}")
             else:
                 info_lines.append(f"prev_frames不足({prev_frames.shape[0]}<{overlap_count})，跳过")
@@ -217,10 +215,8 @@ class AutoColorDriftCorrection:
         if ref_type != "none":
             # 分通道独立钳制
             base_clamped = torch.clamp(base_offset, -max_offset, max_offset)
-            if has_prev:
-                base_applied = base_clamped
-            else:
-                base_applied = base_clamped * seam_strength
+            # V4.1 FIX: 统一乘以 seam_strength，不再区分 has_prev 分支
+            base_applied = base_clamped * seam_strength
             info_lines.append(f"钳制后偏移(max_offset={max_offset}): R={base_applied[0]:+.6f} G={base_applied[1]:+.6f} B={base_applied[2]:+.6f}")
         else:
             base_applied = torch.zeros(3, device=images.device)
@@ -288,5 +284,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AutoColorDriftCorrection": "Auto Color Drift Correction V4.0 (自适应)",
+    "AutoColorDriftCorrection": "Auto Color Drift Correction V4.1 (自适应)",
 }
