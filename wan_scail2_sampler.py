@@ -36,7 +36,7 @@ class WanSCAIL2PhaseSampler:
     1. 将 previous_frames 尾部 previous_frame_count 帧 VAE 编码，写入 latent 前段作锚定
     2. 创建 noise_mask：锚定区=phase1_noise，其余=1
     3. Phase 1：正常噪声 + noise_mask → 采样到 split_step
-    4. 回写：重新 VAE 编码 previous_frames → 强制覆盖 latent 锚定区
+    4. 回写：用原始锚定帧 latent 强制覆盖 Phase 1 输出中的锚定区
     5. 更新 noise_mask：锚定区=phase2_noise，其余=1
     6. Phase 2：空噪声 + noise_mask → 采样到结束
     7. 输出 latent + 第二阶段 noise_mask
@@ -61,9 +61,9 @@ class WanSCAIL2PhaseSampler:
                 "denoise": ("FLOAT", {"default": 1.00, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "split_step": ("INT", {"default": 2, "min": 0, "max": 10000, "step": 1,
                     "tooltip": "分割步数。0=单阶段；>0且<steps且接入了previous_frames时启用两阶段。"}),
-                "phase1_noise": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.001,
+                "phase1_noise": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001,
                     "tooltip": "Phase 1 锚定帧 noise_mask 值。0=冻结，1=自由。"}),
-                "phase2_noise": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.001,
+                "phase2_noise": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.001,
                     "tooltip": "Phase 2 锚定帧 noise_mask 值。0=冻结，1=自由。"}),
                 "previous_frame_count": ("INT", {"default": 5, "min": 1, "max": 4096, "step": 4,
                     "tooltip": "从 previous_frames 尾部取多少帧作为锚定。"}),
@@ -147,7 +147,7 @@ class WanSCAIL2PhaseSampler:
             del s1, mask1, high_sigmas
             torch.cuda.empty_cache()
 
-            # --- 锚定帧回写（重新 VAE 编码，强制覆盖）---
+            # --- 锚定帧回写（用原始锚定帧 latent 强制覆盖 Phase 1 输出中的锚定区）---
             samples_out = samples_out.clone()
             samples_out[:, :, :prev_latent_frames] = encoded_prev[:, :, :prev_latent_frames].to(
                 device=samples_out.device, dtype=samples_out.dtype)
