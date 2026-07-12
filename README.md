@@ -2,7 +2,7 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
-当前版本：**1.6.0** — 新增批量图像替换节点、色彩校正 V4.1 修复、SCAIL 模型 Uni3C 运镜支持、工作流路径管理优化。
+当前版本：**1.7.0** — 新增独立两阶段采样节点 (WanSCAIL2PhaseSampler)、IntegerSettingNode 前端重构与对齐优化、SCAIL-2 工作流全面重写、色彩校正 V4.1 修复与增强。
 
 ## 目录
 
@@ -82,6 +82,7 @@ pip install -r requirements.txt
 | **Wan SCAIL To Video (Multi Ref)** | `model/conditioning/video_models` | SCAIL/SCAIL-2 多参考图视频生成 conditioning 节点。支持多张参考图自动编码、SCAIL-2 多身份 colored mask 注入、pose 视频引导、运动接续（prev_latent）等 |
 | **Create SCAIL-2 Colored Mask (Multi Ref)** | `conditioning/video_models/scail` | 渲染 SAM3 追踪数据为 SCAIL-2 使用的 colored mask。支持参考图和驱动视频的共享调色板排序（left_to_right/area），确保多人物场景下同一身份颜色一致 |
 | **Wan SCAIL Sparse Attention** | `conditioning/video_models/scail` | SCAIL 稀疏注意力节点，通过注意力掩码限制 pose/ref/main token 之间的交互，减少长视频生成中的退化现象。支持多种注意力掩码策略 |
+| **Wan SCAIL-2 Phase Sampler** | `sampling` | 独立两阶段采样节点。完整复刻 SCAIL2LoopSampler 的两阶段采样核心逻辑。用像素帧（IMAGE）作为锚定输入，内部完成 VAE 编码、锚定帧回写、noise_mask 管理 |
 | **CLIP Vision Multi-Ref Switch** | `conditioning/video_models/scail` | 多参考图 CLIP 特征合并节点。将批次中 N 张图的 CLIP Vision 特征拼接到 token 维度，使所有参考图都参与 conditioning |
 | **Auto Color Drift Correction V4.1** | `CustomNodes/Video` | 自对齐色彩漂移校正节点 V4.1。三层校正：① 段内漂移检测（auto模式自动识别跳变，无漂移则旁路输出）；② 接缝对齐消除段间跳变；③ 段内趋势线性补偿。V4.1 修复 auto 模式跳变检测帧索引、接缝对齐计算、seam_strength 参数忽略等问题 |
 
@@ -131,6 +132,7 @@ pip install -r requirements.txt
 | **Folder Image Loader** | `image` | 从文件夹按文件名升序载入图片批次，支持跳过、数量限制与尺寸同步 |
 | **Image Batch Concat** | `image` | 将两个图像批次拼接，任意一路无输入时透传另一路 |
 | **Image Batch Resize** | `image` | 缩放图像批次到指定宽高，可选按方向裁剪保持宽高比 |
+| **Batch Image Replace** | `image` | 批量图像替换节点。在图像批次中按起始索引和数量替换指定位置的图像。支持溢出模式（循环重置/截断/扩展）和下溢模式，替换源可选连接 |
 | **MaskCompositeRef** | `image` | 遮罩批次合成节点 — 用于 WanSCAILToVideo 的 reference_image 预处理。支持替换模式和动作迁移模式，自动剔除全黑遮罩帧、背景合成 |
 
 ### 上下文工具
@@ -1039,6 +1041,7 @@ SCAIL-2 专用的上下文窗口节点，与通用的 `Custom Context Windows (M
 - ComfyUI-BodyRatioMapper — 骨骼比例对齐
 - comfyui-videohelpersuite — 视频工具
 - comfyui-custom-scripts — 实用节点
+- ComfyUI-Scail2-Sampler-Helper ([checknickname](https://github.com/checknickname)) — SCAIL-2 两阶段采样采样器；借此致谢
 
 同时，本项目中的 WanAnimate 多参考图视频生成逻辑、偏航角估计算法、上下文窗口调度策略、骨骼绘制引擎、SCAIL/SCAIL-2 多参考图支持等核心逻辑均为自主实现。
 

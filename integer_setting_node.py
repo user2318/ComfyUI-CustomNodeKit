@@ -2,12 +2,13 @@ import math
 
 
 class IntegerSettingNode:
-    """自定义整数设置节点
+    """自定义整数设置节点（单行版）
     
     功能：
     - 设置起始值 start 和步进值 step
     - 输入数值自动对齐到 start + step*n
     - 支持负整数
+    - 单行布局：Start、Step、Value 水平排列
     """
 
     @classmethod
@@ -53,20 +54,11 @@ class IntegerSettingNode:
         return (aligned,)
 
     def _align_to_step(self, start, step, value):
-        """将数值对齐到最接近的 start + step*n
-        
-        对齐规则：
-        1. 计算 value 在等差数列 start + step*n 中的两个最近候选值
-        2. 选择距离更近的候选值
-        3. 如果距离相等，选择更接近 start 的值
-        """
+        """将数值对齐到最接近的 start + step*n"""
         if step <= 0:
             return start
 
-        # 计算 n = (value - start) / step
         n = (value - start) / step
-
-        # 取 floor 和 ceil
         n_floor = int(math.floor(n))
         n_ceil = n_floor + 1
 
@@ -81,14 +73,12 @@ class IntegerSettingNode:
         elif diff_ceil < diff_floor:
             return val_ceil
         else:
-            # 距离相等时，选择更接近 start 的值
             if abs(val_floor - start) <= abs(val_ceil - start):
                 return val_floor
             else:
                 return val_ceil
 
 
-# 节点注册
 NODE_CLASS_MAPPINGS = {
     "IntegerSettingNode": IntegerSettingNode,
 }

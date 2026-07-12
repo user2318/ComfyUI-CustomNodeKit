@@ -1,56 +1,31 @@
 """
-AutoColorDriftCorrection V4.1 - 接缝对齐 + 段内趋势线性补偿
+AutoColorDriftCorrection V4.3 - 两遍校正：全局偏移 + 残余增量微调
 
 核心策略：
-1. 接缝对齐（seam_strength）：修正段间跳变 —— 基础校正
-2. 段内趋势校正（drift_trend_strength）：基于当前帧序列RGB斜率做线性反向补偿
-3. 完全自适应，不依赖任何预设模板或跨段学习
+1. 第一遍（全局偏移）：多帧均值检测跳变，统一校正所有新帧，消除跳变主体
+2. 第二遍（残余微调）：增量逐帧跟踪残余漂移，小钳制上限防噪声
+3. 不再需要 EMA 平滑（全局偏移已很准，残余量极小）
 
-V4.0 改进（基于真实数据实测验证）：
-- 移除固定隆起模板（_BUMP_PARAMS），该模板基于特定参考图标定，不通用
-- 移除自适应学习（bump_learning_rate），换参考图后学习结果不再适用
-- auto 模式新增分通道独立处理：R通道漂移方向固定（↓），G/B随参考图变化
-- 接缝淡入帧数自适应（fade_frames = min(overlap_count, 5)），大重叠更平滑
-- standard 模式下也可使用斜率线性补偿（不再依赖预设模板）
-- 简化参数，移除 bump_learning_rate，合并为 drift_trend_strength
+V4.3 变更：
+- 两遍校正替代纯增量递推：先全局对齐，再小幅度微调
+- 移除 EMA：全局偏移足够准，残余微调幅度极小，无需平滑
+- auto 模式：多帧检测的 jump_vec 直接作为第一遍偏移向量
+- 新增 residual_max_offset 参数控制第二遍钳制（默认 max_offset×0.2）
 
-V4.1 修复：
-- 修复 auto 模式跳变检测：有 prev_frames 时改在接缝处对比（overlap_frames[-1] vs new_frames[0]），
-  不再用多帧平均稀释跳变值（prev_frames[-5] vs overlap_frames 是相同内容，diff≈0）
-- 修复接缝对齐计算：同样改为接缝处对比（overlap_frames[-fade_frames:] vs new_frames[:fade_frames]）
-- 修复有 prev_frames 时 seam_strength 参数被忽略的问题
-- 调高 max_offset 默认值 0.01→0.02，上限 0.02→0.05
+V4.2 变更：
+- 移除淡入（fade-in）：重叠帧不动，新帧第一帧直接全量对齐
+- 新增增量逐帧校正（被 V4.3 的两遍方案替代）
 """
 
 import torch
 import json
 
 
-def _detect_drift_slope(frame_means):
-    """
-    检测帧序列的漂移斜率（线性回归）。
-    frame_means: (N, 3) tensor, 每帧的RGB均值
-    返回: (slope_r, slope_g, slope_b), 每帧的平均变化量
-    """
-    N = frame_means.shape[0]
-    if N < 3:
-        return (0.0, 0.0, 0.0)
-    x = torch.arange(N, dtype=torch.float32, device=frame_means.device)
-    x_mean = x.mean()
-    y_mean = frame_means.mean(dim=0)
-    numerator = ((x - x_mean).unsqueeze(1) * (frame_means - y_mean.unsqueeze(0))).sum(dim=0)
-    denominator = ((x - x_mean) ** 2).sum()
-    if denominator < 1e-8:
-        return (0.0, 0.0, 0.0)
-    slopes = numerator / denominator
-    return (float(slopes[0]), float(slopes[1]), float(slopes[2]))
-
-
 class AutoColorDriftCorrection:
     OUTPUT_NODE = False
 
     def __init__(self):
-        pass  # V4.0: 无实例级状态，完全无状态节点
+        pass
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -74,15 +49,15 @@ class AutoColorDriftCorrection:
                 }),
                 "seam_strength": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "接缝对齐强度（基础校正）。0=禁用。auto模式下基于跳变幅度自动决策。"
-                }),
-                "drift_trend_strength": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "段内趋势校正强度。基于检测到的RGB漂移斜率做线性反向补偿。0=禁用。"
+                    "tooltip": "第一遍全局偏移强度。0=禁用第一遍。auto模式下自动决策。"
                 }),
                 "max_offset": ("FLOAT", {
                     "default": 0.02, "min": 0.001, "max": 0.05, "step": 0.001,
-                    "tooltip": "最大单通道偏移钳制值。0.02≈5.1像素值。"
+                    "tooltip": "第一遍最大单通道偏移钳制值。0.02≈5.1像素值。"
+                }),
+                "residual_strength": ("FLOAT", {
+                    "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "第二遍残余微调强度（相对max_offset的比例）。0=禁用第二遍。"
                 }),
             }
         }
@@ -91,23 +66,19 @@ class AutoColorDriftCorrection:
     RETURN_NAMES = ("corrected_images", "drift_info")
     FUNCTION = "correct"
     CATEGORY = "CustomNodes/Video"
-    DESCRIPTION = "V4.1: 接缝对齐 + 段内趋势自适应线性补偿。修复 auto 模式跳变检测帧索引问题。"
+    DESCRIPTION = "V4.3: 全局偏移 + 残余增量微调。两遍校正消除跳变。"
 
     def correct(self, images, mode="standard", overlap_count=5,
-                prev_frames=None, seam_strength=0.0, drift_trend_strength=0.0,
-                max_offset=0.02):
+                prev_frames=None, seam_strength=0.0, max_offset=0.02,
+                residual_strength=0.2):
         info_lines = []
         B, H, W, C = images.shape
-        info_lines.append(f"V4.1 输入帧数: {B}, 重叠帧数: {overlap_count}, 模式: {mode}")
+        info_lines.append(f"V4.3 输入帧数: {B}, 重叠帧数: {overlap_count}, 模式: {mode}")
 
         # ========== off 模式：完全旁路 ==========
         if mode == "off":
             info_lines.append("模式: off，跳过所有处理")
-            drift_data = {
-                "mode": "off",
-                "v4_mode": "bypass",
-                "frames_total": B,
-            }
+            drift_data = {"mode": "off", "v4_mode": "bypass", "frames_total": B}
             info = "\n".join(info_lines) + f"\n\n{json.dumps(drift_data, indent=2)}"
             return (images, info)
 
@@ -118,162 +89,134 @@ class AutoColorDriftCorrection:
             info_lines.append(f"警告: 帧数({B}) <= 重叠帧数({overlap_count})，无新生成帧")
             return (images, "\n".join(info_lines))
 
-        new_frames = images[overlap_count:]  # (N, H, W, 3)
-        overlap_frames = images[:overlap_count]  # (overlap, H, W, 3)
+        result = images.clone()
+
+        # ========== Pass 0: prev_frames 对齐（整段偏移） ==========
+        # 当接入 prev_frames 时，将整段 73 帧对齐到上一段真实输出
+        if prev_frames is not None and prev_frames.shape[0] >= overlap_count:
+            ref_prev = prev_frames[-overlap_count:].mean(dim=(0, 1, 2))
+            cur_overlap = result[:overlap_count].mean(dim=(0, 1, 2))
+            pass0_offset = ref_prev - cur_overlap
+            pass0_clamped = torch.clamp(pass0_offset, -max_offset, max_offset)
+            result += pass0_clamped.view(1, 1, 3)
+            info_lines.append(f"Pass0(prev对齐): 偏移=[{float(pass0_clamped[0]):+.6f},{float(pass0_clamped[1]):+.6f},{float(pass0_clamped[2]):+.6f}] 基准来自 prev_frames[-{overlap_count}:]")
+
+        new_frames = result[overlap_count:]          # (N, H, W, 3)
+        overlap_frames = result[:overlap_count]      # (overlap, H, W, 3)
         N = new_frames.shape[0]
-        # 自适应淡入帧数：重叠数越大，淡入越平滑
-        fade_frames = min(overlap_count, 5)
+        fade_frames = min(overlap_count, 5)          # 多帧均值抗噪
 
-        # ========== 检测段内漂移斜率（线性回归） ==========
-        # 计算新帧序列的 RGB 均值趋势
-        new_means = new_frames.mean(dim=(1, 2))  # (N, 3)
-        slopes = _detect_drift_slope(new_means)
-        max_slope = max(abs(s) for s in slopes)
-        info_lines.append(f"段内漂移斜率: R={slopes[0]:+.8f}/帧 G={slopes[1]:+.8f}/帧 B={slopes[2]:+.8f}/帧 max_abs={max_slope:.8f}")
+        corrected_new = result[overlap_count:]       # 视图
 
-        # ========== auto 模式：自动决策 ==========
+        # ========== 第一遍：检测全局偏移 ==========
+        base_offset = torch.zeros(3, device=images.device)
+        ref_type = "none"
+
         if mode == "auto":
-            # --- 1. 段间跳变检测（接缝处精确检测） ---
-            # V4.1: 统一在接缝处检测，不依赖多帧平均也不依赖 prev_frames 配对
-            # 数据布局：overlap_frames 是图像帧拷贝 = prev_frames[-overlap_count:]
-            # 跳变位置在 overlap_frames[-1] → new_frames[0] 之间
-            last_overlap = overlap_frames[-1:]   # 重叠区域最后一帧
-            first_new = new_frames[:1]           # 新帧第一帧
+            # auto 模式：多帧均值检测
+            last_overlap = overlap_frames[-fade_frames:]
+            first_new = new_frames[:fade_frames]
             ref_mean = last_overlap.mean(dim=(0, 1, 2))
             curr_mean = first_new.mean(dim=(0, 1, 2))
             jump_vec = curr_mean - ref_mean
-            info_lines.append("段间跳变检测(接缝处): 重叠末帧 vs 新帧首帧")
-            info_lines.append(f"  重叠末帧均值: R={ref_mean[0]:.4f} G={ref_mean[1]:.4f} B={ref_mean[2]:.4f}")
-            info_lines.append(f"  新帧首帧均值: R={curr_mean[0]:.4f} G={curr_mean[1]:.4f} B={curr_mean[2]:.4f}")
-
             local_jump = max(abs(float(jump_vec[i])) for i in range(3))
+
+            info_lines.append("第一遍(全局): auto多帧均值检测 (各{}帧)".format(fade_frames))
+            info_lines.append(f"  重叠尾均值: R={ref_mean[0]:.4f} G={ref_mean[1]:.4f} B={ref_mean[2]:.4f}")
+            info_lines.append(f"  新帧头均值: R={curr_mean[0]:.4f} G={curr_mean[1]:.4f} B={curr_mean[2]:.4f}")
             info_lines.append(f"  跳变量: R={float(jump_vec[0]):+.6f} G={float(jump_vec[1]):+.6f} B={float(jump_vec[2]):+.6f} max={local_jump:.6f}")
 
             jump_threshold = 0.0005
             has_jump = (local_jump > jump_threshold)
             info_lines.append(f"跳变判定: {'有跳变' if has_jump else '无跳变'} (阈值={jump_threshold})")
 
-            # 自动接缝强度：有跳变时按幅度折算
             if has_jump:
-                auto_seam = min(1.0, max(0.3, local_jump * 200))
-                seam_strength = auto_seam
-                info_lines.append(f"auto: 跳变={local_jump:.6f}, 自动接缝强度={seam_strength:.2f}")
+                base_offset = jump_vec  # 直接使用多帧检测的偏移向量
+                ref_type = "auto_seam"
+                info_lines.append(f"auto: 直接使用检测偏移向量作为全局校正")
             else:
                 seam_strength = 0.0
-                info_lines.append(f"auto: 无显著跳变, seam_strength=0（跳过接缝对齐）")
+                info_lines.append(f"auto: 无显著跳变, 跳过第一遍")
 
-            # --- 2. 段内趋势强度：基于斜率自动决策 ---
-            if max_slope > 0.00003:
-                auto_trend = min(0.8, max(0.2, max_slope * 4000))
-                drift_trend_strength = auto_trend
-                info_lines.append(f"auto: 段内漂移明显({max_slope:.6f}), 自动趋势校正强度={drift_trend_strength:.2f}")
-            else:
-                drift_trend_strength = 0.0
-                info_lines.append(f"auto: 段内漂移微弱({max_slope:.6f}), 趋势校正=0")
+        else:  # standard 模式
+            if seam_strength > 0:
+                # 多帧均值检测偏移
+                last_overlap = overlap_frames[-fade_frames:]
+                first_new = new_frames[:fade_frames]
+                ref_mean = last_overlap.mean(dim=(0, 1, 2))
+                curr_mean = first_new.mean(dim=(0, 1, 2))
+                base_offset = curr_mean - ref_mean
+                ref_type = "seam_align"
+                info_lines.append("第一遍(全局): standard多帧均值检测 (各{}帧)".format(fade_frames))
+                info_lines.append(f"  重叠尾均值: R={ref_mean[0]:.4f} G={ref_mean[1]:.4f} B={ref_mean[2]:.4f}")
+                info_lines.append(f"  新帧头均值: R={curr_mean[0]:.4f} G={curr_mean[1]:.4f} B={curr_mean[2]:.4f}")
+                info_lines.append(f"  段间偏移: R={float(base_offset[0]):+.6f} G={float(base_offset[1]):+.6f} B={float(base_offset[2]):+.6f}")
 
-        # ========== 1. 接缝对齐计算 ==========
-        has_prev = prev_frames is not None
-        base_offset = torch.zeros(3, device=images.device)
-        ref_type = "none"
-
-        if has_prev:
-            if prev_frames.shape[0] >= overlap_count:
-                # V4.1: 接缝对齐在接缝处精确计算
-                # 用 fade_frames 帧做小范围均值，比单帧更抗噪，又不会像 overlap_count 帧那样稀释跳变
-                prev_tail = overlap_frames[-fade_frames:]
-                curr_head = new_frames[:fade_frames]
-                prev_mean = prev_tail.mean(dim=(0, 1, 2))
-                curr_mean = curr_head.mean(dim=(0, 1, 2))
-                base_offset = curr_mean - prev_mean
-                ref_type = "prev_frame"
-                info_lines.append(f"基准: prev_frames (重叠尾{fade_frames}帧 vs 新帧头{fade_frames}帧)")
-                info_lines.append(f"重叠尾均值: R={prev_mean[0]:.4f} G={prev_mean[1]:.4f} B={prev_mean[2]:.4f}")
-                info_lines.append(f"新帧头均值: R={curr_mean[0]:.4f} G={curr_mean[1]:.4f} B={curr_mean[2]:.4f}")
-                info_lines.append(f"段间偏移: R={base_offset[0]:+.6f} G={base_offset[1]:+.6f} B={base_offset[2]:+.6f}")
-            else:
-                info_lines.append(f"prev_frames不足({prev_frames.shape[0]}<{overlap_count})，跳过")
-
-        elif seam_strength > 0:
-            last_overlap = overlap_frames[-1:]
-            first_new = new_frames[:1]
-            last_mean = last_overlap.mean(dim=(0, 1, 2))
-            first_mean = first_new.mean(dim=(0, 1, 2))
-            base_offset = first_mean - last_mean
-            ref_type = "seam_align"
-            info_lines.append("基准: 接缝对齐 (重叠末帧 vs 新帧首帧)")
-            info_lines.append(f"重叠末帧均值: R={last_mean[0]:.4f} G={last_mean[1]:.4f} B={last_mean[2]:.4f}")
-            info_lines.append(f"新帧首帧均值: R={first_mean[0]:.4f} G={first_mean[1]:.4f} B={first_mean[2]:.4f}")
-            info_lines.append(f"接缝偏移: R={base_offset[0]:+.6f} G={base_offset[1]:+.6f} B={base_offset[2]:+.6f}")
-
-        trend_enabled = (drift_trend_strength > 0)
-
-        if ref_type == "none" and not trend_enabled:
-            info_lines.append("基准: 无对齐 (输出原始帧)")
-            return (images, "\n".join(info_lines))
-
-        # ========== 2. 钳制接缝偏移 ==========
-        if ref_type != "none":
-            # 分通道独立钳制
-            base_clamped = torch.clamp(base_offset, -max_offset, max_offset)
-            # V4.1 FIX: 统一乘以 seam_strength，不再区分 has_prev 分支
-            base_applied = base_clamped * seam_strength
-            info_lines.append(f"钳制后偏移(max_offset={max_offset}): R={base_applied[0]:+.6f} G={base_applied[1]:+.6f} B={base_applied[2]:+.6f}")
+        # ========== 应用第一遍：全局偏移 ==========
+        if ref_type != "none" and base_offset.abs().sum() > 1e-8:
+            # 分通道钳制
+            max_global = max_offset * (seam_strength if mode != "auto" else 1.0)
+            base_clamped = torch.clamp(base_offset, -max_global, max_global)
+            # 全部新帧统一减去 base_clamped
+            corrected_new -= base_clamped.view(1, 1, 3)
+            info_lines.append(f"  全局偏移施加: R={float(base_clamped[0]):+.6f} G={float(base_clamped[1]):+.6f} B={float(base_clamped[2]):+.6f} (max={max_global:.4f})")
         else:
-            base_applied = torch.zeros(3, device=images.device)
-            fade_frames = 0
+            base_clamped = torch.zeros(3, device=images.device)
+            info_lines.append("  第一遍跳过 (无偏移)")
 
-        # ========== 3. 应用校正 ==========
-        result = images.clone()
-        frames_to_correct = result[overlap_count:]
+        # ========== 第二遍：残余偏移增补 ==========
+        # 每帧独立向基准靠拢：offset = ref_mean - cur_mean
+        # 非增量递推，每帧不依赖前一帧，无误差传递
+        if residual_strength > 0 and N >= 1:
+            residual_max = max_offset * residual_strength  # 钳制上限
+            info_lines.append(f"第二遍(偏移增补): 钳制上限={residual_max:.5f} (residual_strength={residual_strength})")
 
-        # 接缝对齐（基础校正）
-        if base_applied.abs().sum() > 1e-8:
-            if fade_frames > 0:
-                fade_weights = torch.arange(1, fade_frames + 1, device=images.device, dtype=images.dtype) / fade_frames
-                fade_weights = fade_weights.view(-1, 1, 1, 1)
-                for i in range(min(fade_frames, N)):
-                    frames_to_correct[i] -= base_applied.view(1, 1, 3) * fade_weights[i]
-                if N > fade_frames:
-                    frames_to_correct[fade_frames:] -= base_applied.view(1, 1, 3)
-                info_lines.append(f"接缝校正: 前{fade_frames}帧淡入 + {N-fade_frames}帧完整应用")
+            # 参考基准：重叠末帧均值
+            ref_mean = overlap_frames[-1].mean(dim=(0, 1))         # (3,)
 
-        # ========== 段内趋势校正（线性补偿） ==========
-        if trend_enabled:
-            # 用段内斜率生成线性补偿曲线（逐帧增长的反向补偿）
-            t = torch.arange(N, device=images.device, dtype=images.dtype).view(-1, 1)  # (N, 1)
-            slope_tensor = torch.tensor([[slopes[0]], [slopes[1]], [slopes[2]]], 
-                                        device=images.device, dtype=images.dtype).view(1, 3)  # (1, 3)
-            # 线性补偿 = t * 斜率 * 强度，方向与漂移相反
-            linear_compensation = t * slope_tensor * drift_trend_strength  # (N, 3)
+            max_residual = 0.0
+            total_residual = 0.0
+
             for i in range(N):
-                frames_to_correct[i] -= linear_compensation[i].view(1, 1, 3)
-            peak_val = max(abs(slopes[i] * N * drift_trend_strength) for i in range(3))
-            info_lines.append(f"趋势校正: 斜率=[{slopes[0]:+.8f},{slopes[1]:+.8f},{slopes[2]:+.8f}] "
-                             f"强度={drift_trend_strength:.2f} 末端补偿峰值为{peak_val:.4f}")
+                cur_mean = corrected_new[i].mean(dim=(0, 1))       # (3,)
+                # 向基准靠拢的偏移量（独立计算，不依赖前一帧）
+                residual_offset = ref_mean - cur_mean
+                residual_clamped = torch.clamp(residual_offset, -residual_max, residual_max)
+                corrected_new[i] += residual_clamped.view(1, 1, 3)
 
-        frames_to_correct = torch.clamp(frames_to_correct, 0.0, 1.0)
-        result[overlap_count:] = frames_to_correct
+                dev = float(residual_clamped.abs().max())
+                if dev > max_residual:
+                    max_residual = dev
+                total_residual += dev
 
+                if dev > 0.0003 or i < 2 or i == N - 1:
+                    info_lines.append(f"  帧{overlap_count+1+i}: offset=[{float(residual_clamped[0]):+.6f},{float(residual_clamped[1]):+.6f},{float(residual_clamped[2]):+.6f}] "
+                                     f"dev={dev:.6f}")
+
+            avg_residual = total_residual / N
+            info_lines.append(f"  偏移增补统计: 最大={max_residual:.6f}, 均值={avg_residual:.6f}")
+        else:
+            max_residual = 0.0
+            avg_residual = 0.0
+            info_lines.append("  第二遍跳过 (residual_strength=0 或 N<1)")
+
+        # ========== 钳位到有效范围 ==========
+        corrected_new.clamp_(0.0, 1.0)
         info_lines.append(f"校正帧: [{overlap_count+1}-{B}] ({N}帧)")
 
         # ========== 输出校正信息 ==========
-        trend_peak = max(abs(slopes[i] * N) for i in range(3)) if trend_enabled else 0.0
         drift_data = {
             "mode": mode,
-            "v4_mode": ref_type if ref_type != "none" else "trend_only",
-            "seam_strength": seam_strength if ref_type != "none" else 0,
-            "drift_trend_strength": drift_trend_strength if trend_enabled else 0,
+            "v4_mode": "two_pass",
+            "seam_strength": seam_strength if mode != "auto" else 1.0,
+            "max_offset": max_offset,
+            "residual_strength": residual_strength,
             "frames_corrected": N,
-            "drift_slope_rgb": [slopes[0], slopes[1], slopes[2]],
-            "drift_peak_rgb": [slopes[0] * N, slopes[1] * N, slopes[2] * N],
+            "global_offset_rgb": [float(base_clamped[i]) for i in range(3)],
+            "max_global_offset": round(float(base_clamped.abs().max()), 6),
+            "max_residual_offset": round(float(max_residual), 6),
+            "avg_residual_offset": round(float(avg_residual), 6),
         }
-        if ref_type != "none":
-            drift_data["offset_rgb"] = [float(base_offset[i]) for i in range(3)]
-        if base_applied.abs().sum() > 1e-8:
-            drift_data["offset_clamped_rgb"] = [float(base_applied[i]) for i in range(3)]
-            drift_data["fade_frames"] = fade_frames
-        if trend_peak > 0:
-            drift_data["trend_peak"] = round(trend_peak, 6)
 
         info = "\n".join(info_lines) + f"\n\n{json.dumps(drift_data, indent=2)}"
         return (result, info)
@@ -284,5 +227,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AutoColorDriftCorrection": "Auto Color Drift Correction V4.1 (自适应)",
+    "AutoColorDriftCorrection": "Auto Color Drift Correction V4.3 (两遍校正)",
 }

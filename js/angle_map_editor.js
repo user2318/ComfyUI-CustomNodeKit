@@ -353,7 +353,7 @@ app.registerExtension({
             // 计算标准高度：widget行数 * 行高 + 按钮行
             const totalHeight = widgetRows * rowHeight + buttonHeight + gap * 2;
 
-            return [this.size ? this.size[0] : 300, totalHeight];
+            return [200, totalHeight];
         };
 
         // 尝试从已连接的参考图输入获取张数

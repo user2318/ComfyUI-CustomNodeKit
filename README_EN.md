@@ -2,7 +2,7 @@
 
 A set of custom nodes for ComfyUI, covering video generation, pose processing, interactive image operations, and common workflow utilities.
 
-Current version: **1.5.9** — Rebuilt node architecture, unified node grouping logic, optimized video pose detection and color correction workflow.
+Current version: **1.7.0** — New standalone two-phase sampling node (WanSCAIL2PhaseSampler), IntegerSettingNode frontend refactoring with alignment optimization, SCAIL-2 workflow full rewrite, color drift correction V4.1 fixes and enhancements.
 
 ## Table of Contents
 
@@ -78,8 +78,9 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 | **Wan SCAIL To Video (Multi Ref)** | `model/conditioning/video_models` | SCAIL/SCAIL-2 multi-reference image video generation conditioning node. Supports auto-encoding multiple reference images, SCAIL-2 multi-identity colored mask injection, pose video guidance, motion continuation (prev_latent), etc. |
 | **Create SCAIL-2 Colored Mask (Multi Ref)** | `conditioning/video_models/scail` | Renders SAM3 tracking data into SCAIL-2 colored masks. Supports shared palette sorting (left_to_right/area) for reference images and driving video, ensuring consistent identity coloring across multi-person scenes |
 | **WanSparseAttention** | `model/conditioning/video_models/scail` | SCAIL sparse attention & causal attention node. Uses attention masks to limit interactions between pose/ref/main tokens, reducing degeneration in long video generation. Supports multiple attention mask strategies: no mask, pose-disabled-from-main, causal-only, pose-disabled-from-main+causal, etc. |
+| **Wan SCAIL-2 Phase Sampler** | `sampling` | Standalone two-phase sampling node. Faithfully replicates the two-phase sampling core logic from SCAIL2LoopSampler. Uses pixel frames (IMAGE) as anchor input, internally performs VAE encoding, anchor frame write-back, and noise_mask management |
 | **CLIP Vision Multi-Ref Switch** | `conditioning/video_models/scail` | Multi-image CLIP feature concatenation node. Concatenates batch CLIP vision features in token dimension, enabling all reference images to contribute to conditioning |
-| **Auto Color Drift Correction V3.1** | `CustomNodes/Video` | Self-aligned color drift correction node V3.1. Three-layer correction: ① intra-segment drift detection (auto mode identifies jumps, bypasses if no drift); ② seam alignment eliminates inter-segment jumps; ③ bump correction for intra-segment oscillation + adaptive EMA template learning |
+| **Auto Color Drift Correction V4.1** | `CustomNodes/Video` | Self-aligned color drift correction node V4.1. Three-layer correction: ① intra-segment drift detection (auto mode identifies jumps, bypasses if no drift); ② seam alignment eliminates inter-segment jumps; ③ bump correction for intra-segment oscillation + adaptive EMA template learning. V4.1 fixes auto mode jump detection frame index, seam alignment calculation, and seam_strength parameter ignoring issues |
 
 ### SDPose Pose System
 
@@ -127,12 +128,15 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 | **Folder Image Loader** | `image` | Loads image batches from a folder sorted by filename. Supports skip, count limits, and size synchronization |
 | **Image Batch Concat** | `image` | Concatenates two image batches. Passes through the non-empty input if only one is connected |
 | **Image Batch Resize** | `image` | Resizes image batches to specified dimensions. Optional directional cropping to maintain aspect ratio |
+| **Batch Image Replace** | `image` | Batch image replacement node. Replaces images at specified positions in a batch by start index and count. Supports overflow modes (wrap/truncate/extend) and underflow mode, with optional replacement source |
+| **MaskCompositeRef** | `image` | Mask batch compositing node — reference_image preprocessing for WanSCAILToVideo. Supports replacement mode and animation mode, auto-filters fully black mask frames, background compositing |
 
 ### Context Tools
 
 | Node | Category | Description |
 |------|----------|-------------|
 | **Custom Context Windows (Manual)** | `context` | Universal context window scheduling node. Splits long sequences into sliding windows for piecewise processing. Supports reference frame prefix, noise shuffling, multiple scheduling strategies (uniform/static/cyclic/batched), and fusion modes (pyramid/linear/relative). New `causal_window_fix` feature preserves cross-window interaction details (e.g., footprints) |
+| **Wan SCAIL-2 Context Windows** | `context` | SCAIL-2 dedicated context window node. Automatically handles SCAIL-2 specific conditioning fields (ref_mask_28ch, driving_mask_28ch, pose_video_latent). No prefix reference frames or causal_window_fix needed. Works with WanSCAILToVideoMultiRef |
 
 ---
 
@@ -700,6 +704,7 @@ Some nodes in this project provide auxiliary services for third-party nodes (e.g
 - ComfyUI-BodyRatioMapper — Skeleton ratio alignment
 - comfyui-videohelpersuite — Video tools
 - comfyui-custom-scripts — Utility nodes
+- ComfyUI-Scail2-Sampler-Helper ([checknickname](https://github.com/checknickname)) — SCAIL-2 two-phase sampling core logic
 
 Meanwhile, the WanAnimate multi-reference video generation logic, yaw angle estimation algorithm, context window scheduling strategy, skeleton rendering engine, and SCAIL/SCAIL-2 multi-reference support in this project are original implementations.
 

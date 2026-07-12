@@ -15,9 +15,6 @@ class BatchImageReplace:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE", {
-                    "tooltip": "主图像批次 [B, H, W, C]。将要在此批次中替换指定位置的图像。Main image batch [B, H, W, C]. Images will be replaced at specified positions."
-                }),
                 "start_index": ("INT", {
                     "default": 0,
                     "min": 0,
@@ -42,6 +39,9 @@ class BatchImageReplace:
                 }),
             },
             "optional": {
+                "images": ("IMAGE", {
+                    "tooltip": "主图像批次 [B, H, W, C]。将要在此批次中替换指定位置的图像。Main image batch [B, H, W, C]. Images will be replaced at specified positions."
+                }),
                 "replace_images": ("IMAGE", {
                     "tooltip": "替换用图像批次 [B, H, W, C]。替换来源图像，未连接时直接透传主批次。Replacement image batch [B, H, W, C]. When disconnected, passes through original images unchanged."
                 }),
@@ -68,6 +68,9 @@ class BatchImageReplace:
 
     def replace(self, images, start_index, replace_count, overflow_mode,
                 underflow_mode="as_is", replace_images=None):
+        if images is None or images.shape[0] == 0:
+            return (None,)
+
         B = images.shape[0]
 
         # 未连接替换图 → 直接返回原批次
