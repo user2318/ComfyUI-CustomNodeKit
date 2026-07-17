@@ -2,7 +2,7 @@
 
 A set of custom nodes for ComfyUI, covering video generation, pose processing, interactive image operations, and common workflow utilities.
 
-Current version: **1.7.0** — New standalone two-phase sampling node (WanSCAIL2PhaseSampler), IntegerSettingNode frontend refactoring with alignment optimization, SCAIL-2 workflow full rewrite, color drift correction V4.1 fixes and enhancements.
+Current version: **1.7.1** — Merged batch image operation nodes (BatchImageReplace + BatchFrameReplicate moved into merged_nodes.py), new standalone two-phase sampling node (WanSCAIL2PhaseSampler), IntegerSettingNode frontend refactoring with alignment optimization, SCAIL-2 workflow full rewrite, color drift correction V4.1 fixes and enhancements.
 
 ## Table of Contents
 
@@ -128,7 +128,8 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 | **Folder Image Loader** | `image` | Loads image batches from a folder sorted by filename. Supports skip, count limits, and size synchronization |
 | **Image Batch Concat** | `image` | Concatenates two image batches. Passes through the non-empty input if only one is connected |
 | **Image Batch Resize** | `image` | Resizes image batches to specified dimensions. Optional directional cropping to maintain aspect ratio |
-| **Batch Image Replace** | `image` | Batch image replacement node. Replaces images at specified positions in a batch by start index and count. Supports overflow modes (wrap/truncate/extend) and underflow mode, with optional replacement source |
+| **Batch Image Replace** | `image` | Batch image replacement node. Replaces images at specified positions in a batch by start index and count. Supports overflow modes and underflow mode, with optional replacement source |
+| **Batch Frame Replicate** | `image` | Batch frame replication node. Replicates a specified image and inserts copies after it. Supports negative indexing and dual-channel independent input. Used for extending first/last frame duration, keyframe freeze effects |
 | **MaskCompositeRef** | `image` | Mask batch compositing node — reference_image preprocessing for WanSCAILToVideo. Supports replacement mode and animation mode, auto-filters fully black mask frames, background compositing |
 
 ### Context Tools

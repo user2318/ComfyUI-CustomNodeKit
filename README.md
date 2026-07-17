@@ -2,7 +2,7 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
-当前版本：**1.7.0** — 新增独立两阶段采样节点 (WanSCAIL2PhaseSampler)、IntegerSettingNode 前端重构与对齐优化、SCAIL-2 工作流全面重写、色彩校正 V4.1 修复与增强。
+当前版本：**1.7.1** — 合并图像批次操作节点 (BatchImageReplace + BatchFrameReplicate 移入 merged_nodes.py)、新增独立两阶段采样节点 (WanSCAIL2PhaseSampler)、IntegerSettingNode 前端重构与对齐优化、SCAIL-2 工作流全面重写、色彩校正 V4.1 修复与增强。
 
 ## 目录
 
@@ -132,7 +132,8 @@ pip install -r requirements.txt
 | **Folder Image Loader** | `image` | 从文件夹按文件名升序载入图片批次，支持跳过、数量限制与尺寸同步 |
 | **Image Batch Concat** | `image` | 将两个图像批次拼接，任意一路无输入时透传另一路 |
 | **Image Batch Resize** | `image` | 缩放图像批次到指定宽高，可选按方向裁剪保持宽高比 |
-| **Batch Image Replace** | `image` | 批量图像替换节点。在图像批次中按起始索引和数量替换指定位置的图像。支持溢出模式（循环重置/截断/扩展）和下溢模式，替换源可选连接 |
+| **Batch Image Replace** | `image` | 批量图像替换节点。在图像批次中按起始索引和数量替换指定位置的图像。支持溢出模式和下溢模式，替换源可选连接 |
+| **Batch Frame Replicate** | `image` | 图像批次指定帧复制节点。在图像批次中复制指定图像并插入到其后。支持负索引和双路独立输入。用于延长首/尾帧时长、关键帧停留效果 |
 | **MaskCompositeRef** | `image` | 遮罩批次合成节点 — 用于 WanSCAILToVideo 的 reference_image 预处理。支持替换模式和动作迁移模式，自动剔除全黑遮罩帧、背景合成 |
 
 ### 上下文工具
