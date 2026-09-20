@@ -8,7 +8,6 @@ Place between CLIPVisionEncode and WanSCAILToVideoMultiRef / WanAnimateToVideoCu
 """
 
 import copy
-import torch
 import logging
 
 from comfy_api.latest import io
@@ -76,9 +75,14 @@ class CLIPVisionMultiRefSwitch(io.ComfyNode):
         )
 
         # Create output preserving all original attributes
-        out = type(clip_vision_output)()
-        for attr_name in dir(clip_vision_output):
-            if not attr_name.startswith('_') and attr_name != 'penultimate_hidden_states':
+        # 优先用 copy.copy（比手工 dir()/setattr 反射更快、更稳）；对象不支持时回退到原逐属性复制
+        try:
+            out = copy.copy(clip_vision_output)
+        except Exception:
+            out = type(clip_vision_output)()
+            for attr_name in dir(clip_vision_output):
+                if attr_name.startswith('_') or attr_name == 'penultimate_hidden_states':
+                    continue
                 try:
                     val = getattr(clip_vision_output, attr_name)
                     if not callable(val):

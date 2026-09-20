@@ -2,7 +2,9 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
-当前版本：**1.7.1** — 合并图像批次操作节点 (BatchImageReplace + BatchFrameReplicate 移入 merged_nodes.py)、新增独立两阶段采样节点 (WanSCAIL2PhaseSampler)、IntegerSettingNode 前端重构与对齐优化、SCAIL-2 工作流全面重写、色彩校正 V4.1 修复与增强。
+当前版本：**1.8.0** — 新增 WanAnimate2ToVideoCustom 节点（Wan2.1-I2V 底座 + 二代 pose 分支 K/V 注入，支持多参考图）；WanUni3CApply 重构为 render_video 输入（内置 VAE 编码 + 参考帧偏移，修复 render_latent 归一化偏差问题）；移除已退役的 WanSCAILSparseAttention 节点（长序列下掩码为 O(S²) 稠密矩阵，导致内存爆掉，实测在 SCAIL 上无收益）；另有一个**实验性 / 测试性节点 Context Window Anchor（窗口首帧锚定）——其有效性与副作用尚未充分验证，仅供测试参考；不接入工作流时既有行为完全不变**（详见 [Context Window Anchor (窗口首帧锚定)](#context-window-anchor-窗口首帧锚定)）。
+
+本版另修复了 SDPose 偏航角在短片段素材下的必崩问题、BatchImageReplace 的 repeat_end 填充逻辑（3 张替换 4 张由 `0,2,2,2` 修正为 `0,1,2,2`），并对智能视频裁剪、交互式批量裁剪等节点做了内存/性能优化（后者预览缓存从 2600 帧约 12.5GB 降到约 48MB）。**升级前请先阅读文末的 [更新日志](#更新日志)**（其中含不兼容变更说明）。
 
 ## 目录
 
@@ -17,8 +19,10 @@
   - [图像批次工具](#图像批次工具)
   - [上下文工具](#上下文工具)
 - [复杂节点详解](#复杂节点详解)
+  - [WanAnimate2ToVideoCustom](#wananimate2tovideocustom)
   - [WanAnimateToVideoCustom](#wananimatetovideocustom)
   - [Custom Context Windows (Manual)](#custom-context-windows-manual)
+  - [Context Window Anchor (窗口首帧锚定)](#context-window-anchor-窗口首帧锚定)
   - [Reference Image Selector](#reference-image-selector)
   - [SDPose 空帧修复](#sdpose-空帧修复)
   - [SDPoseDrawKeypointsV2 脚部绘制模式](#sdposedrawkeypointsv2-脚部绘制模式)
@@ -28,15 +32,19 @@
   - [WanAnimate Uni3C 运镜控制](#wananimate-uni3c-运镜控制)
   - [Interactive Batch Crop (交互式批量裁剪)](#interactive-batch-crop-交互式批量裁剪)
   - [MaskCompositeRef (遮罩批次合成 Ref)](#maskcompositeref-遮罩批次合成-ref)
+  - [SmartVideoCrop (智能视频裁剪)](#smartvideocrop-智能视频裁剪)
+  - [VideoGridCompose (视频网格拼接)](#videogridcompose-视频网格拼接)
+  - [BatchImageReplace (图像批次替换)](#batchimagereplace-图像批次替换)
 - [SCAIL-2 节点详解](#scail-2-节点详解)
   - [Wan SCAIL To Video (Multi Ref)](#wan-scail-to-video-multi-ref)
   - [Create SCAIL-2 Colored Mask (Multi Ref)](#create-scail-2-colored-mask-multi-ref)
   - [Wan SCAIL-2 Context Windows](#wan-scail-2-context-windows)
-- [依赖](#依赖)
 - [工作流](#工作流)
   - [长视频姿态检测工作流](#长视频姿态检测工作流)
   - [WanAnimate多参考图生成长视频工作流](#wananimate多参考图生成长视频工作流)
   - [WanSCAIL2 多参考图生成长视频工作流](#wanscail2-多参考图生成长视频工作流)
+- [更新日志](#更新日志)
+- [依赖](#依赖)
 - [使用示例](#使用示例)
 - [许可证](#许可证)
 
@@ -71,6 +79,7 @@ pip install -r requirements.txt
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
 | **WanAnimateToVideoCustom** | `WanLoop/整合节点` | WanAnimate 视频生成核心节点，支持 pose/face 控制、尾帧分段掩码、中性灰混合、上下文模式、prev_latent 潜变量接续等完整参数 |
+| **WanAnimate2ToVideoCustom** | `WanLoop/整合节点` | WanAnimate2（官方二代架构）视频生成核心节点。保留一代多参考图（逐帧独立编码）与 fix/legacy/vanilla 掩码处理、中性灰混合、yaw 角度输出；叠加官方二代 pose_strength / pose_start_percent / pose_end_percent / reference_image_strength / positive_pose / clip_vision_output_pose。已适配二代 pose 分支帧数校验（多参考前补 latent 帧） |
 | **单帧独立 VAE 编码** | `WanLoop/工具节点` | 将 N 张图片逐帧独立 VAE 编码后在时间维度拼接为 latent，为 ComfyUI-EverAnimate 项目提供锚点 latent |
 | **WanUni3CLoader** | `WanVideo/Control` | 加载 Uni3C ControlNet 模型，支持 fp32/bf16/fp16 精度选择（可选） |
 | **WanUni3CApply** | `WanVideo/Control` | 在 KSampler 中注入 Uni3C 运镜控制，支持 strength/start_percent/end_percent 等参数（可选） |
@@ -81,10 +90,9 @@ pip install -r requirements.txt
 |--------|------|------|
 | **Wan SCAIL To Video (Multi Ref)** | `model/conditioning/video_models` | SCAIL/SCAIL-2 多参考图视频生成 conditioning 节点。支持多张参考图自动编码、SCAIL-2 多身份 colored mask 注入、pose 视频引导、运动接续（prev_latent）等 |
 | **Create SCAIL-2 Colored Mask (Multi Ref)** | `conditioning/video_models/scail` | 渲染 SAM3 追踪数据为 SCAIL-2 使用的 colored mask。支持参考图和驱动视频的共享调色板排序（left_to_right/area），确保多人物场景下同一身份颜色一致 |
-| **Wan SCAIL Sparse Attention** | `conditioning/video_models/scail` | SCAIL 稀疏注意力节点，通过注意力掩码限制 pose/ref/main token 之间的交互，减少长视频生成中的退化现象。支持多种注意力掩码策略 |
 | **Wan SCAIL-2 Phase Sampler** | `sampling` | 独立两阶段采样节点。完整复刻 SCAIL2LoopSampler 的两阶段采样核心逻辑。用像素帧（IMAGE）作为锚定输入，内部完成 VAE 编码、锚定帧回写、noise_mask 管理 |
 | **CLIP Vision Multi-Ref Switch** | `conditioning/video_models/scail` | 多参考图 CLIP 特征合并节点。将批次中 N 张图的 CLIP Vision 特征拼接到 token 维度，使所有参考图都参与 conditioning |
-| **Auto Color Drift Correction V4.1** | `CustomNodes/Video` | 自对齐色彩漂移校正节点 V4.1。三层校正：① 段内漂移检测（auto模式自动识别跳变，无漂移则旁路输出）；② 接缝对齐消除段间跳变；③ 段内趋势线性补偿。V4.1 修复 auto 模式跳变检测帧索引、接缝对齐计算、seam_strength 参数忽略等问题 |
+| **Auto Color Drift Correction V4.3** | `CustomNodes/Video` | 自对齐色彩漂移校正节点 V4.3。两遍校正：① 第一遍全局偏移——多帧均值检测段间跳变后统一校正所有新帧；② 第二遍残余微调——在钳制上限内逐帧向基准靠拢。支持 standard/auto/off 三种模式，`max_offset` 控制单通道偏移上限 |
 
 ### SDPose 姿态系统
 
@@ -109,6 +117,8 @@ pip install -r requirements.txt
 |--------|------|------|
 | **VideoFrameCounter** | `video` | 获取输入视频/图像序列的帧数统计信息与帧率 |
 | **ImageSequenceToVideo** | `video` | 使用 ffmpeg 将图片序列合成为视频文件，支持 CRF、音频合成、帧偏移等参数 |
+| **SmartVideoCrop** | `video` | 基于 SAM3 追踪数据的智能视频裁剪：按人物质心做水平跟随裁剪（EMA 平滑 + 切镜检测），固定保留全高后按输出宽高比缩放。支持多 ID 追踪、空 mask 回退策略（保持最后位置/回到中心）、可选第二路图像同步裁剪 |
+| **VideoGridCompose** | `video` | 把 1~4 路视频/图片按布局拼成网格（水平排列 / 垂直排列 / 田字格2×2 / 左一右N / 上一+下N），支持自适应填满或保持比例、时长对齐（超长截断、不足冻结补帧）、音频来源选择；全程 ffmpeg 流式处理，不占内存 |
 
 ### 交互式工具
 
@@ -140,12 +150,17 @@ pip install -r requirements.txt
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
-| **Custom Context Windows (Manual)** | `context` | 通用上下文窗口调度节点。将长序列拆分为滑动窗口逐段处理，支持参考帧前缀、噪声混洗、多种调度策略（均匀/静态/循环/批处理）与融合模式（金字塔/线性叠加/相对加权）。新增 `causal_window_fix` 因果窗口修复功能，用于保留跨窗口的交互细节（如脚印） |
-| **Wan SCAIL-2 Context Windows** | `context` | SCAIL-2 专用上下文窗口节点。自动处理 SCAIL-2 的特殊 conditioning 字段（ref_mask_28ch、driving_mask_28ch、pose_video_latent），无需前缀参考帧和 causal_window_fix。与 WanSCAILToVideoMultiRef 配合使用 |
+| **Custom Context Windows (Manual)** | `context` | 通用上下文窗口调度节点。将长序列拆分为滑动窗口逐段处理，支持参考帧前缀、噪声混洗、多种调度策略（均匀/静态/循环/批处理）与融合模式（金字塔/线性叠加/相对加权） |
+| **Wan SCAIL-2 Context Windows** | `context` | SCAIL-2 专用上下文窗口节点。自动处理 SCAIL-2 的特殊 conditioning 字段（ref_mask_28ch、driving_mask_28ch、pose_video_latent），无需前缀参考帧。与 WanSCAILToVideoMultiRef 配合使用 |
+| **Context Window Anchor (窗口首帧锚定)** | `context` | 【实验性·测试性】上下文窗口跨窗口对齐锚定节点（**有效性与副作用尚未充分验证，仅供测试参考**）。把每个窗口的驱动视频 latent 首帧（animate2: pose_latents；SCAIL-2: pose_latents + 驱动遮罩 sam_latents）替换为当前片段窗口 0 的首帧，让各窗口以同一基准对齐，缓解窗口融合处的比例/位置跳变。必须接在上下文窗口节点之后 |
 
 ---
 
 ## 复杂节点详解
+
+### WanAnimate2ToVideoCustom
+
+基于官方 `WanAnimate2ToVideo`（Wan2.1-I2V 底座 + pose 分支 K/V 注入）与一代 `WanAnimateToVideoCustom` 融合的二代 animate 节点。保留一代的多参考图（逐帧独立编码，兼容 EverAnimate LoRA；原模式 1+4n 批量编码在 animate2 上表现不佳已移除）、fix/legacy/vanilla 掩码处理、黑帧检测+过渡、尾帧分段掩码、中性灰混合、yaw_angles→latent_yaw_angles 输出；叠加官方二代的 `pose_strength` / `pose_start_percent` / `pose_end_percent`（pose 时间窗口，窗口外跳过 pose 分支可提速）/ `reference_image_strength` / `positive_pose` / `clip_vision_output_pose`。pose 分支按二代模型 `pose_latents.shape[2] == f_gen - 1` 的帧数校验要求前补 latent 帧，多参考图场景可直接使用。已去掉二代架构不支持的 face/background/character_mask/prev_latent。
 
 ### WanAnimateToVideoCustom
 
@@ -170,7 +185,6 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | `tail_frame_count` | INT | legacy 模式下尾帧掩码覆盖的帧数 |
 | `tail_start_strength` | FLOAT | legacy 模式下尾帧掩码起始强度 |
 | `tail_end_strength` | FLOAT | legacy 模式下尾帧掩码结束强度 |
-| `ref_mode` | 枚举 | `原模式`=内部1+4n排列后批量编码(接selected_images)；`兼容模式`=逐帧独立编码(接selected_images，兼容EverAnimate LoRA) |
 
 **可选参数：**
 
@@ -240,7 +254,6 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | `freenoise` | BOOLEAN | 是否启用 FreeNoise 噪声混洗（改善窗口间连续性） |
 | `prefix_latent_num` | INT | 前缀参考帧的 latent 数量。接参考图选择器 raw_reference_images 的图片数量即可（每张图片编码为1个 latent）。这些帧会作为稳定参考拼接到每个窗口前 |
 | `split_conds_to_windows` | BOOLEAN | 是否将多个 conditioning 按区域索引分配给各窗口 |
-| `causal_window_fix` | BOOLEAN | 因果窗口修复（默认 True）。开启后在每个窗口前补上一窗口的 denoised 末帧，保留脚印等交互细节。会牺牲并行性（每次 denoise step 内窗口串行执行） |
 
 #### 调度策略 (context_schedule)
 
@@ -265,7 +278,6 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 1. **帧数转换**：`context_length`、`context_overlap` 均以像素帧为单位输入，节点内部自动转换为 latent 帧（每 4 像素帧 → 1 latent 帧）。
 2. **前缀参考帧**：设置 `prefix_latent_num > 0` 后，该数量的参考图 latent 会被追加到每个窗口开头作为稳定参考，适合需要全局上下文信息的生成任务。
 3. **freenoise**：启用后会混洗噪声以改善窗口间的纹理连续性，建议在总帧数较长且重叠较小时开启。
-4. **causal_window_fix**：启用后会在每个窗口前补入上一窗口 denoised 输出的末帧作为 anchor，有效保留脚印、地面交互等跨窗口连续性细节。注意这会强制窗口串行执行，降低并行度。
 
 #### 典型工作流
 
@@ -276,6 +288,92 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
                       ↓
                model (已封装) → [KSampler] → [VAE Decode] → 输出
 ```
+
+---
+
+### Context Window Anchor (窗口首帧锚定)
+> ⚠️ **实验性 / 测试性节点（未充分验证）**：本节点保留在仓库中**仅供测试与参考**。其**有效性**（能否真正缓解窗口接缝处的比例/位置跳变）与**副作用**（对画质、人物一致性、动作自然度、采样稳定性等的影响）**均未经过充分测试与验证**，也不保证在不同模型 / LoRA / 参数组合下都安全无害。
+> 请务必先在本地用**同一 seed** 做“加节点 vs 不加节点”的对比（见下方 [实验建议](#实验建议)）再决定是否长期使用，不建议在正式生产工作流中依赖它。该节点未接入工作流时，其代码路径不参与执行，既有节点行为完全不变。
+
+
+【实验性】**要解决的问题**：animate2 / SCAIL-2 的「参考图 ↔ 驱动视频」身体比例与空间位置对齐由模型内部**逐窗口**推导。上下文窗口采样时，每个窗口的驱动视频 latent 只包含本窗口对应的帧，窗口首帧姿态各不相同 → 每个窗口的对齐基准不同 → 窗口融合后出现比例/位置跳变（接缝错位）。
+
+**本节点做什么**：把窗口 w>0 的驱动视频 latent 前 K 个 latent 帧，替换为**当前片段窗口 0**（即本段驱动视频首帧）的同名张量前 K 帧，让所有窗口以同一基准对齐；SCAIL-2 的驱动遮罩（`sam_latents`）同时锚定。
+
+#### 参数说明
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `model` | MODEL | — | 已接入上下文窗口节点的模型（必填）：`Custom Context Windows (Manual)` 或 `Wan SCAIL-2 Context Windows` 的 model 输出 |
+| `enabled` | BOOLEAN | true | 是否启用；关闭时模型直接透传 |
+| `anchor_targets` | COMBO | 驱动视频 + 驱动遮罩 (auto) | 要锚定的目标（下拉选择）：`驱动视频 + 驱动遮罩 (auto)` / `仅驱动视频 (pose only)` / `仅驱动遮罩 (mask only)`。驱动视频 = pose 分支（animate2 与 SCAIL-2 都是 `pose_latents`）；驱动遮罩 = SCAIL-2 的 `driving_mask`（`sam_latents`）|
+| `anchor_frames` | INT | 1 | 每个窗口锚定前 K 个 latent 帧；0=关闭 |
+| `anchor_offset` | INT | -1（自动） | 切片内起始帧偏移。`-1`=自动：跳过切片头部的"前缀派生帧"（`max(0, 前缀帧数-1)`），从**窗口自身的第一个驱动帧**开始锚定；也可填 `0/1/…` 手动指定做实验 |
+| `blend` | FLOAT | 1.0 | 1.0=完全替换为窗口 0 的首帧；<1.0 与窗口自身首帧线性混合（用于缓解首帧姿态回跳造成的抖动） |
+| `apply_to_negative` | BOOLEAN | true | CFG 下是否同时锚定 negative（两边传入同一份驱动条件，锚定结果一致，不会造成 CFG 偏斜） |
+| `log_debug` | BOOLEAN | false | 打印每个窗口命中的键、shape 与首帧数值，用于确认锚定是否生效 |
+| `anchor_steps` | INT | -1（全程） | 只在前 N 个采样步锚定：`-1`=全程（默认）、`0`=不锚定、`N>0`=前 N 步。**时间门控**：每步都给真实信号（要么锚、要么本段），与 `blend`（幅度混合，会喂合成中间态）是两条不同的路 |
+| `global_pose_frames` | IMAGE | 不接 | 【可选】驱动/pose 视频开头的若干像素帧（给多少用多少）：编码成 latent 后替换锚定带的前 M 帧（`M=((T-1)//4)+1`）。给多了=完全替换、给少了=部分替换；不接=纯本段锚定 |
+| `global_mask_frames` | IMAGE | 不接 | 【可选，SCAIL-2】彩色遮罩视频开头的若干像素帧，按 `_extract_mask_to_28ch` 编码后替换遮罩锚的前 M 帧（animate2 用不到） |
+| `vae` | VAE | 不接 | 【可选】仅用于把 `global_pose_frames` 编码成 latent（接同一个 Wan VAE）；遮罩池不需要 VAE |
+
+#### 生效机制与边界
+
+- **生效层级**：conditioning 层 —— 在每个窗口的 cond 重切分之后做后处理，因此**每个采样步都会生效**；不触碰 x/latent 层，与窗口融合权重、overlap、FreeNoise 互不干扰。
+- **锚点位置**：上下文节点会把前缀索引（chunk 的 `0..P-1` 帧）拼到每个窗口的 `index_list` 前面，而驱动视频/驱动遮罩的切片用的正是 `index_list` → 每个窗口的切片头部都会多出 `P-1` 帧"**前缀派生帧**"（多参考图时是零填充帧；单参考图时是 chunk 开头几帧的驱动内容），且它们对所有窗口完全相同 → 锚在这些帧上时，替换前后的数值相同（即不改变数据），故 `anchor_offset` 默认自动跳过它们：
+  - 前缀 `P = 0` 或 `1` → 偏移 `0`（与最早版本行为相同）；
+  - 前缀 `P = 6`（6 张参考图）→ 偏移 `5`（锚点落在窗口 body 的第一个驱动帧）。
+- **不跨 chunk**：锚定源始终是"当前这一段"的窗口 0，每段各自锚定（快照在每个采样步的窗口 0 处刷新）。
+- **只改数值、不改长度**：animate2 的 `pose_latents.shape[2] == f_gen - 1` 帧数校验不受影响。
+- **只处理按窗口切分过的张量**：仅作用于 `model_conds` 内的目标键；长度超过窗口帧数的整段条件会被自动跳过（例如 SCAIL 的 `ref_mask_latents` 这类"参考帧 + 窗口帧"张量默认不在锚定范围内）。
+- **实现方式**：对 `model_options["context_handler"]` 上的 handler 实例做浅拷贝后包装其 `get_resized_cond` / `execute`，不修改 handler 的类，也不改动上下文窗口节点的任何代码。
+
+#### 典型接线
+
+```
+[加载模型] → Custom Context Windows (Manual) → Context Window Anchor → [KSampler] → [VAE Decode] → 输出
+[加载模型] → Wan SCAIL-2 Context Windows    → Context Window Anchor → [KSampler] → [VAE Decode] → 输出
+```
+
+> 未接在上下文窗口节点之后时，节点会打印警告并原样透传模型（不会中断工作流）。
+
+#### 混合锚定（全局头部 + 本段锚，可选）
+
+默认锚定源是「本段窗口 0 的首帧」。接上 `global_pose_frames`（SCAIL-2 再加 `global_mask_frames`）后，锚定带的前 M 帧改用"全局素材"：
+
+```
+hybrid = [全局池的前 M 帧] + [本段窗口0 锚的其余 K−M 帧]
+M = ((T−1)//4)+1        # T = 你接入的像素帧数
+```
+
+- **给多少用多少**（没有"取多少帧"参数）：给的帧数超出锚定带 → 只取前 K 帧（**完全替换**）；不足 → **部分替换**；不接 → **纯本段锚定**（与之前行为完全一致）；
+- **分辨率自动对齐**：按采样期 latent 的空间尺寸反推（`latent×8`），你不需要接 width/height；
+- **遮罩按硬替换处理**：`sam_latents` 承载空间/身份信息（8×8 块的颜色覆盖率 × 颜色通道），本版本对其强制硬替换（即使 `blend<1` 也按 1.0 处理）——线性混合两帧图案会得到与任一帧都不对应的边界（实现选择，后续可再评估）；
+- **窗口 0 不参与替换**（它是锚定源），因此本段第一个窗口的驱动条件保持不变；
+- 本节点的**输出不变**（仍是单个 `model`），三个新输入都是可选插口，接在参数区末尾，旧工作流的参数不会错位。
+
+接线示例（用你工作流里已有的节点即可）：
+
+```
+[完整驱动/pose 视频] -- ImageFromBatch(start=0, length=5) --> global_pose_frames
+[完整彩色遮罩视频]   -- ImageFromBatch(start=0, length=5) --> global_mask_frames   (SCAIL-2)
+[同一个 Wan VAE] ----------------------------------------> vae
+```
+> ⚠️ 这两个"全局素材"要取自**整段视频**（循环之前），不要取循环里已被裁成"当前片段"的视频，否则"开头几帧"会变成本段开头，等于没换。
+
+#### 实验建议
+
+> 方法提醒：以下对比建议**同 seed、同 chunk、每次只改一个变量**；单组结果容易受采样随机性影响，建议同组重复跑 2 次以上再比较。
+
+1. 先开 `log_debug=true` 跑一次，确认日志里既有"记录锚定源 窗口0"也有后续窗口的"锚定"行（并对比首帧数值是否不同）。
+2. 同 seed、同参数做"加节点 vs 不加节点"对比，重点看窗口接缝处的人物比例与位置。
+3. 若出现首帧姿态回跳引起的抖动：先保持 `anchor_frames=1`，再用 `blend`（如 0.5~0.8）软化。
+4. SCAIL-2 可把 `anchor_targets` 依次切到"仅驱动视频 / 仅驱动遮罩 / 两者都锚"，以定位主要影响因素。
+5. 该功能**不解决跨段（chunk 之间）的对齐漂移**，仅作用于同一段内的各窗口。
+6. **幅度混合 vs 时间门控**：两者是不同取舍——
+   - `blend<1`：每一步都喂"锚 ×α + 本段 ×(1−α)"的**合成条件**（可能对应不存在的中间姿态/边界）；
+   - `anchor_steps=N`：**只在前 N 步锚定**，之后回归真实条件（每步都是真实信号；按采样进度切换条件与官方 `pose_start_percent/pose_end_percent` 属同一类用法）。
+   建议对比这两组：`blend=1.0 + anchor_steps=1~2`（门控）vs `blend=0.7 + anchor_steps=-1`（软混合）。
 
 ---
 
@@ -497,34 +595,33 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
 |------|------|------|------|
 | `model` | MODEL | ✅ | 待注入控制的模型 |
 | `uni3c_controlnet` | UNI3C_CONTROLNET | ✅ | 由 WanUni3CLoader 加载的 ControlNet 模型 |
-| `render_latent` | LATENT | ✅ | 预渲染的参考视频潜空间张量（B, C, T, H, W），作为运镜控制的视觉参考 |
+| `render_video` | IMAGE | ✅ | 运镜参考视频（像素帧），节点内部 VAE 编码后作为运镜控制的视觉参考 |
+| `vae` | VAE | ✅ | 用于编码 render_video 的 VAE |
 | `strength` | FLOAT | ✅ | 控制强度（0.0-10.0，默认 1.0） |
 | `start_percent` | FLOAT | ✅ | 控制生效起始百分比（0.0-1.0，默认 0.0） |
 | `end_percent` | FLOAT | ✅ | 控制生效结束百分比（0.0-1.0，默认 1.0） |
-| `render_mask` | MASK | ❌ | 可选的渲染遮罩（实验性功能） |
 | `trim_latent` | INT | ❌ | 参考图占用的 latent 帧数，从 WanAnimateToVideoCustom 的 `trim_latent` 输出接入，用于时序对齐 |
-| `positive` | CONDITIONING | ❌ | 可选：传入 conditioning 自动提取 `concat_latent_image`，替代 WanAnimateChannelPack 节点 |
-| `negative` | CONDITIONING | ❌ | 同上，负条件 |
 
 **输出**：`model`（MODEL）— 已注入控制的模型，可直接连接 KSampler。
 
 #### 核心原理
 
 1. **v4 架构**：采用 monkey-patch 方式修改模型 `forward_orig` 方法，在 block 循环中精确控制注入时机
-2. **时序对齐**：通过 `trim_latent` 参数自动对齐 render_latent 与生成视频的时序偏移
-3. **异步预取**：控制信号采用 CPU→GPU 异步预取机制，与 block 计算重叠，最小化性能开销
+2. **参考帧偏移**：注入时跳过参考帧 token（与官方 `img_offset` 语义一致），避免参考帧被污染及控制信号时序错位；支持 WanAnimate concat / ref_conv / SCAIL / context window 场景
+3. **latent 归一化**：render_video 内部 VAE 编码后应用 `latent_format.process_in`，与采样中已归一化的 x 尺度对齐，避免控制信号偏向 render 内容
 4. **step 控制**：通过 `start_percent` / `end_percent` 控制控制信号在 denoising 过程中的生效范围
 
 #### 典型工作流
 
 ```
 [WanUni3CLoader] → uni3c_controlnet ─┐
-[渲染好的 latent] → render_latent ────┤
+[运镜参考视频] → render_video ────────┤
+[VAE] → vae ────────────────────────┤
                                        ↓
 [模型] → WanUni3CApply → model (已注入控制) → [KSampler] → [VAE Decode] → 输出
 ```
 
-> **注意**：WanUni3CApply 节点内置了 WanAnimateChannelPack 逻辑，如果传入了 `positive`/`negative` conditioning，会自动从其中提取 `concat_latent_image`，无需额外连接 WanAnimateChannelPack 节点。
+> **注意**：旧版提供过 `positive`/`negative` 条件接口和 `render_mask`，实际为无效逻辑（写入的键从未被读取），已在 v4 清理移除。
 
 ---
 
@@ -664,6 +761,88 @@ Uni3C 运镜控制为 WanAnimate 视频生成提供可选的相机运动控制�
                              ↓
               images + masks → [Wan SCAIL To Video] reference_image + reference_image_mask
 ```
+
+---
+
+### SmartVideoCrop (智能视频裁剪)
+
+基于 SAM3 追踪数据的智能视频裁剪：以人物质心为基准做**水平跟随裁剪**，固定保留原始画面全高，再按输出宽高比缩放到目标尺寸。
+
+#### 参数说明
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `frames` | IMAGE | 当前段原始视频帧批次 (B, H, W, C) |
+| `track_data` | SAM3_TRACK_DATA | SAM3_VideoTrack 的追踪数据（接 `driving_track_data`） |
+| `output_width` / `output_height` | INT | 输出尺寸；裁剪宽度按 `H × output_width / output_height` 推算 |
+| `object_ids` | STRING | 要追踪的人物 ID，逗号分隔（如 `1` 或 `1,2`）；空 = 默认 ID 1 |
+| `smoothing` | FLOAT | 帧间 EMA 平滑（0 = 完全跟随、抖动明显；1 = 几乎静止） |
+| `mask_fallback` | 枚举 | mask 为空时：`hold_last` 保持最后有效位置 / `center` 回到画面中心 |
+| `scene_cut_threshold` | FLOAT | 切镜检测阈值（归一化）：连续有 mask 的帧间质心跳变超过该值即判定切镜并重置平滑；0 = 关闭 |
+| `fallback_center` | FLOAT | `mask_fallback=center` 时的回退水平中心比例（0=最左, 0.5=居中, 1=最右） |
+| `mask_frames` | IMAGE | 可选第二路图像（如遮罩视频），与 `frames` 共用同一裁剪窗口同步输出 |
+
+#### 输出
+
+- `cropped_frames`：裁剪并缩放后的帧批次
+- `cropped_mask`：第二路的同步裁剪结果（未接时为空批次）
+- `debug_info`：每帧裁剪位置等 JSON 调试信息
+
+> 输入比目标更窄时会自动切换为"垂直居中裁剪"（用全宽、按比例算高），因此不会裁掉画面内容。
+> 内部按 **8 帧分块批处理** grid_sample，长序列比逐帧处理更快（裁剪结果与原逐帧实现逐位一致）。
+
+---
+
+### VideoGridCompose (视频网格拼接)
+
+把 1~4 路视频/图片拼成一个网格视频，**全程由 ffmpeg 流式处理**，不会把帧读进内存（长视频同样安全）。
+
+#### 参数说明
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `video_paths` | STRING | 多行路径，每行一个（最多 4 路，自动去重去空行）；某一行是**图片**时会自动以 `-loop 1 -t <目标时长>` 当作静止视频流处理 |
+| `layout` | 枚举 | `水平排列` / `垂直排列` / `田字格2×2`（需 4 路）/ `左一右N` / `上一+下N`（后两者需 ≥3 路）；路数不足时自动降级为水平排列 |
+| `audio_source` | 枚举 | `无音频` 或 `视频1`~`视频4`（取对应输入的音频轨） |
+| `match_method` | 枚举 | `自适应(填满)`=拉伸铺满 / `自适应(保持比例)`=等比缩放+黑边 / `统一到最大` / `统一到最小` |
+| `fps` | FLOAT | 输出帧率；0 = 取输入中的最大帧率 |
+| `crf` | INT | x264 质量（越小越好，建议 18~28） |
+| `duration_mode` | 枚举 | 时长基准：`自动(最短)` / `自动(最长)` / `视频1`~`视频4`；比基准长的截断、短的冻结最后一帧补齐，音频同步 atrim/apad |
+| `output_path_prefix` | STRING | 输出路径前缀（相对 ComfyUI 的 output 目录） |
+
+输出 `video_path`（STRING），文件写入 `ComfyUI/output/<output_path_prefix>_0001.mp4`（自动递增避免覆盖）。
+
+---
+
+### BatchImageReplace (图像批次替换)
+
+在主图像批次中，从 `start_index` 开始按 `replace_count` 替换若干帧。替换源（`replace_images`）的数量可以与需求不一致，由两个模式决定如何处理。
+
+#### 参数说明
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `start_index` | INT | 从主批次哪个位置开始替换（0-based） |
+| `replace_count` | INT | 替换多少张；`-1` = 从 start_index 一直替换到末尾；`0` = 不替换（原样透传） |
+| `overflow_mode` | 枚举 | **替换源多于需求**时：`take_front` 取前 N 张 / `take_back` 取后 N 张 |
+| `underflow_mode` | 枚举 | **替换源少于需求**时：`as_is` 只替换源里实际有的张数（不扩展）/ `repeat_begin` 前面用第 1 张补齐 / `repeat_end` 按原顺序保留全部、末尾用最后 1 张补齐 |
+| `images` | IMAGE | 主图像批次（未连接时输出为空） |
+| `replace_images` | IMAGE | 替换源批次（未连接时原样透传主批次） |
+
+#### underflow 语义示例（替换源 3 张、需替换 4 张）
+
+| 模式 | 替换结果 |
+|------|----------|
+| `as_is` | 只替换 3 帧（第 4 帧保持原样） |
+| `repeat_begin` | `0,0,1,2`（第 1 张重复到最前面） |
+| `repeat_end` | `0,1,2,2`（按原顺序保留，末尾补最后 1 张） |
+
+> `repeat_end` 在 v1.8.0 修正过一次：旧实现会丢弃中间帧得到 `0,2,2,2`，升级后行为与上表一致。
+
+#### 其它说明
+
+- 替换源与主批次分辨率不一致时会自动缩放到主批次尺寸
+- `start_index` 超出批次长度时打印警告并原样返回主批次
 
 ---
 
@@ -819,7 +998,6 @@ SCAIL-2 专用的上下文窗口节点，与通用的 `Custom Context Windows (M
 |------|-------------------------------|----------------------------|
 | conditioning 处理 | 通用处理，需要手动配置 prefix_latent_num | 自动处理 SCAIL-2 特殊字段（ref_mask_28ch、driving_mask_28ch、pose_video_latent） |
 | 前缀参考帧 | 通过 `prefix_latent_num` 配置 | **不需要**，SCAIL-2 的 reference_latents / ref_mask_28ch 是全局保留的 |
-| causal_window_fix | 支持 | **不支持**（SCAIL-2 通过 previous_frames 机制实现段间锚定） |
 | 适用模型 | 通用 WAN 模型 | SCAIL-2 模型专用 |
 
 #### 参数说明
@@ -951,6 +1129,41 @@ SCAIL-2 专用的上下文窗口节点，与通用的 `Custom Context Windows (M
 5. 将 colored mask 和驱动视频接入 `Wan SCAIL To Video (Multi Ref)` 节点；
 6. 运行后逐段生成视频帧，利用上下文窗口实现长视频生成；
 7. 生成完成后将帧序列合成为视频文件。
+
+---
+
+## 更新日志
+
+### v1.8.0
+
+**新增**
+- `WanAnimate2ToVideoCustom`：WanAnimate2（官方二代架构）视频生成节点
+- `Context Window Anchor (窗口首帧锚定)`（**实验性 / 测试性——有效性与副作用尚未充分验证**）：上下文窗口的跨窗口对齐锚定节点。把每个窗口的驱动视频 latent 首帧（animate2: `pose_latents`；SCAIL-2: `pose_latents` + 驱动遮罩 `sam_latents`）替换为当前片段窗口 0 的首帧，使各窗口以同一基准对齐，缓解窗口融合处的比例/位置跳变。每采样步生效、不跨 chunk、只改数值不改长度；必须接在上下文窗口节点之后。
+  - 默认参数：`anchor_targets=驱动视频 + 驱动遮罩 (auto)`、`anchor_frames=1`、`anchor_offset=-1`（自动跳过前缀派生帧）、`blend=1.0`、`apply_to_negative=true`、`log_debug=false`；锚定目标与偏移都以**下拉/整数**呈现，无需手填任何"键名:维度"字符串。
+  - **未充分验证**：有效性取决于模型内部对齐是否依赖窗口首帧，副作用（画质 / 人物一致性 / 采样稳定性）尚未系统评估；请按上文“实验建议”做开/关对比后再决定是否长期使用，不建议在正式生产工作流中依赖它。
+
+**移除**
+- `WanSCAILSparseAttention`：长序列下需要构造 O(S²) 的稠密注意力掩码（2600 帧时可达 TB 级），导致内存直接爆掉，且实测在 SCAIL 上无明显收益，故彻底移除。旧工作流若引用它会提示"缺失节点"，删除该节点即可
+
+**修复**
+- `SDPoseEstimateYawSimple` / `SDPoseEstimateYawAdvanced`：短片段、多镜头素材下分组为空会触发 `IndexError` 崩溃（现改为回退到全局基准值）
+- `BatchImageReplace`：修正 `repeat_end` 填充逻辑（3 张替换 4 张由 `0,2,2,2` 修正为 `0,1,2,2`）；`images` 未连线时不再抛 `TypeError`
+- `ImageSequenceToVideo`：ffconcat 列表与音频临时文件在失败/异常路径也会被清理
+
+**优化**
+- `InteractiveBatchCrop`：预览缓存改为"按前端取帧规则缓存帧子集"，2600 帧从约 12.5GB 降到约 48MB，并加了 2GB 总量预算；输出改为预分配
+- `SmartVideoCrop`：裁剪改为 8 帧分块批处理（长序列更快，裁剪结果数值不变）
+- `MaskCompositeRef` / `BatchImageReplace` / `ImageBatchResize` 等：逐帧拼接改为预分配输出（峰值内存约减半）
+- `VideoGridCompose` / `VideoFrameCounter` / `ImageSequenceToVideo`：同一文件的 ffmpeg 探测由 2 次降为 1 次
+- `GD_BBoxDetect`：新增 `unload_after_run` 开关（默认关闭＝保持常驻显存），需要时可在检测完把模型移回 CPU
+- 文件/文件夹选择弹窗改为工作线程执行，弹窗期间不再阻塞 ComfyUI 事件循环
+
+**⚠️ 不兼容变更（升级前请留意）**
+
+1. `WanUni3CApply`：输入由 `render_latent`(LATENT) 改为 `render_video`(IMAGE) + `vae`；`WanUni3CLoader` 的模型目录由 `models/controlnet` 改为 `models/model_patches`
+2. `WanSCAILToVideoMultiRef`：`ref_encoding_mode` 默认值改为 `逐帧编码`（保真度更高；如需旧行为请手动改回 `1+4n批量`）
+3. `Custom Context Windows (Manual)` / `Wan SCAIL-2 Context Windows`：已移除 `causal_window_fix` 相关参数与逻辑
+4. `WanSCAILSparseAttention` 节点已移除（见上文"移除"）
 
 ---
 

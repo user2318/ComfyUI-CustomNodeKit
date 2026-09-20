@@ -48,8 +48,12 @@ def resolve_path(path: str) -> str:
         return resolved
 
 
-def get_video_info(file_path: str) -> Tuple[float, float]:
-    """使用 ffmpeg 获取视频时长（秒）和帧率（fps），一次调用完成"""
+def _probe_video(file_path: str) -> str:
+    """执行一次 ffmpeg -i 探测并返回 stderr 文本。
+
+    拆成独立函数是为了让"时长/帧率/分辨率"共用同一次进程调用，
+    避免同一文件被反复探测（每次探测 = 一次 ffmpeg 进程启动）。
+    """
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"文件不存在: {file_path}")
 
@@ -62,55 +66,64 @@ def get_video_info(file_path: str) -> Tuple[float, float]:
             text=True,
             check=False
         )
-        output = result.stderr
     except Exception as e:
         raise RuntimeError(f"无法执行 ffmpeg: {e}")
+    return result.stderr
 
-    # 解析 Duration
+
+def _parse_duration(output: str) -> float:
+    """从 ffmpeg 输出解析时长（秒）"""
     pattern = r"Duration:\s*(\d{2}):(\d{2}):(\d{2}\.\d+)"
     match = re.search(pattern, output)
     if not match:
         raise ValueError(f"无法从 ffmpeg 输出中解析时长: {output[:200]}")
     h, m, s = match.groups()
-    duration = int(h) * 3600 + int(m) * 60 + float(s)
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
-    # 解析视频流帧率（Stream #0:0: Video: ..., 1920x1080, 30 fps, ...）
-    fps = 0.0
+
+def _parse_fps(output: str) -> float:
+    """从 ffmpeg 输出解析帧率（Stream #0:0: Video: ..., 1920x1080, 30 fps, ...）"""
     fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps", output)
-    if fps_match:
-        fps = float(fps_match.group(1))
-
-    return duration, fps
+    return float(fps_match.group(1)) if fps_match else 0.0
 
 
-def get_video_resolution(file_path: str) -> Tuple[int, int]:
-    """使用 ffmpeg 获取视频分辨率 (width, height)"""
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"文件不存在: {file_path}")
-    
-    cmd = [FFMPEG_PATH, "-i", file_path]
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False
-        )
-        output = result.stderr
-    except Exception as e:
-        raise RuntimeError(f"无法执行 ffmpeg: {e}")
-    
-    # 从视频流解析分辨率
-    # 注意：必须避免匹配 Stream #[0:0x1] 中的十六进制 0x1
-    # 要找的是类似 ", 1080x1440" 的真实分辨率
+def _parse_resolution(output: str) -> Tuple[int, int]:
+    """从 ffmpeg 输出解析分辨率
+
+    注意：必须避免匹配 Stream #[0:0x1] 中的十六进制 0x1，
+    要找的是类似 ", 1080x1440" 的真实分辨率。
+    """
     for line in output.split('\n'):
         if 'Video:' in line and 'Stream' in line:
             match = re.search(r',\s*(\d+)x(\d+)', line)
             if match:
                 return (int(match.group(1)), int(match.group(2)))
-    
+
     raise ValueError(f"无法从 ffmpeg 输出中解析分辨率: {output[:300]}")
+
+
+def get_video_info(file_path: str) -> Tuple[float, float]:
+    """使用 ffmpeg 获取视频时长（秒）和帧率（fps），一次调用完成"""
+    output = _probe_video(file_path)
+    return _parse_duration(output), _parse_fps(output)
+
+
+def get_video_resolution(file_path: str) -> Tuple[int, int]:
+    """使用 ffmpeg 获取视频分辨率 (width, height)"""
+    return _parse_resolution(_probe_video(file_path))
+
+
+def get_video_info_full(file_path: str) -> Tuple[float, float, int, int]:
+    """一次 ffmpeg 探测同时取得 (时长, 帧率, 宽, 高)
+
+    供 VideoGridCompose 等多路输入场景使用，避免每个文件探测两次（2N 次进程启动 → N 次）。
+    解析失败时的语义与 get_video_info / get_video_resolution 分开调用时一致。
+    """
+    output = _probe_video(file_path)
+    duration = _parse_duration(output)
+    fps = _parse_fps(output)
+    width, height = _parse_resolution(output)
+    return duration, fps, width, height
 
 
 def get_media_duration(file_path: str) -> float:
@@ -303,10 +316,22 @@ class ImageSequenceToVideo:
         # ==============================
         # 7. 音频截取（如果有音频）
         # ==============================
+        # 临时文件登记表：成功 / 失败 / 异常都在 finally 中清理，避免残留 ffconcat 列表与音频文件
+        temp_paths = []
+
+        def _cleanup_temps():
+            for _p in temp_paths:
+                try:
+                    if _p and os.path.exists(_p):
+                        os.unlink(_p)
+                except OSError:
+                    pass
+
         temp_audio_file = None
         if audio_valid:
             with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as tmp:
                 temp_audio_file = tmp.name
+            temp_paths.append(temp_audio_file)
             logging.info(f"创建临时音频文件: {temp_audio_file}")
 
             cut_cmd = [
@@ -322,6 +347,7 @@ class ImageSequenceToVideo:
             logging.info(f"截取音频命令: {' '.join(cut_cmd)}")
             cut_process = subprocess.run(cut_cmd, capture_output=True, text=True)
             if cut_process.returncode != 0:
+                _cleanup_temps()
                 raise RuntimeError(f"音频截取失败: {cut_process.stderr}")
             logging.info("音频截取完成")
         else:
@@ -350,6 +376,7 @@ class ImageSequenceToVideo:
         duration_per_frame = 1.0 / fps
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
             list_file = f.name
+            temp_paths.append(list_file)
             f.write("ffconcat version 1.0\n")
             for img in used_images:
                 abs_path = os.path.join(folder_path, img).replace('\\', '/')
@@ -394,47 +421,46 @@ class ImageSequenceToVideo:
         total_seconds = final_duration
         pbar = comfy.utils.ProgressBar(int(total_seconds * 10))
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            bufsize=1,
-            encoding='utf-8'
-        )
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1,
+                encoding='utf-8'
+            )
 
-        time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)")
-        last_progress = 0
-        stderr_lines = []
+            time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)")
+            last_progress = 0
+            stderr_lines = []
 
-        for line in process.stderr:
-            stderr_lines.append(line)
-            match = time_pattern.search(line)
-            if match:
-                h, m, s = match.groups()
-                current_seconds = int(h) * 3600 + int(m) * 60 + float(s)
-                progress = int(current_seconds * 10)
-                if progress > last_progress:
-                    pbar.update(progress - last_progress)
-                    last_progress = progress
+            for line in process.stderr:
+                stderr_lines.append(line)
+                match = time_pattern.search(line)
+                if match:
+                    h, m, s = match.groups()
+                    current_seconds = int(h) * 3600 + int(m) * 60 + float(s)
+                    progress = int(current_seconds * 10)
+                    if progress > last_progress:
+                        pbar.update(progress - last_progress)
+                        last_progress = progress
 
-        process.wait()
+            process.wait()
 
-        full_stderr = ''.join(stderr_lines)
-        logging.debug(f"ffmpeg 输出:\n{full_stderr}")
+            full_stderr = ''.join(stderr_lines)
+            logging.debug(f"ffmpeg 输出:\n{full_stderr}")
 
-        if process.returncode != 0:
-            error_msg = f"ffmpeg 合成失败，返回码 {process.returncode}\n完整 stderr:\n{full_stderr}"
-            raise RuntimeError(error_msg)
+            if process.returncode != 0:
+                error_msg = f"ffmpeg 合成失败，返回码 {process.returncode}\n完整 stderr:\n{full_stderr}"
+                raise RuntimeError(error_msg)
 
-        # ==============================
-        # 12. 清理临时文件
-        # ==============================
-        os.unlink(list_file)
-        if temp_audio_file and os.path.exists(temp_audio_file):
-            os.unlink(temp_audio_file)
-
-        return (str(final_path),)
+            return (str(final_path),)
+        finally:
+            # ==============================
+            # 12. 清理临时文件（成功 / 失败 / 异常均执行）
+            # ==============================
+            _cleanup_temps()
 
 
 class VideoGridCompose:
@@ -614,16 +640,6 @@ class VideoGridCompose:
         with Image.open(file_path) as img:
             return img.size  # (width, height)
     
-    def _get_duration_for_input(self, file_path: str, is_image: bool) -> Optional[float]:
-        """获取输入时长。图片返回 None，视频返回秒数。"""
-        if is_image:
-            return None
-        try:
-            duration, _ = get_video_info(file_path)
-            return duration
-        except Exception:
-            return None
-    
     def _determine_target_duration(self, is_images: List[bool], durations: List[Optional[float]], 
                                     duration_mode: str) -> Tuple[Optional[float], int]:
         """
@@ -800,9 +816,9 @@ class VideoGridCompose:
                 durations.append(None)
                 logging.info(f"  输入{i+1} (图片): {w}x{h}")
             else:
-                w, h = get_video_resolution(p)
+                # 一次 ffmpeg 探测同时取得时长/帧率/分辨率（原来对同一文件探测两次）
+                dur, vfps, w, h = get_video_info_full(p)
                 resolutions.append((w, h))
-                dur, vfps = get_video_info(p)
                 durations.append(dur)
                 max_fps = max(max_fps, vfps)
                 logging.info(f"  输入{i+1} (视频): {w}x{h}, {dur:.2f}s, {vfps:.2f}fps")

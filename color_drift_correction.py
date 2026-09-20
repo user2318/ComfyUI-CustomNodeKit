@@ -52,7 +52,7 @@ class AutoColorDriftCorrection:
                     "tooltip": "第一遍全局偏移强度。0=禁用第一遍。auto模式下自动决策。"
                 }),
                 "max_offset": ("FLOAT", {
-                    "default": 0.02, "min": 0.001, "max": 0.05, "step": 0.001,
+                    "default": 0.02, "min": 0.001, "max": 0.1, "step": 0.001,
                     "tooltip": "第一遍最大单通道偏移钳制值。0.02≈5.1像素值。"
                 }),
                 "residual_strength": ("FLOAT", {

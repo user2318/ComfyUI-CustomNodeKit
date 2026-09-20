@@ -11,14 +11,11 @@
 # 依赖安装: pip install groundingdino-py transformers
 
 import os
-import sys
 import json
 import math
 import numpy as np
 import torch
-from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from tqdm import tqdm
+from typing import List, Dict, Tuple
 import cv2
 
 import folder_paths
@@ -109,7 +106,7 @@ def _load_gd_model(model_name: str) -> dict:
     model = model.to(device)
     print(f"[GD Nodes] Model loaded on {device}, will stay resident.")
 
-    wrapper = {"model": model, "model_name": model_name}
+    wrapper = {"model": model, "model_name": model_name, "device": device, "unloaded": False}
     _GD_MODEL_CACHE[model_name] = wrapper
     return wrapper
 
@@ -155,6 +152,12 @@ def _gd_predict_batch(model_wrapper: dict, images_batch: torch.Tensor,
       - all_scores: [[score, ...], ...] — 每个 bbox 对应的最高置信度
     """
     model = model_wrapper["model"]
+    if model_wrapper.get("unloaded"):
+        # 上次检测结束时被移回 CPU → 这里按需移回计算设备（默认不卸载时不会走到）
+        target = model_wrapper.get("device") or next(model.parameters()).device
+        model.to(target)
+        model_wrapper["unloaded"] = False
+        print(f"[GD Nodes] 模型已移回 {target} 执行推理")
     device = next(model.parameters()).device
     B, H, W, C = images_batch.shape
 
@@ -296,6 +299,10 @@ class GD_BBoxDetect:
                     "default": 5, "min": 1, "max": 20, "step": 1,
                     "tooltip": "预览帧数。自动选首帧+bbox最多帧+末帧+等间隔补足，不影响实际筛选结果。Preview frame count. Auto-selects first frame + frames with most bboxes + last frame + evenly spaced fill, does not affect actual filtering results."
                 }),
+                "unload_after_run": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "检测结束后把 GD 模型移回 CPU 并释放显存。默认 False = 保持常驻显存（复用更快）；与 Wan 等大模型同跑、显存紧张时设为 True（下次检测会自动移回 GPU，仅多一次搬运）。Whether to move the GD model back to CPU after detection. Default False = stay resident on GPU (faster reuse); set True when VRAM is tight (next detection moves it back automatically)."
+                }),
             },
         }
 
@@ -365,7 +372,8 @@ class GD_BBoxDetect:
 
     # ── 主入口 ──
 
-    def detect(self, gd_model, image, prompt, threshold, mode, strategy, index, region, batch_size, preview_count):
+    def detect(self, gd_model, image, prompt, threshold, mode, strategy, index, region, batch_size, preview_count,
+               unload_after_run=False):
         B, H, W, C = image.shape
 
         # 第 1 步：GPU 批处理检测所有帧
@@ -442,6 +450,17 @@ class GD_BBoxDetect:
             preview_tensor = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
 
         preview_json = json.dumps({"samples": preview_samples}, indent=2)
+
+        # ── 可选的显存释放（默认 False = 保持原常驻行为） ──
+        if unload_after_run:
+            try:
+                gd_model["model"].to("cpu")
+                comfy.model_management.soft_empty_cache()
+                gd_model["unloaded"] = True
+                print(f"[GD Nodes] 已将 {gd_model.get('model_name')} 移回 CPU 并释放显存"
+                      f"（下次检测会自动移回 GPU）")
+            except Exception as e:
+                print(f"[GD Nodes] 卸载模型失败（忽略）: {e}")
 
         return (filtered, preview_tensor, preview_json)
 

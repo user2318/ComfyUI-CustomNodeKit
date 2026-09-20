@@ -281,7 +281,7 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                 io.Float.Input("pose_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="姿态 latent 的强度。Strength of the pose latent."),
                 io.Float.Input("pose_start", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="姿态 conditioning 的起始步。Start step of the pose conditioning."),
                 io.Float.Input("pose_end", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="姿态 conditioning 的结束步。End step of the pose conditioning."),
-                io.Combo.Input("ref_encoding_mode", options=["1+4n批量", "逐帧编码", "混合编码"], default="1+4n批量", tooltip="参考图编码模式。1+4n批量=第1张×1其余×4后一次编码（默认,更接近训练）；逐帧编码=每张图独立编码后时间维拼接（高保真）；混合编码=前N-1张1+4n批量+最后1张逐帧编码（兼顾清晰度与减轻段间跳变）。Reference encoding mode: 1+4n batch=1st×1 rest×4 then batch encode (default, closer to training); per-frame=independent encode then temporal concat (high fidelity); hybrid=first N-1 as 1+4n batch + last frame independently."),
+                io.Combo.Input("ref_encoding_mode", options=["1+4n批量", "逐帧编码", "混合编码"], default="逐帧编码", tooltip="参考图编码模式。1+4n批量=第1张×1其余×4后一次编码（默认,更接近训练）；逐帧编码=每张图独立编码后时间维拼接（高保真）；混合编码=前N-1张1+4n批量+最后1张逐帧编码（兼顾清晰度与减轻段间跳变）。Reference encoding mode: 1+4n batch=1st×1 rest×4 then batch encode (default, closer to training); per-frame=independent encode then temporal concat (high fidelity); hybrid=first N-1 as 1+4n batch + last frame independently."),
                 io.Image.Input("reference_image", optional=True, tooltip="参考图输入，多张参考图以批次形式传入 (N, H, W, 3)。每张图独立编码后作为单独的 reference_latents 添加。Reference image(s). For multiple references, pass a batch of images (N, H, W, 3). Each image is independently encoded and added as a separate reference_latents."),
                 io.Image.Input("reference_image_mask", optional=True, tooltip="仅 SCAIL-2。与 reference_image 同分辨率的彩色参考遮罩。应与 reference_image 数量匹配。SCAIL-2 only. Colored reference mask(s) at the same resolution as reference_image. Should match the reference_image count."),
                 io.ClipVisionOutput.Input("clip_vision_output", optional=True, tooltip="用于 conditioning 的 CLIP 视觉特征。模型使用拉伸缩放至宽高比进行训练。CLIP vision features for conditioning. Model is trained with stretch resize to aspect ratio."),
@@ -355,7 +355,7 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
                     ref_pixels.movedim(-1, 1), width, height, "bicubic", "center"
                 ).movedim(1, -1)
                 concat_ref_latent = vae.encode(ref_pixels[:, :, :, :3])
-                # concat_ref_latent: (1, 16, 4N-3, H/8, W/8)
+                # concat_ref_latent: (1, 16, N, H/8, W/8)  # 4N-3 像素帧经 VAE 4:1 压缩为 N latent 帧（实测，非 4N-3）
             elif ref_encoding_mode == "逐帧编码":
                 ref_latent_parts = []
                 for i in range(num_refs):
@@ -424,16 +424,6 @@ class WanSCAILToVideoMultiRef(io.ComfyNode):
             negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [concat_ref_latent]}, append=True)
 
         if clip_vision_output is not None:
-            logging.info(f"[DEBUG wan_scail_multi_ref] clip_vision_output type: {type(clip_vision_output)}")
-            if hasattr(clip_vision_output, 'penultimate_hidden_states'):
-                hs = clip_vision_output.penultimate_hidden_states
-                logging.info(f"[DEBUG wan_scail_multi_ref] penultimate_hidden_states shape: {hs.shape}, dtype: {hs.dtype}, mean={hs.mean().item():.6f}, std={hs.std().item():.6f}, min={hs.min().item():.6f}, max={hs.max().item():.6f}")
-            if hasattr(clip_vision_output, 'last_hidden_state'):
-                hs = clip_vision_output.last_hidden_state
-                logging.info(f"[DEBUG wan_scail_multi_ref] last_hidden_state shape: {hs.shape}, mean={hs.mean().item():.6f}, std={hs.std().item():.6f}")
-            if hasattr(clip_vision_output, 'image_embeds'):
-                ie = clip_vision_output.image_embeds
-                logging.info(f"[DEBUG wan_scail_multi_ref] image_embeds shape: {ie.shape}, mean={ie.mean().item():.6f}, std={ie.std().item():.6f}")
             positive = node_helpers.conditioning_set_values(positive, {"clip_vision_output": clip_vision_output})
             negative = node_helpers.conditioning_set_values(negative, {"clip_vision_output": clip_vision_output})
 

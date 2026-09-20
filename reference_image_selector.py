@@ -1,6 +1,5 @@
 import torch
 import json
-import math
 
 
 class ReferenceImageUtils:

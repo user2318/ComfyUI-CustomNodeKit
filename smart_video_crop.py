@@ -15,7 +15,6 @@ SmartVideoCrop — 基于 SAM3 追踪数据的智能视频裁剪节点。
 
 import torch
 import torch.nn.functional as F
-import numpy as np
 import logging
 from typing import Optional
 
@@ -159,45 +158,6 @@ class SmartVideoCrop:
         W = mask.shape[-1]
         return cx / W
 
-    def _crop_single(self, frames: torch.Tensor,
-                     crop_x_px: float, crop_w: float,
-                     output_width: int, output_height: int,
-                     device: torch.device) -> torch.Tensor:
-        """对单路帧进行裁剪（质心已计算好）。"""
-        B, H, W, C = frames.shape
-        output_frames = []
-        for frame_idx in range(B):
-            frame = frames[frame_idx:frame_idx + 1].to(device)
-            if crop_w >= W - 1e-6:
-                cropped = comfy.utils.common_upscale(
-                    frame.movedim(-1, 1), output_width, output_height, "bicubic", "center"
-                ).movedim(1, -1)
-            else:
-                x_start = 2.0 * crop_x_px / max(W - 1, 1) - 1.0
-                x_end = 2.0 * (crop_x_px + crop_w) / max(W - 1, 1) - 1.0
-                out_h_int = int(round(H))
-                out_w_int = int(round(crop_w))
-
-                grid_y = torch.linspace(-1.0, 1.0, out_h_int, device=device)
-                grid_x = torch.linspace(x_start, x_end, out_w_int, device=device)
-                gy, gx = torch.meshgrid(grid_y, grid_x, indexing='ij')
-                grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
-
-                sampled = F.grid_sample(
-                    frame.permute(0, 3, 1, 2).float(),
-                    grid.expand(1, -1, -1, -1),
-                    mode='bicubic', padding_mode='border', align_corners=True
-                ).permute(0, 2, 3, 1)
-
-                if out_w_int != output_width or out_h_int != output_height:
-                    cropped = comfy.utils.common_upscale(
-                        sampled.movedim(-1, 1), output_width, output_height, "bicubic", "center"
-                    ).movedim(1, -1)
-                else:
-                    cropped = sampled
-            output_frames.append(cropped.cpu())
-        return torch.cat(output_frames, dim=0)
-
     def crop(self, frames: torch.Tensor, track_data: dict,
              output_width: int = 480, output_height: int = 864,
              object_ids: str = "1", smoothing: float = 0.3,
@@ -309,39 +269,59 @@ class SmartVideoCrop:
 
         # ── 执行裁剪 ──
         def _do_crop(src_frames: torch.Tensor, params_list: list) -> torch.Tensor:
-            out_list = []
-            for idx in range(min(len(params_list), src_frames.shape[0])):
-                p = params_list[idx]
-                f = src_frames[idx:idx + 1].to(device)
-                # 如果裁剪框几乎覆盖全帧 → 直接 resize
-                if p["w"] >= W - 1e-6 and p["h"] >= H - 1e-6:
-                    cropped = comfy.utils.common_upscale(
-                        f.movedim(-1, 1), output_width, output_height, "bicubic", "center"
+            # 预分配输出后逐帧写入，避免"攒 out_list + torch.cat"的双倍峰值
+            count = min(len(params_list), src_frames.shape[0])
+            out = torch.empty((count, output_height, output_width, 3), dtype=torch.float32)
+            # 分块批处理：裁剪窗口的尺寸对所有帧相同（只有 x/y 变化），
+            # 因此可以一次 grid_sample 处理多帧，减少逐帧的 kernel 启动与同步开销。
+            # 分块大小 8：兼顾吞吐与显存（8 帧 480×864×3 ≈ 40MB/次）。
+            CROP_CHUNK = 8
+            for start in range(0, count, CROP_CHUNK):
+                end = min(start + CROP_CHUNK, count)
+                n = end - start
+                ps = params_list[start:end]
+                chunk = src_frames[start:end].to(device)   # (n, H, W, C)
+
+                # ① 裁剪框几乎覆盖全帧 → 直接批量 resize
+                idx_full = [i for i in range(n) if ps[i]["w"] >= W - 1e-6 and ps[i]["h"] >= H - 1e-6]
+                if idx_full:
+                    sub = chunk if len(idx_full) == n else chunk[idx_full]
+                    resized = comfy.utils.common_upscale(
+                        sub.movedim(-1, 1), output_width, output_height, "bicubic", "center"
                     ).movedim(1, -1)
-                else:
-                    x_start = 2.0 * p["x"] / max(W - 1, 1) - 1.0
-                    x_end = 2.0 * (p["x"] + p["w"]) / max(W - 1, 1) - 1.0
-                    y_start = 2.0 * p["y"] / max(H - 1, 1) - 1.0
-                    y_end = 2.0 * (p["y"] + p["h"]) / max(H - 1, 1) - 1.0
-                    out_h_int = int(round(p["h"]))
-                    out_w_int = int(round(p["w"]))
-                    grid_y = torch.linspace(y_start, y_end, out_h_int, device=device)
-                    grid_x = torch.linspace(x_start, x_end, out_w_int, device=device)
-                    gy, gx = torch.meshgrid(grid_y, grid_x, indexing='ij')
-                    grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
+                    for k, i in enumerate(idx_full):
+                        out[start + i] = resized[k].cpu()
+
+                # ② 需要裁剪 → 批量构造网格后一次性 grid_sample
+                idx_crop = [i for i in range(n) if not (ps[i]["w"] >= W - 1e-6 and ps[i]["h"] >= H - 1e-6)]
+                if idx_crop:
+                    sub = chunk if len(idx_crop) == n else chunk[idx_crop]
+                    out_h_int = int(round(ps[idx_crop[0]]["h"]))
+                    out_w_int = int(round(ps[idx_crop[0]]["w"]))
+                    grids = []
+                    for i in idx_crop:
+                        p = ps[i]
+                        x_start = 2.0 * p["x"] / max(W - 1, 1) - 1.0
+                        x_end = 2.0 * (p["x"] + p["w"]) / max(W - 1, 1) - 1.0
+                        y_start = 2.0 * p["y"] / max(H - 1, 1) - 1.0
+                        y_end = 2.0 * (p["y"] + p["h"]) / max(H - 1, 1) - 1.0
+                        grid_y = torch.linspace(y_start, y_end, out_h_int, device=device)
+                        grid_x = torch.linspace(x_start, x_end, out_w_int, device=device)
+                        gy, gx = torch.meshgrid(grid_y, grid_x, indexing='ij')
+                        grids.append(torch.stack([gx, gy], dim=-1))
+                    grid = torch.stack(grids, dim=0)      # (m, out_h, out_w, 2)
                     sampled = F.grid_sample(
-                        f.permute(0, 3, 1, 2).float(),
-                        grid.expand(1, -1, -1, -1),
+                        sub.permute(0, 3, 1, 2).float(),
+                        grid,
                         mode='bicubic', padding_mode='border', align_corners=True
-                    ).permute(0, 2, 3, 1)
+                    ).permute(0, 2, 3, 1)                # (m, out_h, out_w, C)
                     if out_w_int != output_width or out_h_int != output_height:
-                        cropped = comfy.utils.common_upscale(
+                        sampled = comfy.utils.common_upscale(
                             sampled.movedim(-1, 1), output_width, output_height, "bicubic", "center"
                         ).movedim(1, -1)
-                    else:
-                        cropped = sampled
-                out_list.append(cropped.cpu())
-            return torch.cat(out_list, dim=0)
+                    for k, i in enumerate(idx_crop):
+                        out[start + i] = sampled[k].cpu()
+            return out
 
         result_frames = _do_crop(frames, crop_params_per_frame)
 
@@ -385,7 +365,8 @@ class SmartVideoCrop:
             return torch.zeros(1, output_height, output_width, 3)
         B, H, W, C = frames.shape
         crop_x = max(0.0, min(crop_x, W - crop_w))
-        output_frames = []
+        # 预分配输出后逐帧写入，避免"攒 list + torch.cat"的双倍峰值
+        out = torch.empty((B, output_height, output_width, 3), dtype=torch.float32)
         for frame_idx in range(B):
             frame = frames[frame_idx:frame_idx + 1].to(device)
             x_start = 2.0 * crop_x / max(W - 1, 1) - 1.0
@@ -407,8 +388,8 @@ class SmartVideoCrop:
                 ).movedim(1, -1)
             else:
                 cropped = sampled
-            output_frames.append(cropped.cpu())
-        return torch.cat(output_frames, dim=0)
+            out[frame_idx] = cropped.cpu()
+        return out
 
 
 NODE_CLASS_MAPPINGS = {

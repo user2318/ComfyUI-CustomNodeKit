@@ -4,15 +4,94 @@ import os
 import json
 import logging
 import time
+import asyncio
+import threading
 from collections import defaultdict, OrderedDict
 from PIL import Image, ImageColor
 from server import PromptServer
 from aiohttp import web
+import comfy.model_management
 
 # 每批处理的图片数量，可根据显存大小调整
 BATCH_SIZE = 32
 CACHE_MAX_SIZE = 50  # output_cache 最多保留 50 个节点的数据
+CACHE_MAX_BYTES = 2 << 30  # output_cache 所有条目合计内存预算（2GB），超出按 LRU 淘汰
 output_cache = OrderedDict()  # OrderedDict 实现 LRU 淘汰
+
+
+def _entry_bytes(entry) -> int:
+    """估算单条缓存占用的字节数（仅统计预览帧张量）"""
+    frames = entry.get("frames")
+    if frames is None:
+        return 0
+    try:
+        return int(frames.numel()) * int(frames.element_size())
+    except Exception:
+        return 0
+
+
+def _cache_total_bytes() -> int:
+    return sum(_entry_bytes(e) for e in output_cache.values())
+
+# 前端预览取帧规则（见 js/interactive_batch_crop.js:223-240）：
+#   total <= max_preview                -> 取全部帧
+#   max_preview < total < 2*max_preview -> 弹窗自选一段连续区间（最多 2*max_preview-1 帧）
+#   total >= 2*max_preview              -> step = ceil(total / max_preview)，等距采样
+# 所以预览只需要"前端真正会请求的那几帧"，没必要把整批张量常驻内存
+# （2600 帧 @480×832 float32 整批约 12.5GB，按此规则只有 max_preview 帧量级）
+# 前端预览取帧规则（见 js/interactive_batch_crop.js:223-240）：
+#   total <= max_preview                -> 取全部帧
+#   max_preview < total < 2*max_preview -> 弹窗自选一段连续区间（最多 2*max_preview-1 帧）
+#   total >= 2*max_preview              -> step = ceil(total / max_preview)，等距采样
+# 所以预览只需要"前端真正会请求的那几帧"，没必要把整批张量常驻内存
+# （2600 帧 @480×832 float32 整批约 12.5GB，按此规则只有 max_preview 帧量级）
+PREVIEW_CACHE_MAX_BYTES = 1 << 30  # 预览缓存内存预算（1GB），按分辨率自适应换算成帧数
+
+
+def _build_preview_cache(batch, max_preview: int):
+    """按前端预览规则抽取帧子集，返回 (frames, index_map, total)
+
+    index_map 记录每个缓存帧在原批次中的真实索引，路由据此精确还原请求的帧。
+
+    常规路径（total >= 2*max_preview）采样步距与前端完全一致，因此逐帧精确命中；
+    仅当"弹窗自选区间"且整批超出内存预算时才会出现近似（回退到最接近的缓存帧）。
+    """
+    total = int(batch.shape[0])
+    if total <= 0:
+        return batch[:0], [], total
+    per_frame = max(int(batch[0].numel()) * int(batch.element_size()), 1)
+    byte_budget_frames = max(PREVIEW_CACHE_MAX_BYTES // per_frame, 1)
+    # 可缓存帧数上限：不超过"弹窗自选区间"所需（2*max_preview），也不超过字节预算
+    limit = min(max(int(max_preview) * 2, 1), byte_budget_frames)
+    if total <= limit:
+        idx = list(range(total))
+    else:
+        step = max(1, (total + int(max_preview) - 1) // int(max_preview))
+        idx = list(range(0, total, step))
+        if len(idx) > byte_budget_frames:
+            step = (total + byte_budget_frames - 1) // byte_budget_frames
+            idx = list(range(0, total, step))
+    return batch[idx].cpu(), idx, total
+
+
+def _resolve_cached_preview(cache, index: int):
+    """在预览缓存中定位请求的帧。
+
+    精确命中（常规路径）时返回真实帧；未命中时回退到最接近的已缓存帧，
+    避免返回错误框（例如用户在前端自选了采样步距之外的区间）。
+    返回 (frame, total, exact)；frame 为 None 表示索引越界。
+    """
+    total = int(cache.get("total", 0))
+    if index < 0 or index >= total:
+        return None, total, False
+    frames = cache.get("frames")
+    index_map = cache.get("index_map") or []
+    if frames is None or len(index_map) == 0:
+        return None, total, False
+    if index in index_map:
+        return frames[index_map.index(index)], total, True
+    pos = min(range(len(index_map)), key=lambda i: abs(index_map[i] - index))
+    return frames[pos], total, False
 
 # ============= 安全工具 =============
 
@@ -35,18 +114,6 @@ def _check_rate_limit(request) -> bool:
         return False
     _request_timestamps[ip].append(now)
     return True
-
-# 允许的图片格式白名单（用于格式验证）
-ALLOWED_IMAGE_FORMATS = {"PNG", "JPEG", "JPG", "WEBP", "BMP", "TIFF", "TIF"}
-
-
-def _validate_image_format(path: str) -> bool:
-    """验证文件是否为允许的图片格式"""
-    try:
-        with Image.open(path) as img:
-            return img.format is not None and img.format.upper() in ALLOWED_IMAGE_FORMATS
-    except Exception:
-        return False
 
 
 def _parse_fill_color(fill_color: str, device: torch.device):
@@ -125,8 +192,15 @@ class InteractiveBatchCrop:
             grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # 1, H, W, 2
 
         # 分批处理
-        outputs = []
-        for start in range(0, len(paths), BATCH_SIZE):
+        # 预分配输出后逐块写入，避免"攒 outputs + torch.cat"的双倍峰值
+        # 容量按路径总数分配；若因尺寸不符/损坏跳过了部分图片，末尾截断
+        # （调用方通常已按 target_size 过滤过路径，正常情况下不会明显浪费容量）
+        capacity = len(paths)
+        out_h = crop_h if has_crop else ref_h
+        out_w = crop_w if has_crop else ref_w
+        result_all = torch.empty((capacity, out_h, out_w, 3), dtype=torch.float32)
+        written = 0
+        for start in range(0, capacity, BATCH_SIZE):
             chunk_paths = paths[start:start + BATCH_SIZE]
             # 加载当前批次
             tensors = []
@@ -146,7 +220,9 @@ class InteractiveBatchCrop:
             img_batch = torch.stack(tensors, dim=0).to(device)  # B, H, W, C
 
             if not has_crop:
-                outputs.append(img_batch.cpu())
+                n_chunk = img_batch.shape[0]
+                result_all[written:written + n_chunk] = img_batch.cpu()
+                written += n_chunk
             else:
                 # 将单张网格广播到批次
                 batch_grid = grid.expand(img_batch.shape[0], -1, -1, -1)
@@ -161,11 +237,13 @@ class InteractiveBatchCrop:
                 mask = ((src_x_broadcast >= 0) & (src_x_broadcast < ref_w) &
                         (src_y_broadcast >= 0) & (src_y_broadcast < ref_h)).float().unsqueeze(-1)
                 fill_batch = fill.expand(img_batch.shape[0], crop_h, crop_w, -1)
-                result = sampled * mask + fill_batch * (1 - mask)
-                outputs.append(result.cpu())
-        if not outputs:
+                chunk_result = sampled * mask + fill_batch * (1 - mask)
+                n_chunk = chunk_result.shape[0]
+                result_all[written:written + n_chunk] = chunk_result.cpu()
+                written += n_chunk
+        if written == 0:
             raise RuntimeError("没有有效图片可处理")
-        return torch.cat(outputs, dim=0)
+        return result_all if written == capacity else result_all[:written]
 
     def process(self, crop_params="", images=None, path="", node_id="",
                 target_size="", max_preview=10):
@@ -189,7 +267,7 @@ class InteractiveBatchCrop:
                                 with Image.open(p) as im:
                                     if im.size == (w, h):
                                         image_paths.append(p)
-                            except:
+                            except Exception:
                                 pass
                 else:
                     image_paths = paths_all
@@ -206,7 +284,7 @@ class InteractiveBatchCrop:
                                 with Image.open(p) as im:
                                     if im.size == (w, h):
                                         image_paths.append(p)
-                            except:
+                            except Exception:
                                 pass
                 else:
                     image_paths = paths_all
@@ -219,27 +297,44 @@ class InteractiveBatchCrop:
         # 解析裁剪参数
         try:
             params = json.loads(crop_params) if crop_params.strip() else None
-        except:
+        except Exception:
             params = None
 
-        # 更新缓存（带 LRU 淘汰）
+        # 更新缓存（LRU：条数上限 + 全局字节预算）
         if node_id:
             # 如果已存在，先删除（后面重新插入以更新 LRU 顺序）
             if node_id in output_cache:
                 del output_cache[node_id]
-            # 超过上限则淘汰最旧的条目
-            while len(output_cache) >= CACHE_MAX_SIZE:
-                output_cache.popitem(last=False)
+
+            if source_type == "tensor":
+                # 只缓存前端预览真正会请求的帧（规则见 _build_preview_cache），
+                # 避免整批图像张量常驻内存（长序列可达数 GB，且会阻碍缓存回收）
+                preview_frames, preview_index_map, preview_total = _build_preview_cache(
+                    batch_input, max_preview
+                )
+            else:
+                preview_frames, preview_index_map, preview_total = None, [], 0
 
             entry = {
-                "batch": batch_input if source_type == "tensor" else None,
+                "frames": preview_frames,
+                "index_map": preview_index_map,
+                "total": preview_total,
                 "source_type": source_type,
                 "image_paths": image_paths if source_type != "tensor" else [],
                 "max_preview": max_preview,
             }
+            entry["bytes"] = _entry_bytes(entry)
+
+            # 淘汰最旧条目：条数超上限，或加上新条目后会超出总字节预算
+            # （单条本身超过预算时允许保留，避免全部淘汰后预览完全不可用）
+            while len(output_cache) >= CACHE_MAX_SIZE or (
+                    output_cache and _cache_total_bytes() + entry["bytes"] > CACHE_MAX_BYTES):
+                output_cache.popitem(last=False)
+
             output_cache[node_id] = entry
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 统一走 ComfyUI 的设备管理（兼容 AMD/Intel 后端与 --cpu/--novram 配置）
+        device = comfy.model_management.get_torch_device()
 
         if source_type == "tensor":
             # tensor 模式：分批处理传入的张量
@@ -266,8 +361,9 @@ class InteractiveBatchCrop:
             grid_y = (src_y / ((H - 1) / 2.0)) - 1.0
             grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # 1, H_out, W_out, 2
 
-            outputs = []
+            # 预分配输出后逐块写入，避免"攒 outputs + torch.cat"的双倍峰值
             total = batch_input.shape[0]
+            result = torch.empty((total, crop_h, crop_w, 3), dtype=torch.float32)
             for start in range(0, total, BATCH_SIZE):
                 end = min(start + BATCH_SIZE, total)
                 chunk = batch_input[start:end].to(device)
@@ -281,8 +377,7 @@ class InteractiveBatchCrop:
                         (src_y.unsqueeze(0) >= 0) & (src_y.unsqueeze(0) < H)).float().unsqueeze(-1)
                 fill_chunk = fill.expand(end-start, crop_h, crop_w, -1)
                 result_chunk = sampled * mask + fill_chunk * (1 - mask)
-                outputs.append(result_chunk.cpu())
-            result = torch.cat(outputs, dim=0)
+                result[start:end] = result_chunk.cpu()
             return (result,)
 
         else:
@@ -392,16 +487,16 @@ async def get_preview(request):
         cache = output_cache[node_id]
         if cache["source_type"] != "tensor":
             return web.json_response({"error": "Not tensor mode"}, status=400)
-        batch = cache["batch"]
-        if index < 0 or index >= batch.shape[0]:
+        frame, total, _exact = _resolve_cached_preview(cache, index)
+        if frame is None:
             return web.json_response({"error": "Index out of range"}, status=400)
         import torchvision.transforms.functional as TF
-        img_tensor = batch[index].permute(2, 0, 1)
+        img_tensor = frame.permute(2, 0, 1)
         img_pil = TF.to_pil_image(img_tensor.clamp(0, 1))
         buf = BytesIO()
         img_pil.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
-        return web.json_response({"image": f"data:image/png;base64,{b64}", "total": batch.shape[0]})
+        return web.json_response({"image": f"data:image/png;base64,{b64}", "total": total})
 
     # 文件类模式：解析路径列表
     if source == "folder":
@@ -464,39 +559,64 @@ async def get_tensor_preview(request):
     cache = output_cache[node_id]
     if cache["source_type"] != "tensor":
         return web.json_response({"error":"Not tensor mode"}, status=400)
-    batch = cache["batch"]
-    if index<0 or index>=batch.shape[0]:
+    frame, total, _exact = _resolve_cached_preview(cache, index)
+    if frame is None:
         return web.json_response({"error":"Index out of range"}, status=400)
     import torchvision.transforms.functional as TF
     from io import BytesIO
     import base64
-    img_tensor = batch[index].permute(2,0,1)
+    img_tensor = frame.permute(2,0,1)
     img_pil = TF.to_pil_image(img_tensor.clamp(0,1))
     buf = BytesIO()
     img_pil.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
-    return web.json_response({"image": f"data:image/png;base64,{b64}", "total": batch.shape[0]})
+    return web.json_response({"image": f"data:image/png;base64,{b64}", "total": total})
 
 # 文件/文件夹选择弹窗
 # 注意: 依赖 tkinter（Python 标准 GUI 库）。
 # 如果使用 ComfyUI 官方 Release 便携版，嵌入式 Python 可能缺少 tkinter。
 # 解决方案: 运行 install.py 或重启 ComfyUI 后会自动从 NuGet 下载缺失组件。
-@PromptServer.instance.routes.post("/interactive_crop/select_folder")
-async def select_folder(request):
-    """只弹窗选择单个目录（单选），不循环多选"""
-    try:
+#
+# tkinter 模态对话框是阻塞调用：直接写在 async 路由里会在弹窗期间卡住整个 aiohttp
+# 事件循环（队列/进度/其它前端请求全部无响应）。这里放到工作线程执行并加锁串行化；
+# 若运行环境要求 Tk 主线程（如 macOS），自动回退为同步调用（等同改动前行为）。
+_DIALOG_LOCK = threading.Lock()
+
+
+def _run_tk_dialog(pick_fn):
+    """在工作线程中执行 tkinter 对话框"""
+    with _DIALOG_LOCK:
         import tkinter as tk
-        from tkinter import filedialog
 
         root = tk.Tk()
         root.withdraw()
         root.attributes('-topmost', True)
         root.lift()
         root.focus_force()
+        try:
+            return pick_fn(root)
+        finally:
+            root.destroy()
 
-        dir_path = filedialog.askdirectory(title="选择图片文件夹")
-        root.destroy()
 
+async def _exec_dialog(pick_fn):
+    """异步执行对话框：优先线程池，失败回退同步"""
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _run_tk_dialog, pick_fn)
+    except Exception:
+        return _run_tk_dialog(pick_fn)
+
+
+@PromptServer.instance.routes.post("/interactive_crop/select_folder")
+async def select_folder(request):
+    """只弹窗选择单个目录（单选），不循环多选"""
+    try:
+        def pick(root):
+            from tkinter import filedialog
+            return filedialog.askdirectory(title="选择图片文件夹")
+
+        dir_path = await _exec_dialog(pick)
         return web.json_response({"path": dir_path if dir_path else ""})
     except ImportError:
         return web.json_response({
@@ -509,13 +629,11 @@ async def select_folder(request):
 @PromptServer.instance.routes.post("/interactive_crop/select_files")
 async def select_files(request):
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        file_paths = filedialog.askopenfilenames(title="选择图片文件（可多选）")
-        root.destroy()
+        def pick(root):
+            from tkinter import filedialog
+            return filedialog.askopenfilenames(title="选择图片文件（可多选）")
+
+        file_paths = await _exec_dialog(pick)
         if not file_paths:
             return web.json_response({"paths": ""})
         paths_str = "|".join(file_paths)

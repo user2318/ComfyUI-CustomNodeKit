@@ -2,7 +2,9 @@
 
 A set of custom nodes for ComfyUI, covering video generation, pose processing, interactive image operations, and common workflow utilities.
 
-Current version: **1.7.1** — Merged batch image operation nodes (BatchImageReplace + BatchFrameReplicate moved into merged_nodes.py), new standalone two-phase sampling node (WanSCAIL2PhaseSampler), IntegerSettingNode frontend refactoring with alignment optimization, SCAIL-2 workflow full rewrite, color drift correction V4.1 fixes and enhancements.
+Current version: **1.8.0** — Added the WanAnimate2ToVideoCustom node (Wan2.1-I2V base + second-gen pose branch K/V injection, multi-reference image support); reworked WanUni3CApply to accept render_video with built-in VAE encoding and reference-frame offset (fixing the render_latent normalization bias); removed the retired WanSCAILSparseAttention node (its dense O(S²) attention masks blew up memory on long sequences and gave no measurable benefit on SCAIL); plus one **experimental / test-only node, Context Window Anchor** — its effectiveness and side effects have not been fully validated, so it is kept for testing reference only; if it is not wired into a workflow, existing behaviour is unchanged (see [Context Window Anchor](#context-window-anchor)).
+
+This release also fixes a crash in the SDPose yaw nodes on short segments, the BatchImageReplace `repeat_end` padding logic (3 replacement images for 4 slots: `0,2,2,2` → `0,1,2,2`), and brings memory/performance improvements to SmartVideoCrop and InteractiveBatchCrop (the latter's preview cache drops from ~12.5GB to ~48MB for 2600 frames). **Please read the [Changelog](#changelog) at the end before upgrading** — it lists the breaking changes.
 
 ## Table of Contents
 
@@ -17,8 +19,10 @@ Current version: **1.7.1** — Merged batch image operation nodes (BatchImageRep
   - [Image Batch Tools](#image-batch-tools)
   - [Context Tools](#context-tools)
 - [Complex Node Details](#complex-node-details)
+  - [WanAnimate2ToVideoCustom](#wananimate2tovideocustom)
   - [WanAnimateToVideoCustom](#wananimatetovideocustom)
   - [Custom Context Windows (Manual)](#custom-context-windows-manual)
+  - [Context Window Anchor](#context-window-anchor)
   - [Reference Image Selector](#reference-image-selector)
   - [SDPose Empty Frame Repair](#sdpose-empty-frame-repair)
   - [SDPoseDrawKeypointsV2 Foot Mode](#sdposedrawkeypointsv2-foot-mode)
@@ -26,11 +30,15 @@ Current version: **1.7.1** — Merged batch image operation nodes (BatchImageRep
   - [Image Batch Concat](#image-batch-concat)
   - [Image Batch Resize](#image-batch-resize)
   - [WanAnimate Uni3C Camera Control](#wananimate-uni3c-camera-control)
-- [Dependencies](#dependencies)
+  - [SmartVideoCrop](#smartvideocrop)
+  - [VideoGridCompose](#videogridcompose)
+  - [BatchImageReplace](#batchimagereplace)
 - [Workflows](#workflows)
   - [Long Video Pose Detection Workflow](#long-video-pose-detection-workflow)
   - [WanAnimate Multi-Ref Long Video Workflow](#wananimate-multi-ref-long-video-workflow)
   - [WanSCAIL2 Multi-Ref Long Video Workflow](#wanscail2-multi-ref-long-video-workflow)
+- [Changelog](#changelog)
+- [Dependencies](#dependencies)
 - [Usage Examples](#usage-examples)
 - [License](#license)
 
@@ -67,6 +75,7 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 | Node | Category | Description |
 |------|----------|-------------|
 | **WanAnimateToVideoCustom** | `WanLoop/Complete` | Core WanAnimate video generation node. Supports pose/face control, tail-frame segmented masking, neutral gray blending, context mode, prev_latent continuation, and full parameter set |
+| **WanAnimate2ToVideoCustom** | `WanLoop/Complete` | WanAnimate2 (official second-gen architecture) video generation core node. Retains first-gen multi-reference images (frame-by-frame independent encoding) with fix/legacy/vanilla mask handling, neutral gray blending and yaw angle output; adds official second-gen pose_strength / pose_start_percent / pose_end_percent / reference_image_strength / positive_pose / clip_vision_output_pose. Adapted for second-gen pose branch frame-count validation (reference latent frames padded in front for multi-ref scenarios) |
 | **Single Frame VAE Encode** | `WanLoop/Tools` | Encodes N images frame-by-frame independently with VAE and concatenates in temporal dimension to produce latent. Provides anchor latents for projects like ComfyUI-EverAnimate |
 | **WanUni3CLoader** | `WanVideo/Control` | Loads Uni3C ControlNet model with fp32/bf16/fp16 precision options (optional) |
 | **WanUni3CApply** | `WanVideo/Control` | Injects Uni3C camera control into KSampler. Supports strength/start_percent/end_percent parameters (optional) |
@@ -77,10 +86,9 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 |------|----------|-------------|
 | **Wan SCAIL To Video (Multi Ref)** | `model/conditioning/video_models` | SCAIL/SCAIL-2 multi-reference image video generation conditioning node. Supports auto-encoding multiple reference images, SCAIL-2 multi-identity colored mask injection, pose video guidance, motion continuation (prev_latent), etc. |
 | **Create SCAIL-2 Colored Mask (Multi Ref)** | `conditioning/video_models/scail` | Renders SAM3 tracking data into SCAIL-2 colored masks. Supports shared palette sorting (left_to_right/area) for reference images and driving video, ensuring consistent identity coloring across multi-person scenes |
-| **WanSparseAttention** | `model/conditioning/video_models/scail` | SCAIL sparse attention & causal attention node. Uses attention masks to limit interactions between pose/ref/main tokens, reducing degeneration in long video generation. Supports multiple attention mask strategies: no mask, pose-disabled-from-main, causal-only, pose-disabled-from-main+causal, etc. |
 | **Wan SCAIL-2 Phase Sampler** | `sampling` | Standalone two-phase sampling node. Faithfully replicates the two-phase sampling core logic from SCAIL2LoopSampler. Uses pixel frames (IMAGE) as anchor input, internally performs VAE encoding, anchor frame write-back, and noise_mask management |
 | **CLIP Vision Multi-Ref Switch** | `conditioning/video_models/scail` | Multi-image CLIP feature concatenation node. Concatenates batch CLIP vision features in token dimension, enabling all reference images to contribute to conditioning |
-| **Auto Color Drift Correction V4.1** | `CustomNodes/Video` | Self-aligned color drift correction node V4.1. Three-layer correction: ① intra-segment drift detection (auto mode identifies jumps, bypasses if no drift); ② seam alignment eliminates inter-segment jumps; ③ bump correction for intra-segment oscillation + adaptive EMA template learning. V4.1 fixes auto mode jump detection frame index, seam alignment calculation, and seam_strength parameter ignoring issues |
+| **Auto Color Drift Correction V4.3** | `CustomNodes/Video` | Self-aligned color drift correction node V4.3. Two-pass correction: ① global offset — multi-frame mean detects segment jumps and corrects all new frames uniformly; ② residual fine-tuning — each frame moves toward the reference within a clamped limit. Supports standard/auto/off modes; `max_offset` caps the per-channel offset |
 
 ### SDPose Pose System
 
@@ -105,6 +113,8 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 |------|----------|-------------|
 | **VideoFrameCounter** | `video` | Gets frame count statistics and frame rate from input video/image sequences |
 | **ImageSequenceToVideo** | `video` | Assembles image sequences into video files using ffmpeg. Supports CRF, audio synthesis, frame offset, etc. |
+| **SmartVideoCrop** | `video` | Smart video crop driven by SAM3 tracking data: keeps the full height, computes each frame's person centroid, and pans horizontally with EMA smoothing + scene-cut detection before scaling to the target aspect. Supports multiple tracked IDs, empty-mask fallback (hold last position / go to center) and optional synchronized cropping of a second image channel |
+| **VideoGridCompose** | `video` | Composes 1–4 videos/images into a grid (horizontal / vertical / 2×2 quad / one-left-N-right / one-top-N-bottom). Supports stretch-or-fit scaling, duration alignment (trim longer clips, freeze-pad shorter ones) and audio source selection. Fully streamed through ffmpeg, so no frames are loaded into memory |
 
 ### Interactive Tools
 
@@ -136,12 +146,17 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 
 | Node | Category | Description |
 |------|----------|-------------|
-| **Custom Context Windows (Manual)** | `context` | Universal context window scheduling node. Splits long sequences into sliding windows for piecewise processing. Supports reference frame prefix, noise shuffling, multiple scheduling strategies (uniform/static/cyclic/batched), and fusion modes (pyramid/linear/relative). New `causal_window_fix` feature preserves cross-window interaction details (e.g., footprints) |
-| **Wan SCAIL-2 Context Windows** | `context` | SCAIL-2 dedicated context window node. Automatically handles SCAIL-2 specific conditioning fields (ref_mask_28ch, driving_mask_28ch, pose_video_latent). No prefix reference frames or causal_window_fix needed. Works with WanSCAILToVideoMultiRef |
+| **Custom Context Windows (Manual)** | `context` | Universal context window scheduling node. Splits long sequences into sliding windows for piecewise processing. Supports reference frame prefix, noise shuffling, multiple scheduling strategies (uniform/static/cyclic/batched), and fusion modes (pyramid/linear/relative) |
+| **Wan SCAIL-2 Context Windows** | `context` | SCAIL-2 dedicated context window node. Automatically handles SCAIL-2 specific conditioning fields (ref_mask_28ch, driving_mask_28ch, pose_video_latent). No prefix reference frames needed. Works with WanSCAILToVideoMultiRef |
+| **Context Window Anchor** | `context` | [Experimental / test-only] Cross-window alignment anchor for context-window sampling (**effectiveness and side effects not fully validated; testing reference only**). Replaces the leading driving-video latent frame(s) of every window (animate2: pose_latents; SCAIL-2: pose_latents + driving mask sam_latents) with window 0's frame of the current segment, so all windows share one alignment reference, easing scale/position jumps at window seams. Must be placed after a context windows node |
 
 ---
 
 ## Complex Node Details
+
+### WanAnimate2ToVideoCustom
+
+A second-gen animate node that fuses the official `WanAnimate2ToVideo` (Wan2.1-I2V base + pose branch K/V injection) with the first-gen `WanAnimateToVideoCustom`. It retains first-gen multi-reference image support (frame-by-frame independent encoding, compatible with EverAnimate LoRA; the original 1+4n batch encoding mode was removed because it performed poorly on animate2), fix/legacy/vanilla mask handling, black-frame detection + transition, tail-frame segmented masking, neutral gray blending, and yaw_angles→latent_yaw_angles output. On top of that it adds the official second-gen `pose_strength` / `pose_start_percent` / `pose_end_percent` (pose time window; skipping the pose branch outside the window speeds up sampling) / `reference_image_strength` / `positive_pose` / `clip_vision_output_pose`. The pose branch follows the second-gen model's frame-count validation requirement (`pose_latents.shape[2] == f_gen - 1`) by padding latent frames in front, so multi-reference scenarios can be used directly. face/background/character_mask/prev_latent are removed since the second-gen architecture does not support them.
 
 ### WanAnimateToVideoCustom
 
@@ -236,7 +251,6 @@ A context window scheduling node for WAN-type video generation models. When vide
 | `freenoise` | BOOLEAN | Enable FreeNoise noise shuffling (improves inter-window continuity) |
 | `prefix_latent_num` | INT | Number of prefix reference frame latents. Set to match the count of images from reference image selector's raw_reference_images. These frames are prepended to each window as stable references |
 | `split_conds_to_windows` | BOOLEAN | Whether to assign multiple conditionings to windows by region index |
-| `causal_window_fix` | BOOLEAN | Causal window fix (default True). When enabled, prepends the previous window's denoised last frame to each window, preserving details like footprints. Sacrifices parallelism (windows execute serially per denoise step) |
 
 #### Scheduling Strategies (context_schedule)
 
@@ -261,7 +275,6 @@ A context window scheduling node for WAN-type video generation models. When vide
 1. **Frame conversion**: `context_length` and `context_overlap` are input in pixel frames; the node auto-converts to latent frames (every 4 pixel frames → 1 latent frame).
 2. **Prefix reference frames**: When `prefix_latent_num > 0`, that many reference latents are prepended to each window as stable references, suitable for tasks requiring global context.
 3. **freenoise**: Enable this to shuffle noise for improved texture continuity across windows. Recommended for long sequences with small overlaps.
-4. **causal_window_fix**: When enabled, prepends the previous window's denoised last frame as an anchor to each window, effectively preserving cross-window continuity details. Note this forces serial execution, reducing parallelism.
 
 #### Typical Workflow
 
@@ -272,6 +285,92 @@ A context window scheduling node for WAN-type video generation models. When vide
                         ↓
                 model (wrapped) → [KSampler] → [VAE Decode] → Output
 ```
+
+---
+
+### Context Window Anchor
+> ⚠️ **Experimental / test-only node (not fully validated)**: this node is kept in the repository **for testing and reference only**. Neither its **effectiveness** (whether it really eases the scale/position jumps at the window seams) nor its **side effects** (impact on image quality, identity consistency, motion naturalness, sampling stability, etc.) **has been fully tested or validated**, and it is not guaranteed to be safe across different models / LoRAs / parameter combinations.
+> Always A/B it locally with the **same seed** (see [Experiment tips](#experiment-tips)) before relying on it, and do not depend on it in production workflows. When the node is not wired into a workflow, its code path never runs and existing node behaviour is unchanged.
+
+
+[Experimental] **Problem it addresses**: for animate2 / SCAIL-2 the body-proportion and spatial alignment between the reference image and the driving video is derived by the model **per window**. With context-window sampling each window only carries its own driving-video frames, so every window starts from a different pose → each window ends up with a different alignment reference → visible scale/position jumps at the window seams.
+
+**What this node does**: it replaces the leading K latent frame(s) of the driving video in every window w>0 with window 0's frames **of the current segment** (i.e. the segment's first driving frame), so all windows align to one reference; for SCAIL-2 the driving mask (`sam_latents`) is anchored as well.
+
+#### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model` | MODEL | — | Model already wrapped by a context windows node (required): the model output of `Custom Context Windows (Manual)` or `Wan SCAIL-2 Context Windows` |
+| `enabled` | BOOLEAN | true | When off the model is passed through unchanged |
+| `anchor_targets` | COMBO | Driving video + mask (auto) | What to anchor (dropdown): `驱动视频 + 驱动遮罩 (auto)` / `仅驱动视频 (pose only)` / `仅驱动遮罩 (mask only)`. Driving video = the pose branch (`pose_latents` for animate2 and SCAIL-2); driving mask = SCAIL-2's `driving_mask` (`sam_latents`) |
+| `anchor_frames` | INT | 1 | Number of leading latent frames anchored per window; 0 disables |
+| `anchor_offset` | INT | -1 (auto) | Slice start offset. `-1` = auto: skip the prefix-derived frames at the slice head (`max(0, prefix_frames - 1)`) so anchoring starts at the window's own first driving frame; set `0/1/…` to override for experiments |
+| `blend` | FLOAT | 1.0 | 1.0 fully replaces with window 0's frame; below 1.0 linearly blends with the window's own frame (helps when the pose jump-back causes jitter) |
+| `apply_to_negative` | BOOLEAN | true | Also anchor the negative conditioning under CFG (both sides receive the same driving condition, so results stay consistent and CFG is not skewed) |
+| `log_debug` | BOOLEAN | false | Logs per-window hits, shapes and first-frame stats for verification |
+| `anchor_steps` | INT | -1 (all steps) | Anchor only during the first N sampling steps: `-1` = all steps (default), `0` = never, `N>0` = first N steps. **Time gating**: every step gets a real signal (anchor or segment), unlike `blend` (amplitude mixing, which feeds a synthetic intermediate) |
+| `global_pose_frames` | IMAGE | unconnected | *Optional* head frames of the driving/pose video (as many as you feed): encoded to latents and used to replace the first M frames of the anchor band (`M=((T-1)//4)+1`). More frames than needed = full replacement; fewer = partial; unconnected = per-segment anchor only |
+| `global_mask_frames` | IMAGE | unconnected | *Optional (SCAIL-2)* head frames of the colored mask video, encoded via `_extract_mask_to_28ch` and used to replace the first M frames of the mask anchor (not used by animate2) |
+| `vae` | VAE | unconnected | *Optional* VAE used only to encode `global_pose_frames` (the mask pool needs no VAE) |
+
+#### How it works / boundaries
+
+- **Layer**: conditioning level — post-processing right after each window's conds are re-sliced, so it applies on **every sampling step**; the x/latent layer is untouched, so fusion weights, overlap and FreeNoise behave exactly as before.
+- **Anchor position**: the context node prepends the prefix indices (chunk frames `0..P-1`) to every window's `index_list`, and the driving-video / driving-mask slices are built from that same `index_list` → every window's slice head carries `P-1` extra "**prefix-derived frames**" (zero-padded frames with multiple references; the chunk's opening driving frames with a single reference), identical across all windows → anchoring those frames leaves the values unchanged, so `anchor_offset` skips them automatically:
+  - prefix `P = 0` or `1` → offset `0` (same as the earliest version's behaviour);
+  - prefix `P = 6` (6 reference images) → offset `5` (the anchor lands on the window body's first driving frame).
+- **Per chunk, never cross-chunk**: the anchor source is always window 0 of the current segment; the snapshot is refreshed at window 0 of every sampling step.
+- **Values only, never lengths**: the animate2 check `pose_latents.shape[2] == f_gen - 1` is unaffected.
+- **Windowed tensors only**: it targets the given keys inside `model_conds`; tensors longer than the window (for example SCAIL's `ref_mask_latents`, which holds "reference frames + window frames") are skipped automatically.
+- **Implementation**: the handler instance in `model_options["context_handler"]` is shallow-copied and its `get_resized_cond` / `execute` are wrapped; the handler class is not modified and neither context windows node is touched.
+
+#### Wiring
+
+```
+[Load Model] → Custom Context Windows (Manual) → Context Window Anchor → [KSampler] → [VAE Decode] → Output
+[Load Model] → Wan SCAIL-2 Context Windows    → Context Window Anchor → [KSampler] → [VAE Decode] → Output
+```
+
+> If it is not placed after a context windows node, the node logs a warning and passes the model through (the workflow keeps running).
+
+#### Hybrid anchoring (global head + segment anchor, optional)
+
+By default the anchor source is "window 0 of the current segment". If you connect `global_pose_frames` (and, for SCAIL-2, `global_mask_frames`), the first M frames of the anchor band are taken from the "global" material instead:
+
+```
+hybrid = [first M frames of the global pool] + [remaining K-M frames of the segment anchor]
+M = ((T-1)//4)+1        # T = number of pixel frames you feed
+```
+
+- **Feed as many as you want** (no "how many frames" parameter): more frames than the band needs → only the first K are used (**full replacement**); fewer → **partial replacement**; nothing connected → **per-segment anchor** (identical to the previous behaviour);
+- **Resolution is matched automatically** from the sampling-time latent size (`latent×8`), so no width/height wiring is required;
+- **Masks are hard-replaced**: `sam_latents` carries spatial/identity information (8×8 color coverage × color channels); this version forces a hard replacement (even when `blend<1`) because linearly mixing two frames' patterns produces a boundary that matches neither frame (implementation choice, can be revisited);
+- **Window 0 is not replaced** (it is the anchor source), so the segment's first window keeps its original driving condition;
+- The node's **output is unchanged** (a single `model`); the three new sockets are optional and appended last, so existing workflows keep their widget values.
+
+Wiring example (using nodes you already have):
+
+```
+[full driving/pose video] -- ImageFromBatch(start=0, length=5) --> global_pose_frames
+[full colored mask video] -- ImageFromBatch(start=0, length=5) --> global_mask_frames   (SCAIL-2)
+[same Wan VAE] ------------------------------------------------> vae
+```
+> ⚠️ Take these frames from the **full video** (before the loop), not from the per-chunk cropped video inside the loop; otherwise "the first frames" just become the current segment's head and nothing changes.
+
+#### Experiment tips
+
+> Method note: keep the **same seed and the same chunk, and change only one variable per run**; a single run is easily affected by sampling randomness, so repeat each setting at least twice before comparing.
+
+1. Run once with `log_debug=true` and confirm the log shows both "record anchor source (window 0)" and the anchor lines for later windows (and whether the first-frame values differ).
+2. A/B the same seed and settings with and without the node, watching scale/position at the window seams.
+3. If the anchor causes pose jump-back jitter, keep `anchor_frames=1` and soften with `blend` (e.g. 0.5–0.8).
+4. For SCAIL-2 you can cycle `anchor_targets` through "pose only / mask only / both" to isolate the dominant factor.
+5. This feature does **not** address drift between chunks; it only aligns windows inside one segment.
+6. **Amplitude blending vs time gating**: two different trade-offs —
+   - `blend<1`: every step receives a **synthetic condition** ("anchor × α + segment × (1−α)"), which may correspond to a pose/boundary that does not really exist;
+   - `anchor_steps=N`: only the first N steps are anchored, then the real condition is restored (every step gets a real signal; switching conditions by sampling progress is the same kind of usage as the official `pose_start_percent` / `pose_end_percent`).
+   Suggested comparison: `blend=1.0 + anchor_steps=1~2` (gating) vs `blend=0.7 + anchor_steps=-1` (soft mixing).
 
 ---
 
@@ -485,34 +584,115 @@ Injects Uni3C camera control signals into KSampler. The node monkey-patches the 
 |-----------|------|----------|-------------|
 | `model` | MODEL | ✅ | Model to inject control into |
 | `uni3c_controlnet` | UNI3C_CONTROLNET | ✅ | ControlNet model loaded by WanUni3CLoader |
-| `render_latent` | LATENT | ✅ | Pre-rendered reference video latent tensor (B, C, T, H, W) as visual reference for camera control |
+| `render_video` | IMAGE | ✅ | Guidance video rendered from the camera trajectory (pixel frames); encoded internally by the node's VAE as visual reference for camera control |
+| `vae` | VAE | ✅ | VAE used to encode render_video |
 | `strength` | FLOAT | ✅ | Control strength (0.0-10.0, default 1.0) |
 | `start_percent` | FLOAT | ✅ | Control activation start percentage (0.0-1.0, default 0.0) |
 | `end_percent` | FLOAT | ✅ | Control activation end percentage (0.0-1.0, default 1.0) |
-| `render_mask` | MASK | ❌ | Optional render mask (experimental) |
 | `trim_latent` | INT | ❌ | Number of reference latent frames, connected from WanAnimateToVideoCustom's trim_latent output for temporal alignment |
-| `positive` | CONDITIONING | ❌ | Optional: pass conditioning to auto-extract concat_latent_image, replacing WanAnimateChannelPack node |
-| `negative` | CONDITIONING | ❌ | Same as above, negative condition |
 
 **Output**: `model` (MODEL) — Control-injected model, ready for direct connection to KSampler.
 
 #### Core Principles
 
 1. **v4 Architecture**: Uses monkey-patch to modify the model's `forward_orig` method, precisely controlling injection timing within the block loop
-2. **Temporal Alignment**: Uses the `trim_latent` parameter to auto-align render_latent with the generated video's temporal offset
-3. **Async Prefetch**: Control signals use CPU→GPU async prefetch, overlapping with block computation to minimize performance overhead
+2. **Reference Offset**: Injection skips reference-frame tokens (same `img_offset` semantics as the official node), preventing reference-frame pollution and control-signal misalignment; supports WanAnimate concat / ref_conv / SCAIL / context-window scenarios
+3. **Latent Normalization**: render_video is VAE-encoded internally then normalized via `latent_format.process_in`, matching the already-normalized x scale during sampling, avoiding the control signal biasing toward render content
 4. **Step Control**: Uses `start_percent` / `end_percent` to control the activation range of control signals during the denoising process
 
 #### Typical Workflow
 
 ```
 [WanUni3CLoader] → uni3c_controlnet ─┐
-[Rendered latent] → render_latent ────┤
+[Guidance video] → render_video ────────┤
+[VAE] → vae ────────────────────────┤
                                         ↓
 [Model] → WanUni3CApply → model (injected) → [KSampler] → [VAE Decode] → Output
 ```
 
-> **Note**: The WanUni3CApply node has built-in WanAnimateChannelPack logic. If `positive`/`negative` conditioning is provided, it automatically extracts `concat_latent_image` from them — no separate WanAnimateChannelPack node needed.
+> **Note**: Older versions exposed `positive`/`negative` conditioning inputs and `render_mask`; they were no-ops (keys written but never read) and have been removed in v4.
+
+---
+
+### SmartVideoCrop
+
+Smart video cropping driven by SAM3 tracking data: the node keeps the **full frame height**, computes each frame's person centroid, pans the crop window horizontally (EMA smoothing + scene-cut detection), then scales the result to the requested output size.
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `frames` | IMAGE | Source frames of the current chunk (B, H, W, C) |
+| `track_data` | SAM3_TRACK_DATA | Tracking data from SAM3_VideoTrack (connect to `driving_track_data`) |
+| `output_width` / `output_height` | INT | Output size; the crop width is derived as `H × output_width / output_height` |
+| `object_ids` | STRING | Comma-separated person IDs to track (e.g. `1` or `1,2`); empty = default ID 1 |
+| `smoothing` | FLOAT | Inter-frame EMA smoothing (0 = follow exactly, jittery; 1 = almost static) |
+| `mask_fallback` | enum | Behaviour when the mask is empty: `hold_last` keeps the last valid position / `center` falls back to the frame center |
+| `scene_cut_threshold` | FLOAT | Scene-cut detection threshold (normalized): a centroid jump larger than this between consecutive masked frames resets the smoothing; 0 = disabled |
+| `fallback_center` | FLOAT | Horizontal fallback ratio used by `mask_fallback=center` (0=left, 0.5=center, 1=right) |
+| `mask_frames` | IMAGE | Optional second image channel (e.g. a mask video) cropped with the very same window and output in sync |
+
+#### Outputs
+
+- `cropped_frames`: cropped and rescaled frame batch
+- `cropped_mask`: synchronized crop of the second channel (empty batch when not connected)
+- `debug_info`: JSON with per-frame crop positions
+
+> When the input is narrower than the target it automatically switches to "vertical center crop" (full width, height derived from the aspect ratio), so no content is cut off.
+> Cropping runs in **8-frame batches** internally: faster on long sequences while producing bit-identical results to the per-frame implementation.
+
+---
+
+### VideoGridCompose
+
+Composes 1–4 videos/images into a single grid video. Everything is **streamed through ffmpeg**, so no frames are ever loaded into memory — safe for long videos.
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `video_paths` | STRING | Multi-line list, one path per line (up to 4, duplicates/empty lines removed). If a line points to an **image**, it is turned into a static video stream with `-loop 1 -t <target duration>` |
+| `layout` | enum | Horizontal / Vertical / 2×2 quad (needs 4 inputs) / One-left-N-right / One-top-N-bottom (both need ≥3 inputs); falls back to horizontal when there are not enough inputs |
+| `audio_source` | enum | None, or the audio track of input 1–4 |
+| `match_method` | enum | Stretch to fill / Keep aspect ratio (equal scale + black bars) / Uniform to max / Uniform to min |
+| `fps` | FLOAT | Output frame rate; 0 = use the highest input frame rate |
+| `crf` | INT | x264 quality (lower is better, 18–28 recommended) |
+| `duration_mode` | enum | Duration reference: auto (shortest) / auto (longest) / video 1–4. Longer clips are trimmed and shorter ones are freeze-padded; audio is aligned with atrim/apad |
+| `output_path_prefix` | STRING | Output path prefix, relative to ComfyUI's output directory |
+
+Returns `video_path` (STRING); the file is written to `ComfyUI/output/<output_path_prefix>_0001.mp4` (auto-incremented to avoid overwriting).
+
+---
+
+### BatchImageReplace
+
+Replaces a contiguous run of frames in the main batch, starting at `start_index` for `replace_count` frames. The replacement source (`replace_images`) may differ in length from the requirement; two modes decide what happens.
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `start_index` | INT | Position in the main batch where replacement starts (0-based) |
+| `replace_count` | INT | How many frames to replace; `-1` = replace from start_index to the end; `0` = no replacement (pass through) |
+| `overflow_mode` | enum | When the source has **more** frames than needed: `take_front` keeps the first N / `take_back` keeps the last N |
+| `underflow_mode` | enum | When the source has **fewer** frames than needed: `as_is` replaces only as many as the source actually has / `repeat_begin` pads the front with the first image / `repeat_end` keeps all in original order and pads the end with the last image |
+| `images` | IMAGE | Main image batch (empty output when not connected) |
+| `replace_images` | IMAGE | Replacement source (main batch is passed through when not connected) |
+
+#### underflow semantics (3 source images, 4 frames to replace)
+
+| Mode | Replacement result |
+|------|--------------------|
+| `as_is` | Only 3 frames are replaced (the 4th keeps its original content) |
+| `repeat_begin` | `0,0,1,2` (first image repeated at the front) |
+| `repeat_end` | `0,1,2,2` (all kept in order, last image repeated at the end) |
+
+> `repeat_end` was fixed in v1.8.0: the previous implementation dropped the middle frames and produced `0,2,2,2`.
+
+#### Notes
+
+- Replacement images are automatically resized to the main batch's resolution when they differ
+- `start_index` beyond the batch length prints a warning and returns the main batch unchanged
 
 ---
 
@@ -614,6 +794,41 @@ The `workflow/` directory contains complete ComfyUI workflow JSON files that can
 5. Connect colored masks and driving video to `Wan SCAIL To Video (Multi Ref)`
 6. Run to generate video frames segment-by-segment with context window support
 7. Compile frame sequences into video after generation
+
+---
+
+## Changelog
+
+### v1.8.0
+
+**Added**
+- `WanAnimate2ToVideoCustom`: WanAnimate2 (official second-gen architecture) video generation node
+- `Context Window Anchor` (**experimental / test-only — effectiveness and side effects not fully validated**): a cross-window alignment anchor for context-window sampling. It replaces the leading driving-video latent frame(s) of every window (animate2: `pose_latents`; SCAIL-2: `pose_latents` + driving mask `sam_latents`) with window 0's frame of the current segment, so all windows align to one reference and the scale/position jumps at window seams are eased. Applies on every sampling step, never cross-chunk, values only (no length changes); must be placed after a context windows node.
+  - Defaults: `anchor_targets=driving video + mask (auto)`, `anchor_frames=1`, `anchor_offset=-1` (auto-skip prefix-derived frames), `blend=1.0`, `apply_to_negative=true`, `log_debug=false`; both the target and the offset are plain dropdown/integer widgets (no "key:dim" text entry).
+  - **Not fully validated**: effectiveness depends on whether the model derives its alignment from the window first driving frame, and side effects (image quality / identity consistency / sampling stability) have not been systematically evaluated. Always A/B it (see Experiment tips) before relying on it, and do not depend on it in production workflows.
+
+**Removed**
+- `WanSCAILSparseAttention`: it required dense O(S²) attention masks (TB-scale at 2600 frames) which blew up memory, and showed no measurable benefit on SCAIL. Workflows still referencing it will report a missing node — just delete that node
+
+**Fixed**
+- `SDPoseEstimateYawSimple` / `SDPoseEstimateYawAdvanced`: crashed with `IndexError` on short segments / multi-shot footage when the grouping was empty (now falls back to global reference values)
+- `BatchImageReplace`: corrected the `repeat_end` padding logic (3 images for 4 slots: `0,2,2,2` → `0,1,2,2`); no more `TypeError` when `images` is not connected
+- `ImageSequenceToVideo`: the ffconcat list and audio temp files are now cleaned up on failure/exception paths as well
+
+**Improvements**
+- `InteractiveBatchCrop`: the preview cache now only stores the frames the front end actually requests — ~12.5GB → ~48MB for 2600 frames — with a 2GB total budget; outputs are pre-allocated
+- `SmartVideoCrop`: cropping now runs in 8-frame batches (faster on long sequences, identical values)
+- `MaskCompositeRef` / `BatchImageReplace` / `ImageBatchResize` and others: per-frame append+concat replaced with pre-allocated outputs (peak memory roughly halved)
+- `VideoGridCompose` / `VideoFrameCounter` / `ImageSequenceToVideo`: ffmpeg probing per file reduced from 2 calls to 1
+- `GD_BBoxDetect`: new `unload_after_run` switch (off by default = stay resident) that moves the model back to CPU after detection when enabled
+- File/folder picker dialogs now run in a worker thread, so they no longer block ComfyUI's event loop
+
+**⚠️ Breaking changes**
+
+1. `WanUni3CApply`: input changed from `render_latent`(LATENT) to `render_video`(IMAGE) + `vae`; `WanUni3CLoader` now reads models from `models/model_patches` instead of `models/controlnet`
+2. `WanSCAILToVideoMultiRef`: `ref_encoding_mode` now defaults to `逐帧编码` (per-frame encoding, higher fidelity); switch back to `1+4n批量` manually if you need the old behaviour
+3. `Custom Context Windows (Manual)` / `Wan SCAIL-2 Context Windows`: the `causal_window_fix` parameters and logic have been removed
+4. The `WanSCAILSparseAttention` node has been removed
 
 ---
 

@@ -79,12 +79,13 @@ class MaskCompositeRef:
         return black.float().mean().item() >= ratio
 
     def _resize_to(self, img_tensor, target_h, target_w):
-        """将单帧 [H, W, C] 缩放到目标尺寸"""
+        """将单帧 [H, W, C] 缩放到目标尺寸（dtype 保持 float32，设备跟随输入）"""
+        device = img_tensor.device
         img_np = (img_tensor.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
         pil = Image.fromarray(img_np)
         pil_resized = pil.resize((target_w, target_h), Image.Resampling.LANCZOS)
         img_np = np.array(pil_resized).astype(np.float32) / 255.0
-        return torch.from_numpy(img_np)
+        return torch.from_numpy(img_np).to(device)
 
     def _warn(self, msg):
         """统一打印带节点标识的警告信息"""
@@ -110,7 +111,8 @@ class MaskCompositeRef:
         # masks 未连接 → 透传原图 + 全黑遮罩
         if masks is None:
             h, w = images[0].shape[0], images[0].shape[1]
-            zeros = torch.zeros((batch_n, h, w, 3), dtype=torch.float32)
+            zeros = torch.zeros((batch_n, h, w, 3), dtype=torch.promote_types(images.dtype, torch.float32),
+                                device=images.device)
             return (images.clone(), zeros)
 
         mask_n = masks.shape[0]
@@ -135,10 +137,12 @@ class MaskCompositeRef:
                 valid_indices.append(i)
 
         if len(valid_indices) == 0:
-            # 所有帧都被剔除 → 返回空批次
+            # 所有帧都被剔除 → 返回空批次（设备/dtype 跟随输入，避免 GPU 输入时下游设备不一致）
             return (
-                torch.empty((0, target_h, target_w, 3), dtype=torch.float32),
-                torch.empty((0, target_h, target_w, 3), dtype=torch.float32),
+                torch.empty((0, target_h, target_w, 3),
+                            dtype=torch.promote_types(images.dtype, torch.float32), device=images.device),
+                torch.empty((0, target_h, target_w, 3),
+                            dtype=torch.promote_types(masks.dtype, torch.float32), device=masks.device),
             )
 
         filtered_images = images[valid_indices]
@@ -149,11 +153,18 @@ class MaskCompositeRef:
             return (filtered_images.clone(), filtered_masks.clone())
 
         # 2. 合成：将背景替换为纯黑
-        bg0 = torch.zeros((target_h, target_w, 3), dtype=torch.float32)
-        result_frames = []
-        result_masks = []
-
+        # 预分配输出后逐帧写入，避免"逐帧攒 list + torch.stack"造成的双倍峰值
+        # （长序列下这一步会额外占用整批图像大小的内存）
+        # dtype 用 promote_types 与旧实现（torch.stack 的类型提升规则）保持一致
         n = filtered_images.shape[0]
+        frame_dtype = torch.promote_types(filtered_images.dtype, torch.float32)
+        mask_dtype = torch.promote_types(filtered_masks.dtype, torch.float32)
+        bg0 = torch.zeros((target_h, target_w, 3), dtype=frame_dtype, device=filtered_images.device)
+        result_batch = torch.empty((n, target_h, target_w, 3), dtype=frame_dtype,
+                                   device=filtered_images.device)
+        result_mask_batch = torch.empty((n, target_h, target_w, 3), dtype=mask_dtype,
+                                        device=filtered_masks.device)
+
         for i in range(n):
             img = filtered_images[i]
             m = filtered_masks[i]
@@ -164,12 +175,9 @@ class MaskCompositeRef:
                 m = self._resize_to(m, target_h, target_w)
 
             background_mask = self._is_black(m).float()
-            composed = img * (1.0 - background_mask) + bg0 * background_mask
-            result_frames.append(composed)
-            result_masks.append(m)  # 保留原始彩色遮罩
+            result_batch[i] = img * (1.0 - background_mask) + bg0 * background_mask
+            result_mask_batch[i] = m  # 保留原始彩色遮罩
 
-        result_batch = torch.stack(result_frames, dim=0)
-        result_mask_batch = torch.stack(result_masks, dim=0)
         return (result_batch, result_mask_batch)
 
     # ==============================
@@ -184,7 +192,8 @@ class MaskCompositeRef:
         # masks 未连接 → 透传原图 + 全白遮罩
         if masks is None:
             h, w = images[0].shape[0], images[0].shape[1]
-            ones = torch.ones((batch_n, h, w, 3), dtype=torch.float32)
+            ones = torch.ones((batch_n, h, w, 3), dtype=torch.promote_types(images.dtype, torch.float32),
+                              device=images.device)
             return (images.clone(), ones)
 
         # === Step 1: 批次截断（输入后第一顺位操作） ===
@@ -203,13 +212,16 @@ class MaskCompositeRef:
             has_bg = backgrounds is not None and backgrounds.shape[0] > 0
             if has_bg:
                 bg_h, bg_w = backgrounds[0].shape[0], backgrounds[0].shape[1]
-                ones = torch.ones((backgrounds.shape[0], bg_h, bg_w, 3), dtype=torch.float32)
+                ones = torch.ones((backgrounds.shape[0], bg_h, bg_w, 3),
+                                  dtype=torch.promote_types(backgrounds.dtype, torch.float32),
+                                  device=backgrounds.device)
                 return (backgrounds.clone(), ones)
             else:
                 # images 被截断为 [:0] 后仍是 4D (0, H, W, 3)，取其空间形状
+                empty_dtype = torch.promote_types(images.dtype, torch.float32)
                 return (
-                    torch.empty((0, *images.shape[1:]), dtype=torch.float32),
-                    torch.empty((0, *images.shape[1:]), dtype=torch.float32),
+                    torch.empty((0, *images.shape[1:]), dtype=empty_dtype, device=images.device),
+                    torch.empty((0, *images.shape[1:]), dtype=empty_dtype, device=images.device),
                 )
 
         # 目标尺寸：以 images 为准
@@ -224,16 +236,20 @@ class MaskCompositeRef:
                     f"differs from target {target_h}x{target_w}, resizing masks."
                 )
 
-        # 背景图
+        # 背景图 / 白遮罩模板：dtype 与旧实现一致（float32 提升），设备跟随输入
+        # （否则输入在 GPU 时会 RuntimeError: Expected all tensors to be on the same device）
         has_backgrounds = backgrounds is not None and backgrounds.shape[0] > 0
+        frame_dtype = torch.promote_types(images.dtype, torch.float32)
+        mask_dtype = torch.promote_types(masks.dtype, torch.float32)
         if has_backgrounds:
             bg0 = backgrounds[0]
             if bg0.shape[0] != target_h or bg0.shape[1] != target_w:
                 bg0 = self._resize_to(bg0, target_h, target_w)
+            bg0 = bg0.to(device=images.device, dtype=frame_dtype)
         else:
-            bg0 = torch.zeros((target_h, target_w, 3), dtype=torch.float32)
+            bg0 = torch.zeros((target_h, target_w, 3), dtype=frame_dtype, device=images.device)
 
-        white_mask_tpl = torch.ones((target_h, target_w, 3), dtype=torch.float32)
+        white_mask_tpl = torch.ones((target_h, target_w, 3), dtype=mask_dtype, device=masks.device)
 
         # === Step 2: 首尾帧跳过（基于截断后的结果） ===
         skip_flags = []
@@ -274,9 +290,20 @@ class MaskCompositeRef:
             result_mask_batch = torch.stack(result_masks, dim=0)
             return (result_batch, result_mask_batch)
 
-        # === Step 4: 常规循环处理 ===
-        result_frames = []
-        result_masks = []
+        # === Step 4: 常规循环处理（预分配输出后逐帧写入，避免 list + stack 双倍峰值） ===
+        # 输出布局与旧实现完全一致：
+        #   无背景图: [frame0 .. frame(n-1)]
+        #   有背景图且 n>=2: [frame0 .. frame(n-2), bg0 .. bg(n_bg-1), frame(n-1)]
+        #   有背景图且 n==1: [frame0, bg0 .. bg(n_bg-1), frame0]（首帧同时出现在首尾）
+        n_bg = backgrounds.shape[0] if has_backgrounds else 0
+        extra_for_single = 1 if (n == 1 and n_bg > 0) else 0
+        capacity = n + n_bg + extra_for_single
+        bg_start = capacity - 1 - n_bg          # 背景图块起始位置（n_bg==0 时不使用）
+        last_pos = capacity - 1                 # 末帧位置
+        result_frames = torch.empty((capacity, target_h, target_w, 3), dtype=frame_dtype,
+                                    device=images.device)
+        result_masks = torch.empty((capacity, target_h, target_w, 3), dtype=mask_dtype,
+                                   device=masks.device)
 
         for i in range(n):
             img = images[i]
@@ -289,39 +316,29 @@ class MaskCompositeRef:
 
             if remove_background and not skip_flags[i]:
                 background_mask = self._is_white(m).float()
-                composed = img * (1.0 - background_mask) + bg0 * background_mask
-                result_frames.append(composed)
+                frame_out = img * (1.0 - background_mask) + bg0 * background_mask
             else:
                 # 跳过帧 或 remove_background=False → 透传原图
-                result_frames.append(img)
+                frame_out = img
 
-            # 遮罩：原帧保留原始彩色遮罩（与有无背景图无关）
-            result_masks.append(m)
+            pos = i if i < n - 1 else last_pos
+            result_frames[pos] = frame_out
+            result_masks[pos] = m  # 遮罩：原帧保留原始彩色遮罩（与有无背景图无关）
+            if extra_for_single:
+                # n==1 且存在背景图：旧实现为 [img] + bgs + [img]，首帧同时写入首尾
+                result_frames[0] = frame_out
+                result_masks[0] = m
 
         # === Step 5: 插入所有背景图（第1张既用于合成，也插入序列） ===
         if has_backgrounds:
-            extra_bgs = []
-            for i in range(backgrounds.shape[0]):
-                bg = backgrounds[i]
+            for j in range(n_bg):
+                bg = backgrounds[j]
                 if bg.shape[0] != target_h or bg.shape[1] != target_w:
                     bg = self._resize_to(bg, target_h, target_w)
-                extra_bgs.append(bg)
+                result_frames[bg_start + j] = bg
+                result_masks[bg_start + j] = white_mask_tpl
 
-            if len(result_frames) <= 1:
-                result_frames = result_frames + extra_bgs
-                result_masks = result_masks + [white_mask_tpl.clone()] * len(extra_bgs)
-            else:
-                # 插入到倒数第2和倒数第1之间
-                result_frames = result_frames[:-1] + extra_bgs + result_frames[-1:]
-                result_masks = (
-                    result_masks[:-1]
-                    + [white_mask_tpl.clone()] * len(extra_bgs)
-                    + result_masks[-1:]
-                )
-
-        result_batch = torch.stack(result_frames, dim=0)
-        result_mask_batch = torch.stack(result_masks, dim=0)
-        return (result_batch, result_mask_batch)
+        return (result_frames, result_masks)
 
 
 # ==============================

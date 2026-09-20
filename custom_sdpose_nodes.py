@@ -9,9 +9,8 @@ import json
 import os
 import logging
 from tqdm import tqdm
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple
 
-import comfy.utils
 import folder_paths
 
 from .sdpose_draw import KeypointDraw

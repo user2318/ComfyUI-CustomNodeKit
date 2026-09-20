@@ -11,9 +11,8 @@
 
 import math
 import json
-import logging
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict
 
 import torch
 
@@ -321,8 +320,13 @@ def compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
                 actual_hg = _get_torso_h_group(all_torso_h[frame_idx]) if frame_idx < len(all_torso_h) else hg
                 if actual_hg == hg:
                     return sf, sb, sm, sfr, sbr
-        # 回退
-        return shot_refs[0][1], shot_refs[0][2], shot_refs[0][3], shot_refs[0][4], shot_refs[0][5] if shot_refs else (max_ratio_initial, max_ratio_initial, 0, 0, 0)
+        # 回退：注意此处必须显式判断再取值——写成 "a, b, c, d, e if shot_refs else (...)"
+        # 时三元表达式只作用于最后一个元素，shot_refs 为空会直接 IndexError
+        if not shot_refs:
+            return (max_ratio_initial, max_ratio_initial, 1e-6,
+                    max_ratio_initial, max_ratio_initial)
+        _, sf0, sb0, sm0, sfr0, sbr0, _, _ = shot_refs[0]
+        return sf0, sb0, sm0, sfr0, sbr0
 
     # Use first group's reference as default
     if shot_refs:
@@ -796,11 +800,11 @@ def compute_yaw_core(pose_keypoints_segment, conf_threshold, unwrap_angle,
             # 可信度
             try:
                 ear_abs = abs(ear_val)
-            except:
+            except Exception:
                 ear_abs = 0
             try:
                 nose_abs = abs(nose_val)
-            except:
+            except Exception:
                 nose_abs = 0
             conf_score = max(ear_abs, nose_abs) / 90.0
             if conf_score > 0.7:

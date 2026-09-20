@@ -12,17 +12,16 @@ Reuses the core infrastructure from Custom_context.py (IndexListContextWindow et
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 import torch
 import logging
 import nodes
 
 from .Custom_context import (
     IndexListContextWindow, IndexListContextHandler,
-    ContextSchedule, ContextFuseMethod, ContextFuseMethods,
+    ContextFuseMethods,
     ContextSchedules,
     get_matching_context_schedule, get_matching_fuse_method,
-    get_shape_for_dim, match_weights_to_dim,
     create_prepare_sampling_wrapper, create_sampler_sample_wrapper,
 )
 
@@ -51,62 +50,43 @@ def _apply_scail_model_patch():
                              transformer_options={}, pose_latents=None, ref_mask_latents=None,
                              sam_latents=None, **kwargs):
             window = transformer_options.get("context_window", None) if transformer_options else None
+            # 仅插件自定义窗口（带 original_indices 属性）由本 patch 负责切片；
+            # 官方 context_windows 窗口（无该属性）已由官方 WAN21_SCAIL2.resize_cond_for_context_window
+            # 切好（N_ref + 窗口帧），此处直接透传，避免双重切片（22→14 维度崩溃）。
+            is_plugin_window = window is not None and hasattr(window, "original_indices")
             ref_latent_kw = kwargs.get("reference_latents", None)
 
             # ComfyUI renames conditioning dict key "ref_mask_28ch" → model named param
             # "ref_mask_latents" via Python function argument binding.
             # So ref_mask_latents is already populated and NOT in kwargs.
             # We slice it here to match the windowed x.
-            if ref_mask_latents is not None and window is not None and hasattr(window, "index_list"):
+            if ref_mask_latents is not None and is_plugin_window and hasattr(window, "index_list"):
                 # ref_mask_latents: (B, 28, N+T_full, H, W) — ComfyUI movedim'ed to channel-first
                 # n_ref = total frames in ref_mask_latents minus video frames = N
                 n_ref = max(0, ref_mask_latents.shape[2] - window.total_frames)
                 indices = window.index_list
                 ref_part = ref_mask_latents[:, :, :n_ref]
                 video_part = ref_mask_latents[:, :, n_ref:]
-                logging.info(
-                    "[SCAIL_DEBUG] ref_mask_latents: input=%s, n_ref=%d, indices=%s, mean=%.6f",
-                    list(ref_mask_latents.shape), n_ref, indices[:5],
-                    ref_mask_latents.mean().item()
-                )
-                # --- 重叠区追踪日志 ---
-                if hasattr(window, "original_indices") and len(video_part.shape) >= 3:
-                    oi = window.original_indices
-                    if oi and len(oi) > 1:
-                        max_idx = video_part.shape[2] - 1
-                        idx0 = min(oi[0], max_idx)
-                        idx1 = min(oi[-1], max_idx)
-                        first_frame_val = video_part[:, :, idx0].mean().item()
-                        last_frame_val = video_part[:, :, idx1].mean().item()
-                        logging.info(
-                            "[SCAIL_OVERLAP] ref_mask overlap boundary: window orig=[%d..%d], "
-                            "first_frame_mean=%.6f, last_frame_mean=%.6f",
-                            oi[0], oi[-1], first_frame_val, last_frame_val
-                        )
-                # --- 结束重叠区追踪 ---
                 safe_indices = [i for i in indices if i < video_part.shape[2]]
                 video_part = video_part[:, :, safe_indices]
                 ref_mask_latents = torch.cat([ref_part, video_part], dim=2)
-                logging.info(
-                    "[SCAIL_DEBUG] ref_mask_latents: sliced=%s, mean=%.6f",
-                    list(ref_mask_latents.shape),
-                    ref_mask_latents.mean().item()
-                )
+
+            # sam_latents: SCAIL-2 SAM mask 流，时间在 dim=2（标准 latent 格式），按窗口切片。
+            # 标准上下文已由 get_resized_cond 切成窗口帧（shape[2]==wlen），此时不再重复切；
+            # 串行窗口未切（完整帧数），按窗口索引切。
+            if sam_latents is not None and is_plugin_window and hasattr(window, "index_list"):
+                wlen = len(window.index_list)
+                logging.info("[SCAILContext] sam_latents shape=%s, window_idx=%s (wlen=%d)",
+                             list(sam_latents.shape), list(window.index_list), wlen)
+                if sam_latents.shape[2] != wlen:
+                    indices = window.index_list
+                    safe_indices = [i for i in indices if i < sam_latents.shape[2]]
+                    sam_latents = sam_latents[:, :, safe_indices]
 
             # driving_mask_28ch is NOT a named param of _forward, stays in kwargs
             _driving_from_kw = kwargs.pop("driving_mask_28ch", None)
-            if _driving_from_kw is not None and window is not None and hasattr(window, "index_list"):
-                logging.info(
-                    "[SCAIL_DEBUG] driving_mask_28ch: input=%s, indices=%s, mean=%.6f",
-                    list(_driving_from_kw.shape), window.index_list[:5],
-                    _driving_from_kw.mean().item()
-                )
+            if _driving_from_kw is not None and is_plugin_window and hasattr(window, "index_list"):
                 _driving_from_kw = _driving_from_kw[:, window.index_list]
-                logging.info(
-                    "[SCAIL_DEBUG] driving_mask_28ch: sliced=%s, mean=%.6f",
-                    list(_driving_from_kw.shape),
-                    _driving_from_kw.mean().item()
-                )
 
             ref_mask_flag = kwargs.pop("ref_mask_flag", None)
 
@@ -366,7 +346,6 @@ class WanSCAILContextWindowsNode:
             freenoise=freenoise,
             prefix_latent_len=0,
             split_conds_to_windows=False,
-            causal_window_fix=False,
         )
         model.model_options["context_handler"] = handler
 

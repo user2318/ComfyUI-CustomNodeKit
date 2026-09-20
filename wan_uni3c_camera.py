@@ -10,14 +10,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import gc
-import math
 import logging
-import sys
-import os
 import types
 import folder_paths
 import comfy.model_management as mm
-from comfy.utils import load_torch_file
+from comfy.utils import load_torch_file, common_upscale
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 from tqdm import tqdm
@@ -262,8 +259,8 @@ class WanUni3CLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_name": (folder_paths.get_filename_list("controlnet"), {
-                    "tooltip": "Uni3C ControlNet 模型文件，放在 ComfyUI/models/controlnet 文件夹。Uni3C ControlNet model file, placed in ComfyUI/models/controlnet folder."
+                "model_name": (folder_paths.get_filename_list("model_patches"), {
+                    "tooltip": "Uni3C ControlNet 模型文件，放在 ComfyUI/models/model_patches 文件夹（与官方 Load Model Patch 一致）。Uni3C ControlNet model file, placed in ComfyUI/models/model_patches (same as official Load Model Patch)."
                 }),
             },
             "optional": {
@@ -279,7 +276,7 @@ class WanUni3CLoader:
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         base_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[base_precision]
-        model_path = folder_paths.get_full_path_or_raise("controlnet", model_name)
+        model_path = folder_paths.get_full_path_or_raise("model_patches", model_name)
         sd = load_torch_file(model_path, device=offload_device, safe_load=True)
         if "controlnet_patch_embedding.weight" not in sd:
             raise ValueError("无效的 Uni3C ControlNet 模型文件")
@@ -332,17 +329,15 @@ class WanUni3CApply:
             "required": {
                 "model": ("MODEL",),
                 "uni3c_controlnet": ("UNI3C_CONTROLNET",),
-                "render_latent": ("LATENT", {"tooltip": "预渲染的参考视频潜空间张量 (B, C, T, H, W)。Pre-rendered reference video latent tensor (B, C, T, H, W)."}),
+                "render_video": ("IMAGE", {"tooltip": "运镜参考视频（像素帧）。The guidance video rendered from the camera trajectory, most commonly warped point cloud renders of the input image."}),
+                "vae": ("VAE", {"tooltip": "用于编码 render_video 的 VAE。VAE used to encode render_video."}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
-                "render_mask": ("MASK", {"tooltip": "可选的渲染遮罩（实验性）。Optional render mask (experimental)."}),
                 "trim_latent": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1,
                     "tooltip": "参考图占用的 latent 帧数（从 WanAnimateToVideoCustom 的 trim_latent 接入），用于时序对齐。Number of latent frames occupied by reference images (connect from WanAnimateToVideoCustom's trim_latent), used for temporal alignment."}),
-                "positive": ("CONDITIONING", {"tooltip": "可选：传入 conditioning 自动提取 concat_latent_image，替代 WanAnimateChannelPack 节点。Optional: pass conditioning to auto-extract concat_latent_image, replacing the WanAnimateChannelPack node."}),
-                "negative": ("CONDITIONING", {"tooltip": "可选：传入 conditioning 自动提取 concat_latent_image，替代 WanAnimateChannelPack 节点。Optional: pass conditioning to auto-extract concat_latent_image, replacing the WanAnimateChannelPack node."}),
             }
         }
     RETURN_TYPES = ("MODEL",)
@@ -350,38 +345,18 @@ class WanUni3CApply:
     FUNCTION = "apply"
     CATEGORY = "WanVideo/Control"
 
-    def apply(self, model, uni3c_controlnet, render_latent, strength,
-              start_percent=0.0, end_percent=1.0, render_mask=None, trim_latent=0,
-              positive=None, negative=None):
+    def apply(self, model, uni3c_controlnet, render_video, vae, strength,
+              start_percent=0.0, end_percent=1.0, trim_latent=0):
+
         
-        # ===== 内联 WanAnimateChannelPack 逻辑：从 conditioning 提取 concat 数据 =====
-        if positive is not None and negative is not None:
-            concat_data = {"concat_latent_image": None, "concat_mask": None}
-            for cond_list, name in [(positive, "positive"), (negative, "negative")]:
-                for cond in cond_list:
-                    cond_dict = cond[1] if isinstance(cond, (list, tuple)) and len(cond) > 1 else {}
-                    if not isinstance(cond_dict, dict):
-                        continue
-                    for key in ("concat_latent_image", "concat_mask"):
-                        if key in cond_dict and concat_data.get(key) is None:
-                            concat_data[key] = cond_dict[key]
-                            logging.info(f"[Uni3C] 从 {name} 提取 {key}: shape={cond_dict[key].shape}")
-            if concat_data["concat_latent_image"] is not None:
-                to = model.model_options.setdefault("transformer_options", {})
-                to["wananim_concat_latent_image"] = concat_data["concat_latent_image"]
-                to["wananim_concat_mask"] = concat_data.get("concat_mask")
-                model.model_options["transformer_options"] = to
-                logging.info(f"[Uni3C] 已从 conditioning 提取 concat_latent_image: "
-                            f"{concat_data['concat_latent_image'].shape}")
-            else:
-                logging.warning("[Uni3C] 提供了 positive/negative 但未找到 concat_latent_image，"
-                              "Animate 模型的通道拼接将不会执行")
-        # ===== 内联结束 =====
-        
-        render_latent_tensor = render_latent["samples"].clone()
-        is_valid_render = not torch.allclose(render_latent_tensor, torch.zeros_like(render_latent_tensor), atol=1e-3)
+        # render_video 全零像素近似判定；真正的 latent 编码在 forward 首次构建时按需执行
+        is_valid_render = not torch.allclose(render_video, torch.zeros_like(render_video), atol=1e-3)
         if not is_valid_render:
-            logging.warning(f"[Uni3C] render_latent 近似全零，跳过 ControlNet")
+            logging.warning(f"[Uni3C] render_video 近似全零，跳过 ControlNet")
+        try:
+            latent_format = model.get_model_object("latent_format")
+        except Exception:
+            latent_format = None
         
         offload_device = mm.unet_offload_device()
         controlnet = uni3c_controlnet["controlnet"]
@@ -407,7 +382,11 @@ class WanUni3CApply:
             "controlnet": controlnet,
             "config": uni3c_controlnet["config"],
             "dtype": uni3c_controlnet["dtype"],
-            "render_latent": render_latent_tensor,
+            "render_video": render_video,
+            "vae": vae,
+            "latent_format": latent_format,
+            "prepared_render": None,
+            "prepared_render_shape": None,
             "strength": strength,
             "start_pct": start_percent,
             "end_pct": end_percent,
@@ -516,30 +495,52 @@ class WanUni3CApply:
                     # 构建 render_latent_input（基于完整视频，不按窗口切片）
                     # 用 x_orig_for_noise（patch 之前的原始输入）的初始噪声拼接 render_latent
                     noise_part = x_orig_for_noise[0:1].to(device=device, dtype=cn_data["dtype"])
-                    # 始终只取前 16 通道
-                    noise_part = noise_part[:, :16]
-                    # 补零到 20 通道
+                    # 保留前 20 通道（noise 16 + mask 4），不足补零（与官方对齐）
+                    noise_part = noise_part[:, :20]
+                    # 不足 20 时补零
                     pad = torch.zeros(1, 20 - noise_part.shape[1],
                                     noise_part.shape[2], noise_part.shape[3], noise_part.shape[4],
                                     device=noise_part.device, dtype=noise_part.dtype)
                     noise_part = torch.cat([noise_part, pad], dim=1)
-                    rl = cn_data["render_latent"].to(device, cn_data["dtype"])
-                    
-                    # 取完整 render_latent（前 16 通道）
+                    # 编码 render 视频（像素→VAE→process_in），缓存复用（对齐官方）
+                    target_shape = tuple(x_orig_for_noise.shape[2:])
+                    rl = cn_data.get("prepared_render", None)
+                    if rl is None or cn_data.get("prepared_render_shape") != target_shape:
+                        rl = self._encode_render_video(cn_data["render_video"], cn_data["vae"],
+                                                       cn_data.get("latent_format"), target_shape, device)
+                        cn_data["prepared_render"] = rl
+                        cn_data["prepared_render_shape"] = target_shape
+                        logging.info(f"[Uni3C] render_video 已编码: {tuple(rl.shape)}")
                     rl_slice = rl[0:1, :16].to(device=device, dtype=cn_data["dtype"])
+
+                    # ===== 参考帧 token 偏移（仅 WanAnimate concat 路径；SCAIL 走 ref_token_len 逻辑） =====
+                    if not is_scail and full_ref is None:
+                        window = transformer_options.get("context_window", None)
+                        trim_frames = int(cn_data.get("trim_latent", 0) or 0)
+                        if trim_frames <= 0 and window is None:
+                            inferred = int(x_orig_for_noise.shape[2]) - int(rl.shape[2])
+                            if inferred > 0:
+                                trim_frames = inferred
+                                logging.info(f"[Uni3C] 自动推断参考帧数 = {inferred}")
+                        ref_frames_in_window = trim_frames
+                        if window is not None and hasattr(window, "index_list") and len(window.index_list) > 0:
+                            first_global = int(window.index_list[0])
+                            if first_global >= trim_frames:
+                                ref_frames_in_window = 0
+                            else:
+                                ref_frames_in_window = min(trim_frames - first_global, len(window.index_list))
+                            logging.info(f"[Uni3C] 窗口首帧索引={first_global}, trim={trim_frames}, 窗口内参考帧={ref_frames_in_window}")
+                        if ref_frames_in_window > 0:
+                            tokens_per_frame = (x_orig_for_noise.shape[3] // 2) * (x_orig_for_noise.shape[4] // 2)
+                            cn_data["ref_offset"] = ref_frames_in_window * tokens_per_frame
+                            logging.info(f"[Uni3C] WanAnimate 参考帧偏移 = {ref_frames_in_window}帧 x {tokens_per_frame} token/帧 = {cn_data['ref_offset']}")
+                        else:
+                            cn_data["ref_offset"] = 0
+                    elif full_ref is not None:
+                        cn_data["ref_offset"] = full_ref.shape[1]
                     
-                    # 前缀补齐：补 trim_latent 帧重复（与 pose_video 的 delta 对齐）
-                    # 补齐后总帧数 = render_latent_motion_frames + trim_latent，与 concat 总帧数一致
-                    trim = cn_data.get("trim_latent", 0)
-                    if trim > 0 and rl_slice.shape[2] >= 1:
-                        first_frame = rl_slice[:, :, :1, :, :]
-                        padding_frames = first_frame.repeat(1, 1, trim, 1, 1)
-                        rl_slice = torch.cat([padding_frames, rl_slice], dim=2)
-                    
-                    if rl_slice.shape[2] != noise_part.shape[2]:
-                        rl_slice = F.interpolate(rl_slice, size=(noise_part.shape[2], noise_part.shape[3], noise_part.shape[4]), mode='trilinear', align_corners=False)
                     render_latent_input = torch.cat([noise_part, rl_slice], dim=1)
-                    del rl, noise_part, rl_slice
+                    del noise_part, rl_slice
                     
                     # 直接用模型内部的 e 作为 temb
                     temb = e.squeeze(1).to(cn_data["dtype"])
@@ -597,10 +598,27 @@ class WanUni3CApply:
                         # cs.shape[1] = video token 数
                         # original_seq_len = ref token 数 + video token 数
                         ref_token_len = original_seq_len - cs.shape[1]
-                        x_p[:, ref_token_len:original_seq_len] += cs * cn_data["strength"]
+                        if 0 <= ref_token_len < original_seq_len:
+                            x_p[:, ref_token_len:original_seq_len] += cs * cn_data["strength"]
+                        else:
+                            # 保护：cs 长度异常时回退到完整注入，保证运镜控制生效
+                            end_s = min(original_seq_len, x_p.shape[1])
+                            if end_s > 0:
+                                x_p[:, :end_s] += cs[:, :end_s] * cn_data["strength"]
                     else:
-                        # WanAnimate 路径：原逻辑不变
-                        x_p[:, :original_seq_len] += cs[:, :original_seq_len] * cn_data["strength"]
+                        # WanAnimate 路径：跳过参考帧 token（修复注入错位）。
+                        # cs 的 token 顺序与模型输入一致：[参考帧 | 生成区]。
+                        # 因此注入用 cs 的生成区部分（cs[:, ref_offset:]）加到 x_p 的生成区。
+                        ref_offset = cn_data.get("ref_offset", 0)
+                        if ref_offset > 0 and ref_offset < x_p.shape[1] and ref_offset < cs.shape[1]:
+                            gen_tokens = min(cs.shape[1] - ref_offset, x_p.shape[1] - ref_offset)
+                            if gen_tokens > 0:
+                                x_p[:, ref_offset:ref_offset + gen_tokens] += cs[:, ref_offset:ref_offset + gen_tokens] * cn_data["strength"]
+                            else:
+                                x_p[:, :original_seq_len] += cs[:, :original_seq_len] * cn_data["strength"]
+                        else:
+                            # 无法确定参考帧偏移：使用原逻辑保证运镜控制生效
+                            x_p[:, :original_seq_len] += cs[:, :original_seq_len] * cn_data["strength"]
                 
                 # face_adapter（仅 WanAnimate）
                 if not is_scail and i % 5 == 0 and motion_vec is not None:
@@ -628,9 +646,43 @@ class WanUni3CApply:
         
         logging.info(f"[Uni3C] monkey-patch forward_orig 已应用: "
                     f"strength={strength}, start={start_percent}, end={end_percent}, "
-                    f"render_latent_shape={render_latent_tensor.shape}")
+                    f"render_video={tuple(render_video.shape)}")
         
         return (model,)
+
+    def _encode_render_video(self, render_video, vae, latent_format, target_shape, device):
+        # pixel video -> VAE latent -> process_in (align with official encode_render_video)
+        # target_shape = (t_len, h_len, w_len) in latent space. Wan VAE: temporal 4x, spatial 8x.
+        t_len, h_len, w_len = target_shape
+        target_frames = (t_len - 1) * 4 + 1
+        target_height = h_len * 8
+        target_width = w_len * 8
+
+        frames = render_video  # (F, H, W, C)
+        if frames.ndim == 5:
+            frames = frames[0]
+        if frames.ndim != 4:
+            raise ValueError(f"[Uni3C] render_video should be (F,H,W,C) or (1,F,H,W,C), got {tuple(frames.shape)}")
+
+        # frame count: truncate if too long, else repeat the last frame (no time interpolation)
+        if frames.shape[0] > target_frames:
+            frames = frames[:target_frames]
+        elif frames.shape[0] < target_frames:
+            last_frame = frames[-1:].expand(target_frames - frames.shape[0], -1, -1, -1)
+            frames = torch.cat([frames, last_frame], dim=0)
+
+        # spatial resize
+        if frames.shape[1] != target_height or frames.shape[2] != target_width:
+            frames = common_upscale(frames.movedim(-1, 1), target_width, target_height, "bilinear", "center").movedim(1, -1)
+
+        latent = vae.encode(frames)
+        if isinstance(latent, dict):
+            latent = latent["samples"]
+        latent = latent.float()
+
+        if latent_format is not None and hasattr(latent_format, "process_in"):
+            latent = latent_format.process_in(latent)
+        return latent
 
 
 NODE_CLASS_MAPPINGS = {

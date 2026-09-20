@@ -499,7 +499,7 @@ app.registerExtension({
                 const [a, b] = str.split(":").map(Number);
                 return a / b;
             };
-            const enforceAspect = (w, h, a) => !a ? { w, h } : (w / h > a ? { w: h * a, h } : { w, h: w / a });
+            const enforceAspect = (w, h, a) => !a ? { w, h } : { w: h * a, h };
             const toWorld = (sx, sy) => ({ x: sx / state.viewScale + state.viewX, y: sy / state.viewScale + state.viewY });
             const toScreen = (wx, wy) => ({ x: (wx - state.viewX) * state.viewScale, y: (wy - state.viewY) * state.viewScale });
 
@@ -707,22 +707,20 @@ app.registerExtension({
                             state.cropW = calcW;
                             state.cropH = calcH;
                         } else {
-                            // 单边拖动：对边固定，按比例改变另一边
+                            // 单边拖动：对边固定，另一维度从中轴对称
                             if (state.dragMode.includes("W") || state.dragMode.includes("E")) {
-                                const fixedTop = state.dragMode.includes("N") ? origY + origH : origY;
                                 const calcW = Math.max(1, newW);
                                 const calcH = calcW / state.aspectRatio;
-                                const calcY = state.dragMode.includes("N") ? fixedTop - calcH : fixedTop;
+                                const centerY = origY + origH / 2;
                                 state.cropX = newX;
-                                state.cropY = calcY;
+                                state.cropY = centerY - calcH / 2;
                                 state.cropW = calcW;
                                 state.cropH = calcH;
                             } else if (state.dragMode.includes("N") || state.dragMode.includes("S")) {
-                                const fixedLeft = state.dragMode.includes("W") ? origX + origW : origX;
                                 const calcH = Math.max(1, newH);
                                 const calcW = calcH * state.aspectRatio;
-                                const calcX = state.dragMode.includes("W") ? fixedLeft - calcW : fixedLeft;
-                                state.cropX = calcX;
+                                const centerX = origX + origW / 2;
+                                state.cropX = centerX - calcW / 2;
                                 state.cropY = newY;
                                 state.cropW = calcW;
                                 state.cropH = calcH;
@@ -798,6 +796,15 @@ app.registerExtension({
 
             const ratioSelect = document.getElementById("preset-ratio");
             const keepRatioCheckbox = document.getElementById("keep-ratio");
+            const applyRatioWithCenter = () => {
+                if (keepRatioCheckbox.checked && state.aspectRatio) {
+                    const cx = state.cropX + state.cropW / 2;
+                    const adj = enforceAspect(state.cropW, state.cropH, state.aspectRatio);
+                    state.cropW = adj.w;
+                    state.cropH = adj.h;
+                    state.cropX = cx - state.cropW / 2;
+                }
+            };
             ratioSelect.onchange = () => {
                 const val = ratioSelect.value;
                 if (val === "free") {
@@ -807,11 +814,7 @@ app.registerExtension({
                     // 选择预设比例时自动勾选保持比例
                     if (!keepRatioCheckbox.checked) keepRatioCheckbox.checked = true;
                 }
-                if (keepRatioCheckbox.checked && state.aspectRatio) {
-                    const adj = enforceAspect(state.cropW, state.cropH, state.aspectRatio);
-                    state.cropW = adj.w;
-                    state.cropH = adj.h;
-                }
+                applyRatioWithCenter();
                 draw();
             };
             keepRatioCheckbox.onchange = () => {
@@ -829,6 +832,7 @@ app.registerExtension({
                     ratioSelect.value = "free";
                     state.aspectRatio = null;
                 }
+                applyRatioWithCenter();
                 draw();
             };
 
@@ -841,8 +845,10 @@ app.registerExtension({
             document.getElementById("crop-w-input").onchange = (e) => {
                 let w = Math.max(1, Number(e.target.value));
                 if (state.aspectRatio && keepRatioCheckbox.checked) {
+                    const cx = state.cropX + state.cropW / 2;
                     state.cropW = w;
                     state.cropH = w / state.aspectRatio;
+                    state.cropX = cx - state.cropW / 2;
                 } else {
                     state.cropW = w;
                 }
@@ -851,8 +857,10 @@ app.registerExtension({
             document.getElementById("crop-h-input").onchange = (e) => {
                 let h = Math.max(1, Number(e.target.value));
                 if (state.aspectRatio && keepRatioCheckbox.checked) {
+                    const cx = state.cropX + state.cropW / 2;
                     state.cropH = h;
                     state.cropW = h * state.aspectRatio;
+                    state.cropX = cx - state.cropW / 2;
                 } else {
                     state.cropH = h;
                 }
@@ -894,9 +902,11 @@ app.registerExtension({
                 state.cropW = state.img.width;
                 state.cropH = state.img.height;
                 if (state.aspectRatio && keepRatioCheckbox.checked) {
+                    const cx = state.cropX + state.cropW / 2;
                     const adj = enforceAspect(state.cropW, state.cropH, state.aspectRatio);
                     state.cropW = adj.w;
                     state.cropH = adj.h;
+                    state.cropX = cx - state.cropW / 2;
                 }
                 draw();
             };
@@ -963,9 +973,11 @@ app.registerExtension({
                             state.cropW = imgW;
                             state.cropH = imgH;
                             if (state.aspectRatio && keepRatioCheckbox.checked) {
+                                const cx = state.cropX + state.cropW / 2;
                                 const adj = enforceAspect(state.cropW, state.cropH, state.aspectRatio);
                                 state.cropW = adj.w;
                                 state.cropH = adj.h;
+                                state.cropX = cx - state.cropW / 2;
                             }
                         }
                     }

@@ -1,11 +1,12 @@
 import folder_paths
 from server import PromptServer
 from aiohttp import web
+import asyncio
 import os
+import threading
 import torch
 import numpy as np
 from PIL import Image
-import logging
 
 
 class PathCollectorNode:
@@ -15,7 +16,7 @@ class PathCollectorNode:
             "required": {},
             "optional": {
                 "paths": ("STRING", {"default": "", "multiline": True, "tooltip": "输入多个路径，每行一个。可通过多文件选择器前端控件批量选择。Enter multiple paths, one per line. Supports batch selection via the multi-file picker frontend control."}),
-                "index": ("INT", {"default": 0, "min": 0, "max": 9999, "step": 1, "tooltip": "选择要输出的行号（从1开始）。0=输出所有行；1=输出第1行；2=输出第2行；以此类推。超出范围时输出空字符串。Select which line number to output (starting from 1). 0=output all lines; 1=output line 1; 2=output line 2; etc. Outputs empty string if out of range."}),
+                "index": ("INT", {"default": 0, "min": 0, "max": 9999, "step": 1, "tooltip": "选择要输出的行号（从1开始）。0=输出所有行；1=输出第1行；2=输出第2行；以此类推。超出范围时输出最后一行。Select which line number to output (starting from 1). 0=output all lines; 1=output line 1; 2=output line 2; etc. Outputs the last line if out of range."}),
             },
         }
 
@@ -38,8 +39,10 @@ class PathCollectorNode:
         if 1 <= index <= len(lines):
             return (lines[index - 1],)
         else:
-            # 超出范围 → 输出空字符串
-            return ("",)
+            # 超出范围 → 输出最后一行作为兜底（并给出告警，避免索引写错时静默取到错误的路径）
+            print(f"[PathCollectorNode] Warning: index={index} 超出范围 (共 {len(lines)} 行)，"
+                  f"已回退输出最后一行")
+            return (lines[-1],) if lines else ("",)
 
 
 class IndexSelectorNode:
@@ -99,6 +102,37 @@ class IndexSelectorNode:
 
 
 # 后端路由：文件/文件夹选择接口（支持多选）
+# 注意：tkinter 的模态对话框是阻塞调用，若直接写在 async 路由里，弹窗期间会卡住整个
+# aiohttp 事件循环（队列/进度/其它前端请求全部无响应）。因此放到工作线程执行，
+# 并用锁串行化多个对话框；若运行环境要求 Tk 在主线程（如 macOS），自动回退为同步调用。
+_DIALOG_LOCK = threading.Lock()
+
+
+def _run_tk_dialog(pick_fn):
+    """在工作线程中执行 tkinter 对话框"""
+    with _DIALOG_LOCK:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        root.lift()
+        root.focus_force()
+        try:
+            return pick_fn(root)
+        finally:
+            root.destroy()
+
+
+async def _exec_dialog(pick_fn):
+    """异步执行对话框：优先线程池，失败回退同步（行为与改动前一致）"""
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _run_tk_dialog, pick_fn)
+    except Exception:
+        return _run_tk_dialog(pick_fn)
+
+
 @PromptServer.instance.routes.post("/multi_file_picker/select")
 async def select_file(request):
     try:
@@ -106,30 +140,20 @@ async def select_file(request):
         mode = data.get("mode", "file")
         multi = data.get("multi", False)
 
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        root.lift()
-        root.focus_force()
-
-        if mode == "file":
-            if multi:
-                file_paths = filedialog.askopenfilenames()
-                root.destroy()
-                paths = list(file_paths) if file_paths else []
-                return web.json_response({"paths": paths})
-            else:
+        def pick(root):
+            from tkinter import filedialog
+            if mode == "file":
+                if multi:
+                    file_paths = filedialog.askopenfilenames()
+                    return list(file_paths) if file_paths else []
                 file_path = filedialog.askopenfilename()
-                root.destroy()
-                return web.json_response({"paths": [file_path] if file_path else []})
-        else:  # directory
+                return [file_path] if file_path else []
             # tkinter 的 askdirectory 不支持多选，所以始终单选
             dir_path = filedialog.askdirectory()
-            root.destroy()
-            return web.json_response({"paths": [dir_path] if dir_path else []})
+            return [dir_path] if dir_path else []
+
+        paths = await _exec_dialog(pick)
+        return web.json_response({"paths": paths})
 
     except ImportError:
         return web.json_response({"error": "tkinter 不可用。请运行 install.py 安装 tkinter 组件，或重启 ComfyUI 后重试。"}, status=500)
@@ -630,7 +654,7 @@ class BatchImageReplace:
                 }),
                 "underflow_mode": (["as_is", "repeat_begin", "repeat_end"], {
                     "default": "as_is",
-                    "tooltip": "替换图像批次数量少于需替换张数时的处理方式。as_is=按实际张数替换（不扩展）；repeat_begin=用第1张重复填充前面（如[A,B]→[A,A,A,B]）；repeat_end=用最后1张重复填充后面（如[A,B]→[A,B,B,B]）。When replace_images has FEWER frames than needed: as_is=use actual count; repeat_begin=fill front with first image; repeat_end=fill end with last image."
+                    "tooltip": "替换图像批次数量少于需替换张数时的处理方式。as_is=按实际张数替换（不扩展）；repeat_begin=把第1张重复放到最前面（如[A,B,C]→[A,A,B,C]）；repeat_end=按原顺序保留全部替换图，末尾用最后1张补齐（如[A,B,C]→[A,B,C,C]）。When replace_images has FEWER frames than needed: as_is=use actual count; repeat_begin=pad front with copies of the first image; repeat_end=keep all in original order and pad the end with copies of the last image."
                 }),
             },
             "optional": {
@@ -661,8 +685,10 @@ class BatchImageReplace:
         """统一打印带节点标识的警告信息"""
         print(f"[BatchImageReplace] Warning: {msg}")
 
-    def replace(self, images, start_index, replace_count, overflow_mode,
+    def replace(self, images=None, start_index=0, replace_count=-1, overflow_mode="take_front",
                 underflow_mode="as_is", replace_images=None):
+        # images 在 INPUT_TYPES 中声明为 optional，这里必须给默认值：
+        # ComfyUI 对未连线的 optional 输入不会补 None，缺默认值会在调用时抛 TypeError
         if images is None or images.shape[0] == 0:
             return (None,)
 
@@ -718,13 +744,13 @@ class BatchImageReplace:
                     frames.append(replace_images[i])
                 selected = torch.stack(frames, dim=0)
             else:  # repeat_end
-                # 扩展结尾：第1张保持，后面用最后1张重复填充
+                # 扩展结尾：按原顺序保留全部替换图，末尾用最后1张重复填充
+                # 例：R=3、需 4 张 → [0,1,2,2]（旧实现只放第1张+重复最后1张，会丢中间帧）
                 frames = []
-                # 先放第1张
-                frames.append(replace_images[0].clone())
-                # 再用最后1张填充剩余 (actual_count - 1) 张
+                for i in range(R):
+                    frames.append(replace_images[i])
                 last_img = replace_images[-1].clone()
-                for _ in range(actual_count - 1):
+                for _ in range(actual_count - R):
                     frames.append(last_img.clone())
                 selected = torch.stack(frames, dim=0)
 
