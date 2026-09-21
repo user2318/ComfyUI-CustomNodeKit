@@ -23,6 +23,7 @@ from .Custom_context import (
     ContextSchedules,
     get_matching_context_schedule, get_matching_fuse_method,
     create_prepare_sampling_wrapper, create_sampler_sample_wrapper,
+    cond_indices_for_window,
 )
 
 import comfy.patcher_extension
@@ -168,25 +169,35 @@ class SCAILContextHandler(IndexListContextHandler):
                             if (cond_key == "pose_video_latent"
                                     and hasattr(cond_value, "cond")
                                     and isinstance(cond_value.cond, torch.Tensor)):
-                                # CRITICAL: Use range(self.context_length) not window.original_indices!
-                                # Conditioning tensors are already offset by video_frame_offset,
-                                # so their frame 0 = current chunk's frame 0.
-                                # window.original_indices like [5,6,...,25] can exceed the
-                                # tensor length (21), causing silent corruption via IndexError
-                                # in the try/finally that swallows the exception.
-                                indices = range(self.context_length)
-                                if cond_value.cond.ndim == 5:
-                                    idx = (slice(None), slice(None), list(indices),
+                                # 关键：按「窗口帧索引」切片（含锚定 / 双侧延伸段），而不是固定取 chunk 前 N 帧。
+                                # 条件张量已按 video_frame_offset 偏移，frame 0 = 当前 chunk 的 frame 0，
+                                # 与 x 同坐标系；超出张量长度的索引会被裁掉并告警（不再静默取头部导致整窗错位）。
+                                _pose_t = cond_value.cond
+                                _t_dim = 2 if _pose_t.ndim == 5 else 1
+                                cond_len = _pose_t.shape[_t_dim]
+                                head_extra = len(getattr(window, "head_extra_indices", None) or [])
+                                tail_extra = len(getattr(window, "tail_extra_indices", None) or [])
+                                indices = cond_indices_for_window(window, cond_len, x_in.size(self.dim),
+                                                                  key="SCAIL.pose_video_latent")
+                                want = len(getattr(window, "original_indices", None) or []) + head_extra + tail_extra
+                                if len(indices) != want:
+                                    logging.warning(
+                                        "[SCAILContext] pose_video_latent 帧数不足：需要 %d，实际映射到 %d（cond 长度 %d, x 长度 %d）",
+                                        want, len(indices), cond_len, x_in.size(self.dim))
+                                if _pose_t.ndim == 5:
+                                    idx = (slice(None), slice(None), indices,
                                            slice(None), slice(None))
-                                elif cond_value.cond.ndim == 4:
-                                    idx = (slice(None), list(indices), slice(None), slice(None))
+                                elif _pose_t.ndim == 4:
+                                    idx = (slice(None), indices, slice(None), slice(None))
                                 else:
-                                    idx = (slice(None), list(indices))
-                                sliced = cond_value.cond[idx]
+                                    idx = (slice(None), indices)
+                                sliced = _pose_t[idx]
                                 logging.info(
-                                    "[SCAILContext] pose_video_latent: input=%s, indices=%s, result=%s",
-                                    list(cond_value.cond.shape),
-                                    f"0..{self.context_length-1}",
+                                    "[SCAILContext] pose_video_latent: input=%s, window=%s..%s (head=%d, tail=%d), result=%s",
+                                    list(_pose_t.shape),
+                                    indices[0] if indices else None,
+                                    indices[-1] if indices else None,
+                                    head_extra, tail_extra,
                                     list(sliced.shape)
                                 )
                                 new_cond_item[cond_key] = cond_value._copy_with(sliced)

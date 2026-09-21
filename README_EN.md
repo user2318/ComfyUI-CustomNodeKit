@@ -2,7 +2,7 @@
 
 A set of custom nodes for ComfyUI, covering video generation, pose processing, interactive image operations, and common workflow utilities.
 
-Current version: **1.8.0** — Added the WanAnimate2ToVideoCustom node (Wan2.1-I2V base + second-gen pose branch K/V injection, multi-reference image support); reworked WanUni3CApply to accept render_video with built-in VAE encoding and reference-frame offset (fixing the render_latent normalization bias); removed the retired WanSCAILSparseAttention node (its dense O(S²) attention masks blew up memory on long sequences and gave no measurable benefit on SCAIL); plus one **experimental / test-only node, Context Window Anchor** — its effectiveness and side effects have not been fully validated, so it is kept for testing reference only; if it is not wired into a workflow, existing behaviour is unchanged (see [Context Window Anchor](#context-window-anchor)).
+Current version: **1.8.0** — Added the WanAnimate2ToVideoCustom node (Wan2.1-I2V base + second-gen pose branch K/V injection, multi-reference image support); reworked WanUni3CApply to accept render_video with built-in VAE encoding and reference-frame offset (fixing the render_latent normalization bias); removed the retired WanSCAILSparseAttention node (its dense O(S²) attention masks blew up memory on long sequences and gave no measurable benefit on SCAIL); plus one **experimental / test-only node, Context Window Anchor + Halo (unified-basis anchoring + two-sided halo)** — its effectiveness and side effects have not been fully validated, so it is kept for testing reference only; with all parameters at 0 it is exactly equivalent to not installing it (see [Context Window Anchor + Halo](#context-window-anchor--halo-unified-basis-anchoring--two-sided-halo)).
 
 This release also fixes a crash in the SDPose yaw nodes on short segments, the BatchImageReplace `repeat_end` padding logic (3 replacement images for 4 slots: `0,2,2,2` → `0,1,2,2`), and brings memory/performance improvements to SmartVideoCrop and InteractiveBatchCrop (the latter's preview cache drops from ~12.5GB to ~48MB for 2600 frames). **Please read the [Changelog](#changelog) at the end before upgrading** — it lists the breaking changes.
 
@@ -22,7 +22,7 @@ This release also fixes a crash in the SDPose yaw nodes on short segments, the B
   - [WanAnimate2ToVideoCustom](#wananimate2tovideocustom)
   - [WanAnimateToVideoCustom](#wananimatetovideocustom)
   - [Custom Context Windows (Manual)](#custom-context-windows-manual)
-  - [Context Window Anchor](#context-window-anchor)
+  - [Context Window Anchor + Halo](#context-window-anchor--halo-unified-basis-anchoring--two-sided-halo)
   - [Reference Image Selector](#reference-image-selector)
   - [SDPose Empty Frame Repair](#sdpose-empty-frame-repair)
   - [SDPoseDrawKeypointsV2 Foot Mode](#sdposedrawkeypointsv2-foot-mode)
@@ -148,7 +148,7 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 |------|----------|-------------|
 | **Custom Context Windows (Manual)** | `context` | Universal context window scheduling node. Splits long sequences into sliding windows for piecewise processing. Supports reference frame prefix, noise shuffling, multiple scheduling strategies (uniform/static/cyclic/batched), and fusion modes (pyramid/linear/relative) |
 | **Wan SCAIL-2 Context Windows** | `context` | SCAIL-2 dedicated context window node. Automatically handles SCAIL-2 specific conditioning fields (ref_mask_28ch, driving_mask_28ch, pose_video_latent). No prefix reference frames needed. Works with WanSCAILToVideoMultiRef |
-| **Context Window Anchor** | `context` | [Experimental / test-only] Cross-window alignment anchor for context-window sampling (**effectiveness and side effects not fully validated; testing reference only**). Replaces the leading driving-video latent frame(s) of every window (animate2: pose_latents; SCAIL-2: pose_latents + driving mask sam_latents) with window 0's frame of the current segment, so all windows share one alignment reference, easing scale/position jumps at window seams. Must be placed after a context windows node |
+| **Context Window Anchor + Halo (unified-basis anchoring + two-sided halo)** | `context` | [Experimental / test-only] Unified-basis anchoring + two-sided halo for context-window sampling (**effectiveness and side effects not fully validated; testing reference only**). (1) Anchoring: prepends the unified-basis frames as **extra frames** between the reference prefix and the window frames (no more replacement, which rewrote the window's own driving content in the overlap); (2) two-sided halo: lets each window *see* N real neighbouring frames on both sides without taking part in fusion, so no frame sits on the two windows' weakest edges any more. All-zero parameters disable it (equivalent to not installing the node). Must be placed after a context windows node |
 
 ---
 
@@ -288,89 +288,73 @@ A context window scheduling node for WAN-type video generation models. When vide
 
 ---
 
-### Context Window Anchor
-> ⚠️ **Experimental / test-only node (not fully validated)**: this node is kept in the repository **for testing and reference only**. Neither its **effectiveness** (whether it really eases the scale/position jumps at the window seams) nor its **side effects** (impact on image quality, identity consistency, motion naturalness, sampling stability, etc.) **has been fully tested or validated**, and it is not guaranteed to be safe across different models / LoRAs / parameter combinations.
-> Always A/B it locally with the **same seed** (see [Experiment tips](#experiment-tips)) before relying on it, and do not depend on it in production workflows. When the node is not wired into a workflow, its code path never runs and existing node behaviour is unchanged.
+### Context Window Anchor + Halo (unified-basis anchoring + two-sided halo)
+> ⚠️ **Experimental / test-only node (not fully validated)**: kept **for testing and reference only**. Neither its **effectiveness** nor its **side effects** (image quality, identity consistency, motion naturalness, sampling stability) **have been fully validated**. **All-zero parameters make this node exactly equivalent to not installing it.**
+> Always A/B locally with the **same seed** ("all zeros" vs "one mechanism on") before relying on it.
 
+**Problem it addresses**: neither animate2 nor SCAIL-2 has an explicit spatial anchor (no skeleton) — the reference-image ↔ driving alignment is inferred **in-context inside each clip**; and once windows are used, RoPE is always `0..L-1` per window (verified in `comfy/ldm/wan/model.py` and `model_animate2.py`), so the only way a window can tell where it is, is its conditioning. Hence:
 
-[Experimental] **Problem it addresses**: for animate2 / SCAIL-2 the body-proportion and spatial alignment between the reference image and the driving video is derived by the model **per window**. With context-window sampling each window only carries its own driving-video frames, so every window starts from a different pose → each window ends up with a different alignment reference → visible scale/position jumps at the window seams.
+- every window **re-infers its alignment basis from its own head** → a different starting point yields a different result for the same global frame → adjacent windows disagree in the overlap (**ghosting / motion mismatch**);
+- if the head pose is far from the reference image, the inference fails → **the whole segment breaks structurally**.
 
-**What this node does**: it replaces the leading K latent frame(s) of the driving video in every window w>0 with window 0's frames **of the current segment** (i.e. the segment's first driving frame), so all windows align to one reference; for SCAIL-2 the driving mask (`sam_latents`) is anchored as well.
+Measured (proxy experiment: two overlapping clips generated independently with the same seed): **prepending a shared head** makes both clips converge at the same global frame (big poses match, only detail/spatial residuals remain); without it the same global frame differs wildly and one clip is structurally distorted.
+
+**What this node does (two independently switchable mechanisms)**:
+
+1. **Anchoring (splice-style)**: prepends the unified-basis frames as **extra frames** between the reference prefix and the window frames; they take part in sampling and are trimmed afterwards. **Replacement is no longer used** — replacing rewrites the window's own driving content exactly in the overlap region and therefore *creates* inconsistency.
+2. **Two-sided halo**: lets each window *see* N real neighbouring frames before and after its own frames **without** taking part in fusion (trimmed after sampling). Every owned frame then sits inside its window with real context on both sides, instead of always sitting on the two windows' weakest edges.
+
+**Slice layout** (x coordinates): `[reference prefix] [anchor frames] [head halo] [window frames (fused)] [tail halo]`.
 
 #### Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `model` | MODEL | — | Model already wrapped by a context windows node (required): the model output of `Custom Context Windows (Manual)` or `Wan SCAIL-2 Context Windows` |
-| `enabled` | BOOLEAN | true | When off the model is passed through unchanged |
-| `anchor_targets` | COMBO | Driving video + mask (auto) | What to anchor (dropdown): `驱动视频 + 驱动遮罩 (auto)` / `仅驱动视频 (pose only)` / `仅驱动遮罩 (mask only)`. Driving video = the pose branch (`pose_latents` for animate2 and SCAIL-2); driving mask = SCAIL-2's `driving_mask` (`sam_latents`) |
-| `anchor_frames` | INT | 1 | Number of leading latent frames anchored per window; 0 disables |
-| `anchor_offset` | INT | -1 (auto) | Slice start offset. `-1` = auto: skip the prefix-derived frames at the slice head (`max(0, prefix_frames - 1)`) so anchoring starts at the window's own first driving frame; set `0/1/…` to override for experiments |
-| `blend` | FLOAT | 1.0 | 1.0 fully replaces with window 0's frame; below 1.0 linearly blends with the window's own frame (helps when the pose jump-back causes jitter) |
-| `apply_to_negative` | BOOLEAN | true | Also anchor the negative conditioning under CFG (both sides receive the same driving condition, so results stay consistent and CFG is not skewed) |
-| `log_debug` | BOOLEAN | false | Logs per-window hits, shapes and first-frame stats for verification |
-| `anchor_steps` | INT | -1 (all steps) | Anchor only during the first N sampling steps: `-1` = all steps (default), `0` = never, `N>0` = first N steps. **Time gating**: every step gets a real signal (anchor or segment), unlike `blend` (amplitude mixing, which feeds a synthetic intermediate) |
-| `global_pose_frames` | IMAGE | unconnected | *Optional* head frames of the driving/pose video (as many as you feed): encoded to latents and used to replace the first M frames of the anchor band (`M=((T-1)//4)+1`). More frames than needed = full replacement; fewer = partial; unconnected = per-segment anchor only |
-| `global_mask_frames` | IMAGE | unconnected | *Optional (SCAIL-2)* head frames of the colored mask video, encoded via `_extract_mask_to_28ch` and used to replace the first M frames of the mask anchor (not used by animate2) |
-| `vae` | VAE | unconnected | *Optional* VAE used only to encode `global_pose_frames` (the mask pool needs no VAE) |
+|---|---|---|---|
+| `model` | MODEL | — | Model that already has a context windows node applied (required): `Custom Context Windows (Manual)` or `Wan SCAIL-2 Context Windows` |
+| `enabled` | BOOLEAN | true | Master switch; when off the model passes through |
+| `anchor_frames` | INT | 0 | Number of spliced anchor frames; `0` disables. `1~2` recommended (matches the training-time "first two latent frames = history", SCAIL-2 appendix B; equals `continue_motion_max_frames=5` pixel frames ≈ 2 latent frames) |
+| `anchor_source` | COMBO | 本段窗口0开头 | Basis source: `本段窗口0开头` = the first frames of the segment's window 0 (**window 0 is skipped automatically**, avoiding self-duplication); `本段开头` = the segment's first video frames. Both live inside x → index-only, zero copies |
+| `halo_frames_head` | INT | 0 | Head halo: preceding latent frames the window can see (context only, not fused); `0` disables. Always 0 for the first window |
+| `halo_frames_tail` | INT | 0 | Tail halo: following latent frames the window can see (context only, not fused); `0` disables. Clipped for the last window |
+| `log_debug` | BOOLEAN | false | Log per-window splice details (prefix / anchor / head / tail counts) |
 
 #### How it works / boundaries
 
-- **Layer**: conditioning level — post-processing right after each window's conds are re-sliced, so it applies on **every sampling step**; the x/latent layer is untouched, so fusion weights, overlap and FreeNoise behave exactly as before.
-- **Anchor position**: the context node prepends the prefix indices (chunk frames `0..P-1`) to every window's `index_list`, and the driving-video / driving-mask slices are built from that same `index_list` → every window's slice head carries `P-1` extra "**prefix-derived frames**" (zero-padded frames with multiple references; the chunk's opening driving frames with a single reference), identical across all windows → anchoring those frames leaves the values unchanged, so `anchor_offset` skips them automatically:
-  - prefix `P = 0` or `1` → offset `0` (same as the earliest version's behaviour);
-  - prefix `P = 6` (6 reference images) → offset `5` (the anchor lands on the window body's first driving frame).
-- **Per chunk, never cross-chunk**: the anchor source is always window 0 of the current segment; the snapshot is refreshed at window 0 of every sampling step.
-- **Values only, never lengths**: the animate2 check `pose_latents.shape[2] == f_gen - 1` is unaffected.
-- **Windowed tensors only**: it targets the given keys inside `model_conds`; tensors longer than the window (for example SCAIL's `ref_mask_latents`, which holds "reference frames + window frames") are skipped automatically.
-- **Implementation**: the handler instance in `model_options["context_handler"]` is shallow-copied and its `get_resized_cond` / `execute` are wrapped; the handler class is not modified and neither context windows node is touched.
+- **Level**: rewrites each window's `index_list` (plus head/tail extra-segment indices) *before* per-window conditioning is re-sliced, so all three slicing paths are covered: the plugin handler's `get_resized_cond` (including the SCAIL handler), the model-level `resize_cond_for_context_window`, and core `slice_cond` (index_list + temporal_offset). Effective on **every sampling step**.
+- **Conditioning follows automatically**: `cond_indices_for_window()` (in `Custom_context.py`) derives the coordinate system from the cond vs x length: equal → same coordinates; `cond_len == x_len - 1` → one-frame reference-slot offset (matching animate2's `rope_encode_pose(t_start=1)` and core `slice_cond(temporal_offset=1)`). This also **fixes a possible one-frame pose offset for prefixed animate2 windows**; when cond and x have equal length the behaviour is unchanged.
+- **Trimmed before fusion**: the head segment (prefix + anchor + head halo) and the tail segment are trimmed inside `combine_context_window_results`; the remaining length must equal the window frame count (a warning is logged otherwise), so anchor/halo frames **never enter the fused result**.
+- **First/last window**: the first window's head segment is always 0 (the basis already lives there and the front is the reference-prefix region); the last window's tail halo is clipped. Cross-chunk continuity stays with `continue_motion` / `previous_frames`.
+- **Recommended combo**: **two-sided halo + context node `overlap = 0`** — owned frames no longer overlap, each global frame has exactly one writer, and the existing "sum / counts" averaging degenerates to owner-takes-all, removing the "two divergent predictions averaged" cause of ghosting.
+- **Frame budget**: `context_length + head extra + tail extra` should stay ≤ ≈21 latent frames (81 pixel frames = training length).
+- **Implementation**: shallow-copies the handler in `model_options["context_handler"]` and wraps its `get_context_windows` (the handler class is not modified).
+- **With FreeNoise enabled**: noise shuffling is window-index based and interacts with the extended `index_list`; A/B with FreeNoise off first.
 
 #### Wiring
 
 ```
-[Load Model] → Custom Context Windows (Manual) → Context Window Anchor → [KSampler] → [VAE Decode] → Output
-[Load Model] → Wan SCAIL-2 Context Windows    → Context Window Anchor → [KSampler] → [VAE Decode] → Output
+[Load Model] → Custom Context Windows (Manual) → Context Window Anchor + Halo → [KSampler] → [VAE Decode] → Output
+[Load Model] → Wan SCAIL-2 Context Windows    → Context Window Anchor + Halo → [KSampler] → [VAE Decode] → Output
 ```
 
-> If it is not placed after a context windows node, the node logs a warning and passes the model through (the workflow keeps running).
+> If it is not placed after a context windows node, it raises an explicit error instead of silently producing wrong results.
 
-#### Hybrid anchoring (global head + segment anchor, optional)
+#### Experiment tips (same seed / same chunk / one variable per run)
 
-By default the anchor source is "window 0 of the current segment". If you connect `global_pose_frames` (and, for SCAIL-2, `global_mask_frames`), the first M frames of the anchor band are taken from the "global" material instead:
+> A single run is easily affected by sampling randomness; repeat each setting at least twice before comparing.
 
-```
-hybrid = [first M frames of the global pool] + [remaining K-M frames of the segment anchor]
-M = ((T-1)//4)+1        # T = number of pixel frames you feed
-```
+1. **Baseline**: run with all parameters at 0 — the result must be frame-identical to not installing the node (regression check).
+2. Run again with `log_debug=true` and verify the per-window anchor/head/tail counts, and that each window keeps its own correct driving conditioning in the overlap.
+3. **Halo only**: set the context node's `overlap` to 0, then try `halo_frames_head = halo_frames_tail = 2 / 4 / 6 / 8` and watch whether seams turn from ghosting into a soft transition.
+4. **Anchor only**: restore `overlap`, try `anchor_frames = 1 / 2` with both `anchor_source` values, and watch cross-window scale/position consistency.
+5. **Both**: `overlap = 0` + `halo = 4` + `anchor_frames = 1~2`.
+6. **Quantify**: extract keypoints with the `SDPose*` nodes and compare the keypoint distance of the same global frame across adjacent windows, plus bounding-box centre/scale differences.
 
-- **Feed as many as you want** (no "how many frames" parameter): more frames than the band needs → only the first K are used (**full replacement**); fewer → **partial replacement**; nothing connected → **per-segment anchor** (identical to the previous behaviour);
-- **Resolution is matched automatically** from the sampling-time latent size (`latent×8`), so no width/height wiring is required;
-- **Masks are hard-replaced**: `sam_latents` carries spatial/identity information (8×8 color coverage × color channels); this version forces a hard replacement (even when `blend<1`) because linearly mixing two frames' patterns produces a boundary that matches neither frame (implementation choice, can be revisited);
-- **Window 0 is not replaced** (it is the anchor source), so the segment's first window keeps its original driving condition;
-- The node's **output is unchanged** (a single `model`); the three new sockets are optional and appended last, so existing workflows keep their widget values.
+#### Known limits / next steps
 
-Wiring example (using nodes you already have):
-
-```
-[full driving/pose video] -- ImageFromBatch(start=0, length=5) --> global_pose_frames
-[full colored mask video] -- ImageFromBatch(start=0, length=5) --> global_mask_frames   (SCAIL-2)
-[same Wan VAE] ------------------------------------------------> vae
-```
-> ⚠️ Take these frames from the **full video** (before the loop), not from the per-chunk cropped video inside the loop; otherwise "the first frames" just become the current segment's head and nothing changes.
-
-#### Experiment tips
-
-> Method note: keep the **same seed and the same chunk, and change only one variable per run**; a single run is easily affected by sampling randomness, so repeat each setting at least twice before comparing.
-
-1. Run once with `log_debug=true` and confirm the log shows both "record anchor source (window 0)" and the anchor lines for later windows (and whether the first-frame values differ).
-2. A/B the same seed and settings with and without the node, watching scale/position at the window seams.
-3. If the anchor causes pose jump-back jitter, keep `anchor_frames=1` and soften with `blend` (e.g. 0.5–0.8).
-4. For SCAIL-2 you can cycle `anchor_targets` through "pose only / mask only / both" to isolate the dominant factor.
-5. This feature does **not** address drift between chunks; it only aligns windows inside one segment.
-6. **Amplitude blending vs time gating**: two different trade-offs —
-   - `blend<1`: every step receives a **synthetic condition** ("anchor × α + segment × (1−α)"), which may correspond to a pose/boundary that does not really exist;
-   - `anchor_steps=N`: only the first N steps are anchored, then the real condition is restored (every step gets a real signal; switching conditions by sampling progress is the same kind of usage as the official `pose_start_percent` / `pose_end_percent`).
-   Suggested comparison: `blend=1.0 + anchor_steps=1~2` (gating) vs `blend=0.7 + anchor_steps=-1` (soft mixing).
+- The basis is unified **within one chunk** only (`本段窗口0开头` / `本段开头`). **Cross-chunk** basis unification needs a true splice channel for **external / global basis frames** (VAE-encode frames from outside the chunk and insert them as extra frames; see core `comfy/context_windows.py` `_inject_guide_frames` / `strip_guide_frames` and `causal_anchor_index`) — planned for a later version; until then, appending extra reference frames (multi-reference images) is a workable approximation.
+- Halo frames must exist inside the current chunk's x, so the first window's head halo and the last window's tail halo are necessarily 0.
+- The frame budget is limited by the training length (≈21 latent frames): bigger halos leave fewer generated frames.
+- The old **replacement-style anchoring** and its `anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / vae` parameters were removed (replacing rewrites the window's own driving content in the overlap and only had a very small effect in practice). `enabled` / `anchor_frames` / `log_debug` keep their names so existing widget values still load.
 
 ---
 
@@ -803,9 +787,10 @@ The `workflow/` directory contains complete ComfyUI workflow JSON files that can
 
 **Added**
 - `WanAnimate2ToVideoCustom`: WanAnimate2 (official second-gen architecture) video generation node
-- `Context Window Anchor` (**experimental / test-only — effectiveness and side effects not fully validated**): a cross-window alignment anchor for context-window sampling. It replaces the leading driving-video latent frame(s) of every window (animate2: `pose_latents`; SCAIL-2: `pose_latents` + driving mask `sam_latents`) with window 0's frame of the current segment, so all windows align to one reference and the scale/position jumps at window seams are eased. Applies on every sampling step, never cross-chunk, values only (no length changes); must be placed after a context windows node.
-  - Defaults: `anchor_targets=driving video + mask (auto)`, `anchor_frames=1`, `anchor_offset=-1` (auto-skip prefix-derived frames), `blend=1.0`, `apply_to_negative=true`, `log_debug=false`; both the target and the offset are plain dropdown/integer widgets (no "key:dim" text entry).
-  - **Not fully validated**: effectiveness depends on whether the model derives its alignment from the window first driving frame, and side effects (image quality / identity consistency / sampling stability) have not been systematically evaluated. Always A/B it (see Experiment tips) before relying on it, and do not depend on it in production workflows.
+- `Context Window Anchor + Halo (unified-basis anchoring + two-sided halo)` (**experimental / test-only — effectiveness and side effects not fully validated**): reworked from the previous replacement-style "window head anchor" into **one node with two independently switchable mechanisms** — (1) **splice-style anchoring**: prepends the unified-basis frames (`anchor_source`: first frames of the segment's window 0 / first frames of the segment) as extra frames between the reference prefix and the window frames, part of sampling and trimmed afterwards (replacement rewrote the window's own driving content in the overlap and had only a very small effect, so it was removed); (2) **two-sided halo**: lets the window see N real neighbouring frames on both sides without taking part in fusion, so every owned frame sits inside its window rather than on the two windows' edges. All-zero parameters are exactly equivalent to not installing it. Must be placed after a context windows node.
+  - Defaults: `anchor_frames=0` (off), `anchor_source=本段窗口0开头`, `halo_frames_head=0`, `halo_frames_tail=0`, `log_debug=false`. **Removed**: `anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / vae` (`enabled / anchor_frames / log_debug` keep their names so existing widget values still load).
+  - **Companion fixes**: `Custom_context.py` gained `cond_indices_for_window()`, which aligns the conditioning streams' coordinate system from the cond-vs-x length (`cond_len == x_len - 1` → one-frame reference-slot offset, matching the model's `rope_encode_pose(t_start=1)`), fixing a possible one-frame pose offset for prefixed animate2 windows; the `pose_video_latent` slice inside `Wan SCAIL Context Windows`, which always took the first N frames of the chunk, now follows the window's real frame indices (including anchor/halo frames) with an out-of-range warning.
+  - **Not fully validated**: the mechanism rests on the assumption that the alignment basis is locked by the clip head; side effects (image quality / identity consistency / sampling stability / frame budget) have not been systematically evaluated. Always A/B it (see Experiment tips) before relying on it, and do not depend on it in production workflows.
 
 **Removed**
 - `WanSCAILSparseAttention`: it required dense O(S²) attention masks (TB-scale at 2600 frames) which blew up memory, and showed no measurable benefit on SCAIL. Workflows still referencing it will report a missing node — just delete that node

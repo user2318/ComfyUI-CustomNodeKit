@@ -2,7 +2,7 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
-当前版本：**1.8.0** — 新增 WanAnimate2ToVideoCustom 节点（Wan2.1-I2V 底座 + 二代 pose 分支 K/V 注入，支持多参考图）；WanUni3CApply 重构为 render_video 输入（内置 VAE 编码 + 参考帧偏移，修复 render_latent 归一化偏差问题）；移除已退役的 WanSCAILSparseAttention 节点（长序列下掩码为 O(S²) 稠密矩阵，导致内存爆掉，实测在 SCAIL 上无收益）；另有一个**实验性 / 测试性节点 Context Window Anchor（窗口首帧锚定）——其有效性与副作用尚未充分验证，仅供测试参考；不接入工作流时既有行为完全不变**（详见 [Context Window Anchor (窗口首帧锚定)](#context-window-anchor-窗口首帧锚定)）。
+当前版本：**1.8.0** — 新增 WanAnimate2ToVideoCustom 节点（Wan2.1-I2V 底座 + 二代 pose 分支 K/V 注入，支持多参考图）；WanUni3CApply 重构为 render_video 输入（内置 VAE 编码 + 参考帧偏移，修复 render_latent 归一化偏差问题）；移除已退役的 WanSCAILSparseAttention 节点（长序列下掩码为 O(S²) 稠密矩阵，导致内存爆掉，实测在 SCAIL 上无收益）；另外还有一个**实验性 / 测试性节点 Context Window Anchor + Halo（窗口锚定 + 双侧延伸）——其有效性与副作用尚未充分验证，仅供测试参考；参数为 0 时既有行为完全不变**（详见 [Context Window Anchor + Halo](#context-window-anchor--halo-窗口锚定双侧延伸)）。
 
 本版另修复了 SDPose 偏航角在短片段素材下的必崩问题、BatchImageReplace 的 repeat_end 填充逻辑（3 张替换 4 张由 `0,2,2,2` 修正为 `0,1,2,2`），并对智能视频裁剪、交互式批量裁剪等节点做了内存/性能优化（后者预览缓存从 2600 帧约 12.5GB 降到约 48MB）。**升级前请先阅读文末的 [更新日志](#更新日志)**（其中含不兼容变更说明）。
 
@@ -22,7 +22,7 @@
   - [WanAnimate2ToVideoCustom](#wananimate2tovideocustom)
   - [WanAnimateToVideoCustom](#wananimatetovideocustom)
   - [Custom Context Windows (Manual)](#custom-context-windows-manual)
-  - [Context Window Anchor (窗口首帧锚定)](#context-window-anchor-窗口首帧锚定)
+  - [Context Window Anchor + Halo (窗口锚定/双侧延伸)](#context-window-anchor--halo-窗口锚定双侧延伸)
   - [Reference Image Selector](#reference-image-selector)
   - [SDPose 空帧修复](#sdpose-空帧修复)
   - [SDPoseDrawKeypointsV2 脚部绘制模式](#sdposedrawkeypointsv2-脚部绘制模式)
@@ -152,7 +152,7 @@ pip install -r requirements.txt
 |--------|------|------|
 | **Custom Context Windows (Manual)** | `context` | 通用上下文窗口调度节点。将长序列拆分为滑动窗口逐段处理，支持参考帧前缀、噪声混洗、多种调度策略（均匀/静态/循环/批处理）与融合模式（金字塔/线性叠加/相对加权） |
 | **Wan SCAIL-2 Context Windows** | `context` | SCAIL-2 专用上下文窗口节点。自动处理 SCAIL-2 的特殊 conditioning 字段（ref_mask_28ch、driving_mask_28ch、pose_video_latent），无需前缀参考帧。与 WanSCAILToVideoMultiRef 配合使用 |
-| **Context Window Anchor (窗口首帧锚定)** | `context` | 【实验性·测试性】上下文窗口跨窗口对齐锚定节点（**有效性与副作用尚未充分验证，仅供测试参考**）。把每个窗口的驱动视频 latent 首帧（animate2: pose_latents；SCAIL-2: pose_latents + 驱动遮罩 sam_latents）替换为当前片段窗口 0 的首帧，让各窗口以同一基准对齐，缓解窗口融合处的比例/位置跳变。必须接在上下文窗口节点之后 |
+| **Context Window Anchor + Halo (窗口锚定/双侧延伸)** | `context` | 【实验性·测试性】上下文窗口「统一基准锚定 + 双侧延伸」节点（**有效性与副作用尚未充分验证，仅供测试参考**）。① 锚定：把统一基准帧作为**额外帧**拼在参考前缀与窗口帧之间（不再替换窗口自己的帧，避免破坏重叠区的逐帧对应）；② 双侧延伸：把窗口前后各 N 帧真实相邻帧纳入视野但不参与融合，让每个帧都不再落在两个窗口的边缘。参数为 0 即关闭（等价于不装本节点）。必须接在上下文窗口节点之后 |
 
 ---
 
@@ -291,90 +291,73 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 
 ---
 
-### Context Window Anchor (窗口首帧锚定)
-> ⚠️ **实验性 / 测试性节点（未充分验证）**：本节点保留在仓库中**仅供测试与参考**。其**有效性**（能否真正缓解窗口接缝处的比例/位置跳变）与**副作用**（对画质、人物一致性、动作自然度、采样稳定性等的影响）**均未经过充分测试与验证**，也不保证在不同模型 / LoRA / 参数组合下都安全无害。
-> 请务必先在本地用**同一 seed** 做“加节点 vs 不加节点”的对比（见下方 [实验建议](#实验建议)）再决定是否长期使用，不建议在正式生产工作流中依赖它。该节点未接入工作流时，其代码路径不参与执行，既有节点行为完全不变。
+### Context Window Anchor + Halo (窗口锚定/双侧延伸)
+> ⚠️ **实验性 / 测试性节点（未充分验证）**：本节点保留在仓库中**仅供测试与参考**。其**有效性**与**副作用**（对画质、人物一致性、动作自然度、采样稳定性等的影响）**均未经过充分测试与验证**，也不保证在不同模型 / LoRA / 参数组合下都安全无害。
+> 请务必先用**同一 seed** 做「参数全 0 vs 打开某机制」的对比再决定是否长期使用。**参数全为 0 时本节点完全等价于不安装**（不改动任何窗口）。
 
+**要解决的问题**：animate2 / SCAIL-2 都没有骨骼这类显式空间锚，「参考图 ↔ 驱动」的对齐是在片段内部 **in-context 推断**出来的；而窗口化之后 RoPE 每个窗口都恒为 `0..L-1`（不携带绝对时间信息，见 `comfy/ldm/wan/model.py` 与 `model_animate2.py`），模型区分窗口身份只能靠 conditioning。于是：
 
-【实验性】**要解决的问题**：animate2 / SCAIL-2 的「参考图 ↔ 驱动视频」身体比例与空间位置对齐由模型内部**逐窗口**推导。上下文窗口采样时，每个窗口的驱动视频 latent 只包含本窗口对应的帧，窗口首帧姿态各不相同 → 每个窗口的对齐基准不同 → 窗口融合后出现比例/位置跳变（接缝错位）。
+- 每个窗口都**从自己的开头重新推断对齐基准** → 起点不同，则同一全局帧的生成结果不同 → 相邻窗口在重叠区不一致（**重影 / 动作对不上**）；
+- 起点那一帧的姿态若与参考图差得远 → 推断失败 → **整段结构与动作崩坏**。
 
-**本节点做什么**：把窗口 w>0 的驱动视频 latent 前 K 个 latent 帧，替换为**当前片段窗口 0**（即本段驱动视频首帧）的同名张量前 K 帧，让所有窗口以同一基准对齐；SCAIL-2 的驱动遮罩（`sam_latents`）同时锚定。
+实测（用「两段有重叠的片段各自单窗生成、同 seed」做代理实验）：**只把统一开头拼到两段头部**，两段在同一全局帧上就大幅趋同（大姿势一致，只剩细节与空间位置的残差）；不拼则同一全局帧差别巨大，其中一段结构扭曲。
+
+**本节点做什么（两个可独立开关的机制）**：
+
+1. **锚定（拼接式）**：把「统一基准帧」作为**额外帧**拼在参考前缀与窗口帧之间参与采样，采样后裁掉。**不再使用「替换」**——替换会把重叠区里窗口自己的驱动内容改掉，反而制造不一致（旧实现「只有一点点效果」的原因之一）。
+2. **双侧延伸**：把窗口前后各 N 帧**真实相邻帧**纳入窗口视野，但**不参与融合**（采样后裁掉）。这样每个「被拥有」的帧都处在窗口内部、前后都有上下文，而不是永远落在两个窗口的边缘。
+
+**切片结构**（x 坐标系）：`[参考前缀] [锚定帧(统一基准)] [前延伸帧(紧邻)] [本窗口帧(参与融合)] [后延伸帧]`——前缀与头/尾段只作为采样时的上下文，融合前会被裁掉。
 
 #### 参数说明
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `model` | MODEL | — | 已接入上下文窗口节点的模型（必填）：`Custom Context Windows (Manual)` 或 `Wan SCAIL-2 Context Windows` 的 model 输出 |
-| `enabled` | BOOLEAN | true | 是否启用；关闭时模型直接透传 |
-| `anchor_targets` | COMBO | 驱动视频 + 驱动遮罩 (auto) | 要锚定的目标（下拉选择）：`驱动视频 + 驱动遮罩 (auto)` / `仅驱动视频 (pose only)` / `仅驱动遮罩 (mask only)`。驱动视频 = pose 分支（animate2 与 SCAIL-2 都是 `pose_latents`）；驱动遮罩 = SCAIL-2 的 `driving_mask`（`sam_latents`）|
-| `anchor_frames` | INT | 1 | 每个窗口锚定前 K 个 latent 帧；0=关闭 |
-| `anchor_offset` | INT | -1（自动） | 切片内起始帧偏移。`-1`=自动：跳过切片头部的"前缀派生帧"（`max(0, 前缀帧数-1)`），从**窗口自身的第一个驱动帧**开始锚定；也可填 `0/1/…` 手动指定做实验 |
-| `blend` | FLOAT | 1.0 | 1.0=完全替换为窗口 0 的首帧；<1.0 与窗口自身首帧线性混合（用于缓解首帧姿态回跳造成的抖动） |
-| `apply_to_negative` | BOOLEAN | true | CFG 下是否同时锚定 negative（两边传入同一份驱动条件，锚定结果一致，不会造成 CFG 偏斜） |
-| `log_debug` | BOOLEAN | false | 打印每个窗口命中的键、shape 与首帧数值，用于确认锚定是否生效 |
-| `anchor_steps` | INT | -1（全程） | 只在前 N 个采样步锚定：`-1`=全程（默认）、`0`=不锚定、`N>0`=前 N 步。**时间门控**：每步都给真实信号（要么锚、要么本段），与 `blend`（幅度混合，会喂合成中间态）是两条不同的路 |
-| `global_pose_frames` | IMAGE | 不接 | 【可选】驱动/pose 视频开头的若干像素帧（给多少用多少）：编码成 latent 后替换锚定带的前 M 帧（`M=((T-1)//4)+1`）。给多了=完全替换、给少了=部分替换；不接=纯本段锚定 |
-| `global_mask_frames` | IMAGE | 不接 | 【可选，SCAIL-2】彩色遮罩视频开头的若干像素帧，按 `_extract_mask_to_28ch` 编码后替换遮罩锚的前 M 帧（animate2 用不到） |
-| `vae` | VAE | 不接 | 【可选】仅用于把 `global_pose_frames` 编码成 latent（接同一个 Wan VAE）；遮罩池不需要 VAE |
+| `enabled` | BOOLEAN | true | 总开关；关闭时模型直接透传 |
+| `anchor_frames` | INT | 0 | **拼接式锚定**的帧数；`0`=关闭。建议 `1~2`（量级对齐训练期「首 2 个 latent 帧 = 历史」，见 SCAIL-2 论文附录 B；也对应 `continue_motion_max_frames=5` 像素帧 ≈ 2 latent 帧） |
+| `anchor_source` | COMBO | 本段窗口0开头 | 基准源：`本段窗口0开头`=当前片段第一个窗口的开头若干帧（**首窗自动跳过**，避免自我重复）；`本段开头`=当前片段最前的若干视频帧。二者都在 x 内，纯索引实现、零拷贝 |
+| `halo_frames_head` | INT | 0 | **双侧延伸·前**：把窗口之前的 N 个 latent 帧纳入窗口视野（只做上下文、不参与融合）；`0`=关闭。首窗自动为 0（前面是参考前缀区） |
+| `halo_frames_tail` | INT | 0 | **双侧延伸·后**：把窗口之后的 N 个 latent 帧纳入窗口视野（只做上下文、不参与融合）；`0`=关闭。末窗自动截断 |
+| `log_debug` | BOOLEAN | false | 打印每个窗口的拼接明细（前缀/锚定/前延伸/后延伸帧数） |
 
 #### 生效机制与边界
 
-- **生效层级**：conditioning 层 —— 在每个窗口的 cond 重切分之后做后处理，因此**每个采样步都会生效**；不触碰 x/latent 层，与窗口融合权重、overlap、FreeNoise 互不干扰。
-- **锚点位置**：上下文节点会把前缀索引（chunk 的 `0..P-1` 帧）拼到每个窗口的 `index_list` 前面，而驱动视频/驱动遮罩的切片用的正是 `index_list` → 每个窗口的切片头部都会多出 `P-1` 帧"**前缀派生帧**"（多参考图时是零填充帧；单参考图时是 chunk 开头几帧的驱动内容），且它们对所有窗口完全相同 → 锚在这些帧上时，替换前后的数值相同（即不改变数据），故 `anchor_offset` 默认自动跳过它们：
-  - 前缀 `P = 0` 或 `1` → 偏移 `0`（与最早版本行为相同）；
-  - 前缀 `P = 6`（6 张参考图）→ 偏移 `5`（锚点落在窗口 body 的第一个驱动帧）。
-- **不跨 chunk**：锚定源始终是"当前这一段"的窗口 0，每段各自锚定（快照在每个采样步的窗口 0 处刷新）。
-- **只改数值、不改长度**：animate2 的 `pose_latents.shape[2] == f_gen - 1` 帧数校验不受影响。
-- **只处理按窗口切分过的张量**：仅作用于 `model_conds` 内的目标键；长度超过窗口帧数的整段条件会被自动跳过（例如 SCAIL 的 `ref_mask_latents` 这类"参考帧 + 窗口帧"张量默认不在锚定范围内）。
-- **实现方式**：对 `model_options["context_handler"]` 上的 handler 实例做浅拷贝后包装其 `get_resized_cond` / `execute`，不修改 handler 的类，也不改动上下文窗口节点的任何代码。
+- **生效层级**：改写每个窗口的 `index_list`（外加头/尾额外段索引），发生在 per-window 条件重切分**之前**，因此对三条切片路径同时生效：插件 handler 的 `get_resized_cond`（含 SCAIL 专用 handler）、模型级 `model.resize_cond_for_context_window`、核心 `slice_cond`（按 `index_list` + `temporal_offset`）。**每个采样步都会生效**。
+- **条件流自动对齐**：新增的 `cond_indices_for_window()`（`Custom_context.py`）按 cond 与 x 的时间长度关系自动判定坐标系：两者相等 → 同坐标系；`cond_len == x_len - 1` → 按「参考槽偏移 1 帧」映射（与 animate2 模型侧 `rope_encode_pose(t_start=1)`、核心 `slice_cond(temporal_offset=1)` 一致）。**这同时修掉了此前 animate2 带前缀窗口时 pose 切片可能整体偏 1 帧的问题**；当 cond 与 x 等长时行为与旧版完全一致。
+- **融合前裁剪**：头段（前缀 + 锚定 + 前延伸）与尾段（后延伸）在 `combine_context_window_results` 里被裁掉，且裁剪后长度必须等于窗口帧数（不一致会打 warning）→ 锚定/延伸帧**不会进入融合结果**。
+- **首窗 / 末窗自动处理**：首窗头段自动为 0（基准源本来就在首窗内、前面是参考前缀区），末窗尾段自动截断（越过 chunk 末尾没有内容）。跨 chunk 的连续性仍由 `continue_motion` / `previous_frames` 负责。
+- **推荐组合**：**双侧延伸 + 上下文节点 `overlap = 0`** —— 各窗口「拥有」的帧互不重叠，每个全局帧只被一个窗口写入，现有「累加 / counts」加权平均自动退化为「owner 说了算」，从根本上消除「两份分歧预测被平均」导致的重影。
+- **帧数预算**：窗口总长（`context_length + 头段 + 尾段`）建议不超过 ≈21 latent 帧（= 81 像素帧，模型训练长度），否则会推到训练范围之外。
+- **实现方式**：对 `model_options["context_handler"]` 上的 handler 实例做浅拷贝后包装其 `get_context_windows`，不修改 handler 的类，也不改动上下文窗口节点的其它逻辑。
+- **若开启了 FreeNoise**：噪声混洗按窗口索引进行，与扩展后的 `index_list` 会互相影响；建议先关闭 FreeNoise 做对照。
 
 #### 典型接线
 
 ```
-[加载模型] → Custom Context Windows (Manual) → Context Window Anchor → [KSampler] → [VAE Decode] → 输出
-[加载模型] → Wan SCAIL-2 Context Windows    → Context Window Anchor → [KSampler] → [VAE Decode] → 输出
+[加载模型] → Custom Context Windows (Manual) → Context Window Anchor + Halo → [KSampler] → [VAE Decode] → 输出
+[加载模型] → Wan SCAIL-2 Context Windows    → Context Window Anchor + Halo → [KSampler] → [VAE Decode] → 输出
 ```
 
-> 未接在上下文窗口节点之后时，节点会打印警告并原样透传模型（不会中断工作流）。
+> 未接在上下文窗口节点之后时，节点会直接报错提示（不会静默产出错误结果）。
 
-#### 混合锚定（全局头部 + 本段锚，可选）
+#### 实验建议（同 seed / 同 chunk / 每次只改一个变量）
 
-默认锚定源是「本段窗口 0 的首帧」。接上 `global_pose_frames`（SCAIL-2 再加 `global_mask_frames`）后，锚定带的前 M 帧改用"全局素材"：
+> 单组结果容易受采样随机性影响，建议同组重复跑 2 次以上再比较。
 
-```
-hybrid = [全局池的前 M 帧] + [本段窗口0 锚的其余 K−M 帧]
-M = ((T−1)//4)+1        # T = 你接入的像素帧数
-```
+1. **基线**：参数全 0 跑一次——结果应与你不装本节点时**逐帧一致**（这是回归判据）。
+2. 开 `log_debug=true` 再跑一次，确认每个窗口的「锚定 / 前延伸 / 后延伸」帧数与预期一致，且相邻窗口在重叠区仍各自保留正确的驱动条件。
+3. **只开双侧延伸**：先把上下文节点 `overlap` 设为 0，再试 `halo_frames_head = halo_frames_tail = 2 / 4 / 6 / 8`，观察接缝处是否从「重影」变成「软过渡」。
+4. **只开锚定**：`overlap` 恢复原值，试 `anchor_frames = 1 / 2`（`anchor_source` 两种都试），观察跨窗口的比例与位置是否趋于一致。
+5. **两者叠加**：`overlap = 0` + `halo = 4` + `anchor_frames = 1~2`。
+6. **量化建议**：用 `SDPose*` 节点提取关键点，比较「同一全局帧在相邻两个窗口各自输出里的关键点距离」以及包围盒中心 / 尺度差——比肉眼看重影稳定得多。
 
-- **给多少用多少**（没有"取多少帧"参数）：给的帧数超出锚定带 → 只取前 K 帧（**完全替换**）；不足 → **部分替换**；不接 → **纯本段锚定**（与之前行为完全一致）；
-- **分辨率自动对齐**：按采样期 latent 的空间尺寸反推（`latent×8`），你不需要接 width/height；
-- **遮罩按硬替换处理**：`sam_latents` 承载空间/身份信息（8×8 块的颜色覆盖率 × 颜色通道），本版本对其强制硬替换（即使 `blend<1` 也按 1.0 处理）——线性混合两帧图案会得到与任一帧都不对应的边界（实现选择，后续可再评估）；
-- **窗口 0 不参与替换**（它是锚定源），因此本段第一个窗口的驱动条件保持不变；
-- 本节点的**输出不变**（仍是单个 `model`），三个新输入都是可选插口，接在参数区末尾，旧工作流的参数不会错位。
+#### 已知边界与后续方向
 
-接线示例（用你工作流里已有的节点即可）：
-
-```
-[完整驱动/pose 视频] -- ImageFromBatch(start=0, length=5) --> global_pose_frames
-[完整彩色遮罩视频]   -- ImageFromBatch(start=0, length=5) --> global_mask_frames   (SCAIL-2)
-[同一个 Wan VAE] ----------------------------------------> vae
-```
-> ⚠️ 这两个"全局素材"要取自**整段视频**（循环之前），不要取循环里已被裁成"当前片段"的视频，否则"开头几帧"会变成本段开头，等于没换。
-
-#### 实验建议
-
-> 方法提醒：以下对比建议**同 seed、同 chunk、每次只改一个变量**；单组结果容易受采样随机性影响，建议同组重复跑 2 次以上再比较。
-
-1. 先开 `log_debug=true` 跑一次，确认日志里既有"记录锚定源 窗口0"也有后续窗口的"锚定"行（并对比首帧数值是否不同）。
-2. 同 seed、同参数做"加节点 vs 不加节点"对比，重点看窗口接缝处的人物比例与位置。
-3. 若出现首帧姿态回跳引起的抖动：先保持 `anchor_frames=1`，再用 `blend`（如 0.5~0.8）软化。
-4. SCAIL-2 可把 `anchor_targets` 依次切到"仅驱动视频 / 仅驱动遮罩 / 两者都锚"，以定位主要影响因素。
-5. 该功能**不解决跨段（chunk 之间）的对齐漂移**，仅作用于同一段内的各窗口。
-6. **幅度混合 vs 时间门控**：两者是不同取舍——
-   - `blend<1`：每一步都喂"锚 ×α + 本段 ×(1−α)"的**合成条件**（可能对应不存在的中间姿态/边界）；
-   - `anchor_steps=N`：**只在前 N 步锚定**，之后回归真实条件（每步都是真实信号；按采样进度切换条件与官方 `pose_start_percent/pose_end_percent` 属同一类用法）。
-   建议对比这两组：`blend=1.0 + anchor_steps=1~2`（门控）vs `blend=0.7 + anchor_steps=-1`（软混合）。
-
+- 锚定基准目前只在**同一 chunk 内**统一（`本段窗口0开头` / `本段开头`）。**跨 chunk 的基准统一**需要「外部 / 全局基准帧」的**真拼接**通道（把 chunk 之外的帧 VAE 编码后按额外帧插入，可参考核心 `comfy/context_windows.py` 的 `_inject_guide_frames` / `strip_guide_frames` 与 `causal_anchor_index` 的做法）——属于后续版本；当前可先用「多张参考图（追加参考帧）」近似。
+- 双侧延伸的帧必须存在于当前 chunk 的 x 内，因此首窗的前延伸与末窗的后延伸必然为 0；跨 chunk 连续性仍由 `continue_motion` / `previous_frames` 提供。
+- 帧数预算受模型训练长度限制（≈21 latent 帧）：halo 越大，可「生成」的窗口帧越少，超预算可能掉质量。
+- 旧版本的**替换式锚定**及其 `anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / vae` 参数已移除（替换会改掉重叠区里窗口自己的驱动内容，实测只有很小效果）。旧工作流用到这些参数时重新连线即可。参数名 `enabled` / `anchor_frames` / `log_debug` 保留，旧值仍会被读取。
 ---
 
 ### Reference Image Selector
@@ -1138,9 +1121,10 @@ SCAIL-2 专用的上下文窗口节点，与通用的 `Custom Context Windows (M
 
 **新增**
 - `WanAnimate2ToVideoCustom`：WanAnimate2（官方二代架构）视频生成节点
-- `Context Window Anchor (窗口首帧锚定)`（**实验性 / 测试性——有效性与副作用尚未充分验证**）：上下文窗口的跨窗口对齐锚定节点。把每个窗口的驱动视频 latent 首帧（animate2: `pose_latents`；SCAIL-2: `pose_latents` + 驱动遮罩 `sam_latents`）替换为当前片段窗口 0 的首帧，使各窗口以同一基准对齐，缓解窗口融合处的比例/位置跳变。每采样步生效、不跨 chunk、只改数值不改长度；必须接在上下文窗口节点之后。
-  - 默认参数：`anchor_targets=驱动视频 + 驱动遮罩 (auto)`、`anchor_frames=1`、`anchor_offset=-1`（自动跳过前缀派生帧）、`blend=1.0`、`apply_to_negative=true`、`log_debug=false`；锚定目标与偏移都以**下拉/整数**呈现，无需手填任何"键名:维度"字符串。
-  - **未充分验证**：有效性取决于模型内部对齐是否依赖窗口首帧，副作用（画质 / 人物一致性 / 采样稳定性）尚未系统评估；请按上文“实验建议”做开/关对比后再决定是否长期使用，不建议在正式生产工作流中依赖它。
+- `Context Window Anchor + Halo (窗口锚定/双侧延伸)`（**实验性 / 测试性——有效性与副作用尚未充分验证**）：由原「窗口首帧锚定（替换式）」改造而来，合并为**一个节点、两个可独立开关的机制**——① **拼接式锚定**：把统一基准帧（`anchor_source`：本段窗口0开头 / 本段开头）作为额外帧拼在参考前缀与窗口帧之间参与采样、采样后裁掉（替换式会把重叠区里窗口自己的驱动内容改掉，实测只有很小效果，已移除）；② **双侧延伸**：把窗口前后各 N 帧真实相邻帧纳入窗口视野但不参与融合，使每个被拥有的帧都处在窗口内部而非两窗边缘。参数全为 0 时完全等价于不安装。必须接在上下文窗口节点之后。
+  - 默认参数：`anchor_frames=0`（关闭）、`anchor_source=本段窗口0开头`、`halo_frames_head=0`、`halo_frames_tail=0`、`log_debug=false`。**移除**：`anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / vae`（其中 `enabled / anchor_frames / log_debug` 参数名保留，旧值仍会被读取）。
+  - **配套修复**：`Custom_context.py` 新增 `cond_indices_for_window()`，按 cond 与 x 的长度关系自动对齐条件流坐标系（`cond_len == x_len - 1` 时按参考槽偏移 1 帧，与模型侧 `rope_encode_pose(t_start=1)` 一致），修掉了 animate2 带前缀窗口时 pose 切片可能整体偏 1 帧的问题；`Wan SCAIL Context Windows` 中原本固定取 chunk 前 N 帧的 `pose_video_latent` 切片改为按窗口真实帧索引（含锚定/延伸段）并带越界告警。
+  - **未充分验证**：有效性取决于「对齐基准是否由片段开头锁定」这一假设，副作用（画质 / 人物一致性 / 采样稳定性 / 帧数预算）尚未系统评估；请按上文「实验建议」做开/关对比后再决定是否长期使用，不建议在正式生产工作流中依赖它。
 
 **移除**
 - `WanSCAILSparseAttention`：长序列下需要构造 O(S²) 的稠密注意力掩码（2600 帧时可达 TB 级），导致内存直接爆掉，且实测在 SCAIL 上无明显收益，故彻底移除。旧工作流若引用它会提示"缺失节点"，删除该节点即可

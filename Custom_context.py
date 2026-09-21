@@ -67,6 +67,20 @@ class IndexListContextWindow(ContextWindowABC):
         # 记录原始窗口帧索引（不含前缀），由外部设置
         self.original_indices: list[int] = []
         self.prefix_length: int = 0
+        # ---- 锚定 / 双侧延伸（由 Context Window Anchor 节点写入）----
+        # 头段：参考前缀之后、窗口帧之前的额外帧（顺序 = 锚定帧 → 紧邻的前延伸帧）
+        self.head_extra_indices: list[int] = []
+        # 尾段：窗口帧之后的额外帧（后延伸）
+        self.tail_extra_indices: list[int] = []
+        # 这两段只做「统一基准 / 上下文」用，不参与窗口融合（融合前会被裁掉）
+
+    def frame_indices(self) -> list[int]:
+        """窗口参与采样的全部帧（不含参考前缀）= 头段 + 窗口帧 + 尾段（x 坐标系）。"""
+        return list(self.head_extra_indices) + list(self.original_indices) + list(self.tail_extra_indices)
+
+    def extra_counts(self) -> tuple:
+        """返回 (头段帧数, 尾段帧数)。"""
+        return len(self.head_extra_indices), len(self.tail_extra_indices)
 
     def get_tensor(self, full: torch.Tensor, device=None, dim=None, retain_index_list=None) -> torch.Tensor:
         if dim is None:
@@ -129,6 +143,39 @@ class ContextFuseMethod:
 
 
 ContextResults = collections.namedtuple("ContextResults", ['window_idx', 'sub_conds_out', 'sub_conds', 'window'])
+
+
+# 坐标映射告警去重（避免每个采样步/每个窗口刷屏）
+_COND_MAPPING_LOGGED = set()
+
+
+def cond_indices_for_window(window, cond_len: int, x_len: int, key: str = "cond") -> list:
+    """把窗口帧索引（x 坐标系，含锚定/双侧延伸段）映射到条件流（pose / 遮罩）的帧索引。
+
+    按 cond 张量与 x 的时间长度关系自动判定坐标系：
+      - cond_len == x_len     : 同一坐标系 → 直接取窗口帧索引
+      - cond_len == x_len - 1 : cond 少 1 个「参考槽」帧（animate2 的 pose 分支，模型侧
+                                rope_encode_pose(t_start=1)：pose 帧 j ↔ 生成帧 j+1），
+                                故窗口帧 i 对应 cond 帧 i-1（与核心 slice_cond(temporal_offset=1) 一致）
+      - 其它                  : 按同坐标系裁剪并只告警一次（可能错位）
+    越界保护：只保留落在 [0, cond_len) 内的索引。
+    """
+    full = window.frame_indices() if hasattr(window, "frame_indices") else list(window.original_indices)
+    if cond_len == x_len:
+        return [i for i in full if 0 <= i < cond_len]
+    if cond_len == x_len - 1:
+        if ("slot_offset", key) not in _COND_MAPPING_LOGGED:
+            _COND_MAPPING_LOGGED.add(("slot_offset", key))
+            logging.info(
+                "[ContextWindows] %s: cond 长度 %d = x 长度 %d - 1，按「参考槽偏移 1 帧」映射（pose 帧 j ↔ 生成帧 j+1）",
+                key, cond_len, x_len)
+        return [i - 1 for i in full if 1 <= i <= cond_len]
+    if ("mismatch", key, cond_len, x_len) not in _COND_MAPPING_LOGGED:
+        _COND_MAPPING_LOGGED.add(("mismatch", key, cond_len, x_len))
+        logging.warning(
+            "[ContextWindows] %s: cond 长度 %d 与 x 长度 %d 既不相等也不差 1，按同坐标系裁剪（可能错位）",
+            key, cond_len, x_len)
+    return [i for i in full if 0 <= i < cond_len]
 
 
 class IndexListContextHandler(ContextHandlerABC):
@@ -213,9 +260,12 @@ class IndexListContextHandler(ContextHandlerABC):
                             # 特殊处理 pose_video_latent：使用原始窗口索引（不含前缀）进行切片
                             if cond_key == "pose_video_latent" and hasattr(cond_value, "cond") and isinstance(cond_value.cond, torch.Tensor):
                                 if hasattr(window, "original_indices") and window.original_indices:
-                                    # 假设 cond 形状为 [B, C, T, H, W] 或 [B, T, ...]，时间维度通常在索引2
-                                    # 使用原始索引切片
-                                    indices = window.original_indices
+                                    # 形状 [B, C, T, H, W]（时间维=2）或 [B, T, ...]（时间维=1）
+                                    # 使用窗口帧索引（含锚定 / 双侧延伸段），并按 cond 长度自动对齐坐标系
+                                    _ct = cond_value.cond
+                                    _t_dim = 2 if _ct.ndim == 5 else 1
+                                    indices = cond_indices_for_window(window, _ct.shape[_t_dim], x_in.size(self.dim),
+                                                                      key="pose_video_latent")
                                     # 根据张量维度动态切片
                                     if cond_value.cond.ndim == 5:
                                         # [B, C, T, H, W] -> 时间维度索引2
@@ -401,17 +451,25 @@ class IndexListContextHandler(ContextHandlerABC):
                                        window_idx: int, total_windows: int, timestep: torch.Tensor,
                                        conds_final: list[torch.Tensor], counts_final: list[torch.Tensor],
                                        biases_final: list[torch.Tensor]):
-        # 根据 self.dim 切割输出，丢弃前缀部分
+        # 根据 self.dim 切割输出：丢弃「参考前缀 + 头段额外帧（锚定 / 前延伸）」与「尾段额外帧（后延伸）」
         prefix_len = window.prefix_length
-        if prefix_len > 0:
-            # 对于每个 cond 输出，在时间维度上切掉前 prefix_len 帧
+        head_extra = len(getattr(window, "head_extra_indices", None) or [])
+        tail_extra = len(getattr(window, "tail_extra_indices", None) or [])
+        front_trim = prefix_len + head_extra
+        expected_len = len(window.original_indices)
+        if front_trim > 0 or tail_extra > 0:
             body_out = []
             for tensor in sub_conds_out:
-                # tensor 的形状: (..., time_len, ...)，其中 time_len = prefix_len + original_len
-                # 我们需要在 self.dim 维度上切片
+                total = tensor.shape[self.dim]
+                stop = total - tail_extra if total - tail_extra > front_trim else front_trim
                 slices = [slice(None)] * tensor.ndim
-                slices[self.dim] = slice(prefix_len, None)
-                body_out.append(tensor[tuple(slices)])
+                slices[self.dim] = slice(front_trim, stop)
+                trimmed = tensor[tuple(slices)]
+                if trimmed.shape[self.dim] != expected_len:
+                    logging.warning(
+                        "[ContextWindows] 窗口%d 裁剪后长度 %d != 窗口帧数 %d（前缀=%d, 头段=%d, 尾段=%d）",
+                        window_idx, trimmed.shape[self.dim], expected_len, prefix_len, head_extra, tail_extra)
+                body_out.append(trimmed)
         else:
             body_out = sub_conds_out
 
