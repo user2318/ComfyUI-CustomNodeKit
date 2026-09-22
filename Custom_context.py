@@ -453,9 +453,10 @@ class IndexListContextHandler(ContextHandlerABC):
                                        biases_final: list[torch.Tensor]):
         # 根据 self.dim 切割输出：丢弃「参考前缀 + 头段额外帧（锚定 / 前延伸）」与「尾段额外帧（后延伸）」
         prefix_len = window.prefix_length
+        anchor_extra = int(getattr(window, "anchor_latent_count", 0) or 0)
         head_extra = len(getattr(window, "head_extra_indices", None) or [])
         tail_extra = len(getattr(window, "tail_extra_indices", None) or [])
-        front_trim = prefix_len + head_extra
+        front_trim = prefix_len + anchor_extra + head_extra
         expected_len = len(window.original_indices)
         if front_trim > 0 or tail_extra > 0:
             body_out = []
@@ -467,8 +468,8 @@ class IndexListContextHandler(ContextHandlerABC):
                 trimmed = tensor[tuple(slices)]
                 if trimmed.shape[self.dim] != expected_len:
                     logging.warning(
-                        "[ContextWindows] 窗口%d 裁剪后长度 %d != 窗口帧数 %d（前缀=%d, 头段=%d, 尾段=%d）",
-                        window_idx, trimmed.shape[self.dim], expected_len, prefix_len, head_extra, tail_extra)
+                        "[ContextWindows] 窗口%d 裁剪后长度 %d != 窗口帧数 %d（前缀=%d, 锚定=%d, 头段=%d, 尾段=%d）",
+                        window_idx, trimmed.shape[self.dim], expected_len, prefix_len, anchor_extra, head_extra, tail_extra)
                 body_out.append(trimmed)
         else:
             body_out = sub_conds_out

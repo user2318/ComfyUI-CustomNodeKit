@@ -25,6 +25,7 @@ from .Custom_context import (
     create_prepare_sampling_wrapper, create_sampler_sample_wrapper,
     cond_indices_for_window,
 )
+from .context_window_anchor import prepend_anchor_mask
 
 import comfy.patcher_extension
 
@@ -71,6 +72,8 @@ def _apply_scail_model_patch():
                 safe_indices = [i for i in indices if i < video_part.shape[2]]
                 video_part = video_part[:, :, safe_indices]
                 ref_mask_latents = torch.cat([ref_part, video_part], dim=2)
+                # 锚定帧（拼接式）：插在 N 帧参考之后，与姿态/驱动遮罩保持同一时间基准（未启用时原样返回）
+                ref_mask_latents = prepend_anchor_mask(window, ref_mask_latents, t_dim=2, insert_at=n_ref)
 
             # sam_latents: SCAIL-2 SAM mask 流，时间在 dim=2（标准 latent 格式），按窗口切片。
             # 标准上下文已由 get_resized_cond 切成窗口帧（shape[2]==wlen），此时不再重复切；
@@ -83,11 +86,14 @@ def _apply_scail_model_patch():
                     indices = window.index_list
                     safe_indices = [i for i in indices if i < sam_latents.shape[2]]
                     sam_latents = sam_latents[:, :, safe_indices]
+                # 锚定帧（拼接式）：驱动遮罩与姿态同一时间基准（未启用时原样返回）
+                sam_latents = prepend_anchor_mask(window, sam_latents, t_dim=2)
 
             # driving_mask_28ch is NOT a named param of _forward, stays in kwargs
             _driving_from_kw = kwargs.pop("driving_mask_28ch", None)
             if _driving_from_kw is not None and is_plugin_window and hasattr(window, "index_list"):
                 _driving_from_kw = _driving_from_kw[:, window.index_list]
+                _driving_from_kw = prepend_anchor_mask(window, _driving_from_kw, t_dim=1)
 
             ref_mask_flag = kwargs.pop("ref_mask_flag", None)
 
