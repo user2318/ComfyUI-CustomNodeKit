@@ -290,44 +290,79 @@ def inject_anchor_x(model_options, x_slice, dim: int = 2):
 
 # ---------------- 注入：条件流 ----------------
 
-def _prepend_one_cond(key, tensor, window, x_len, prefix_len):
-    """按键类型把锚帧插进某个条件张量；返回新张量（不改则原样返回）。"""
+# 掩码型通道（1/3/4ch）：锚定帧填 0。SCAIL-2 的 c_concat = 1 - mask（1=clean anchor），
+# 所以锚帧的 mask 取 0 才能让模型把锚帧当作 clean anchor；同样的道理适用于 denoise_mask / concat_mask。
+ANCHOR_ZERO_CHANNELS = (1, 3, 4)
+
+
+def _window_lengths(window, dim: int = 2):
+    """返回 (slice_len, frames_len)：含参考前缀的窗口切片长度 / 不含前缀的窗口帧长度。"""
+    index_list = getattr(window, "index_list", None) or []
+    try:
+        frames_len = len(window.frame_indices())
+    except Exception:
+        frames_len = len(getattr(window, "original_indices", None) or index_list)
+    return len(index_list), frames_len
+
+
+def _prepend_one_cond(key, tensor, window, slice_len, frames_len, prefix_len, stats=None):
+    """按键类型把锚帧插进某个条件张量；返回新张量（不改则原样返回）。
+
+    长度判据必须是「窗口级」长度（slice_len / frames_len），**不能用全局 chunk 长度** ——
+    否则窗口内部的逐帧流会被静默漏插，随后在 comfy 的 c_concat 通道拼接处以形状不匹配报错。
+    """
+    if stats is None:
+        stats = {"extended": [], "skipped": []}
     if tensor is None or _ANCHOR_COUNT <= 0:
         return tensor
     t_dim = _temporal_dim(tensor)
+    cur = int(tensor.shape[t_dim])
+    ch = int(tensor.shape[1]) if tensor.ndim > 1 else 1
+
+    # 1) pose / 驱动 latent 流：一定前插（窗口帧坐标系，不含参考前缀）
     if key == ANCHOR_POSE_KEY:
-        pool = _get_pool("pose", tensor.shape[-2], tensor.shape[-1], target_channels=tensor.shape[1],
+        pool = _get_pool("pose", tensor.shape[-2], tensor.shape[-1], target_channels=ch,
                          device=tensor.device, dtype=tensor.dtype)
         if pool is None:
+            stats["skipped"].append(key)
             return tensor
         window.anchor_pose_latent = pool
-        new_t = _insert_at(tensor, pool, t_dim, 0)          # pose 流不含参考前缀 → 插在最前
+        new_t = _insert_at(tensor, pool, t_dim, 0)
         if new_t is not tensor:
+            stats["extended"].append(f"{key}(pose池)")
             logging.info("[ContextAnchor] pose 流已插入锚定 %d 帧：%s → %s",
                          _ANCHOR_COUNT, list(tensor.shape), list(new_t.shape))
         return new_t
-    if key in ANCHOR_ZERO_KEYS:
-        zeros = _zero_like_frames(tensor, t_dim, _ANCHOR_COUNT)
-        return _insert_at(tensor, zeros, t_dim, prefix_len)   # 与 x 同坐标 → 插在前缀之后
-    if x_len is not None and tensor.shape[t_dim] == x_len:
-        pool = _get_pool("x", tensor.shape[-2], tensor.shape[-1], target_channels=tensor.shape[1],
-                         device=tensor.device, dtype=tensor.dtype)
-        if pool is None:
+
+    # 2) 与窗口切片 / 窗口帧等长的逐帧流：按通道决定填什么
+    if cur == slice_len or cur == frames_len:
+        pos = prefix_len if cur == slice_len else 0
+        if key in ANCHOR_ZERO_KEYS or ch in ANCHOR_ZERO_CHANNELS:
+            extra = _zero_like_frames(tensor, t_dim, _ANCHOR_COUNT)
+            what = f"填0({ch}ch)"
+        else:
+            extra = _get_pool("x", tensor.shape[-2], tensor.shape[-1], target_channels=ch,
+                              device=tensor.device, dtype=tensor.dtype)
+            what = f"x池({ch}ch)"
+        if extra is None:
+            stats["skipped"].append(f"{key}({ch}ch,长{cur})")
             return tensor
-        new_t = _insert_at(tensor, pool, t_dim, prefix_len)
+        new_t = _insert_at(tensor, extra, t_dim, pos)
         if new_t is not tensor:
-            logging.info("[ContextAnchor] 逐帧流 '%s' 已插入锚定 %d 帧（位置=%d）",
-                         key, _ANCHOR_COUNT, prefix_len)
+            stats["extended"].append(f"{key}({what},pos={pos})")
+            logging.info("[ContextAnchor] 逐帧流 '%s'（%dch, 长 %d）已插入锚定 %d 帧：%s，位置=%d",
+                         key, ch, cur, _ANCHOR_COUNT, what, pos)
         return new_t
     return tensor
 
 
-def inject_anchor_conds(window, resized_cond, x_in, dim: int = 2):
+def inject_anchor_conds(window, resized_cond, x_in=None, dim: int = 2):
     """把锚帧插进窗口的条件流（就地更新 resized_cond 中的条目）。"""
     if _POOL_SOURCE["frames"] is None or resized_cond is None:
         return resized_cond
-    x_len = int(x_in.shape[dim]) if (x_in is not None and x_in.ndim > dim) else None
+    slice_len, frames_len = _window_lengths(window, dim)
     prefix_len = int(getattr(window, "prefix_length", 0) or 0)
+    stats = {"extended": [], "skipped": []}
     for actual in resized_cond:
         if not isinstance(actual, dict):
             continue
@@ -337,16 +372,27 @@ def inject_anchor_conds(window, resized_cond, x_in, dim: int = 2):
                     t = _cond_tensor(sub_value)
                     if t is None:
                         continue
-                    new_t = _prepend_one_cond(sub_key, t, window, x_len, prefix_len)
+                    new_t = _prepend_one_cond(sub_key, t, window, slice_len, frames_len, prefix_len, stats)
                     if new_t is not t:
                         value[sub_key] = _cond_replace(sub_value, new_t)
             else:
                 t = _cond_tensor(value)
                 if t is None:
                     continue
-                new_t = _prepend_one_cond(key, t, window, x_len, prefix_len)
+                new_t = _prepend_one_cond(key, t, window, slice_len, frames_len, prefix_len, stats)
                 if new_t is not t:
                     actual[key] = _cond_replace(value, new_t)
+    if stats["extended"] or stats["skipped"]:
+        orig = getattr(window, "original_indices", None) or []
+        logging.info("[ContextAnchor] 窗口帧 %s..%s（切片长 %d / 帧长 %d）：已插=%s；等长未插=%s",
+                     orig[0] if orig else None, orig[-1] if orig else None,
+                     slice_len, frames_len, stats["extended"] or "无", stats["skipped"] or "无")
+        for name in stats["skipped"]:
+            tag = ("skip", name)
+            if tag not in _WARNED:
+                _WARNED.add(tag)
+                logging.warning("[ContextAnchor] 条件流 '%s' 长度等于窗口长度但未插入锚定帧："
+                                "若它在 comfy 内部参与通道拼接会以形状不匹配报错，请检查。", name)
     return resized_cond
 
 

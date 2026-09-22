@@ -326,7 +326,7 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 
 - **生效层级**：两条路径。(a) **双侧延伸**：改写每个窗口的 `index_list`（外加头/尾额外段索引），发生在 per-window 条件重切分之前；(b) **锚定帧**：包装 `execute`（拦 `calc_cond_batch` 给 x 切片前插）+ 包装 `get_resized_cond`（给 `pose_video_latent`、与 x 等长的逐帧流、0/1 掩码流前插）；SCAIL-2 的驱动遮罩则在 `wan_scail_context.py` 的模型 patch 完成切片后插入。**每个采样步都会生效**。
 - **条件流自动对齐**：`cond_indices_for_window()`（`Custom_context.py`）按 cond 与 x 的时间长度关系自动判定坐标系：两者相等 → 同坐标系；`cond_len == x_len - 1` → 按「参考槽偏移 1 帧」映射（与 animate2 模型侧 `rope_encode_pose(t_start=1)` 一致）。**这同时修掉了此前 animate2 带前缀窗口时 pose 切片可能整体偏 1 帧的问题**；当 cond 与 x 等长时行为与旧版完全一致。
-- **锚定帧插入位置**：x 侧插在**参考前缀之后**（animate2 的 `slice[0]` 是 reference slot，必须保持在最前）；pose 流插在**最前**（不含前缀）；与 x 等长的逐帧流按同一位置插；SCAIL-2 的 `ref_mask_latents` 插在 **N 帧参考之后**。锚定帧按「上下文」处理——采样后连同其预测一起裁掉。
+- **锚定帧插入位置**：x 侧插在**参考前缀之后**（animate2 的 `slice[0]` 是 reference slot，必须保持在最前）；pose 流插在**最前**（不含前缀）；SCAIL-2 的 `ref_mask_latents` 插在 **N 帧参考之后**。长度判据一律用**窗口级长度**（含前缀的切片长 / 不含前缀的帧长），**不用全局 chunk 长度**——否则窗口内的逐帧流会被静默漏插，随后在 comfy 的 `c_concat` 通道拼接处报形状不匹配。16 通道的流用 x 池；**掩码型流（1/3/4 通道，如 `concat_mask`/`denoise_mask`，它们构成 SCAIL-2 的 4 通道 `c_concat`）填 0**（使锚帧被当作 clean anchor）；长度都不等的流不动（SCAIL 掩码由模型 patch 处理）；**等长但未插的流会打 warning**，不再静默。锚定帧按「上下文」处理——采样后连同其预测一起裁掉。
 - **融合前裁剪**：`combine_context_window_results` 按「前缀 + **锚定帧数** + 头段」从前面裁、按「尾段」从后面裁，且裁剪后长度必须等于窗口帧数（不一致会打 warning）→ 锚定/延伸帧**不会进入融合结果**。
 - **首窗 / 末窗**：锚定帧对**所有窗口（含首窗）**一致生效；`halo` 的首窗前延伸与末窗后延伸自动为 0（越过边界没有内容，跨 chunk 连续性仍由 `continue_motion`/`previous_frames` 负责）。
 - **推荐组合**：**双侧延伸 + 上下文节点 `overlap = 0`** —— 各窗口「拥有」的帧互不重叠，每个全局帧只被一个窗口写入，现有「累加 / counts」加权平均自动退化为「owner 说了算」，从根本上消除「两份分歧预测被平均」导致的重影。
