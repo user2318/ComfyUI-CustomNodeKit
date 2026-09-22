@@ -307,7 +307,71 @@ def inject_anchor_x(model_options, x_slice, dim: int = 2):
     return new_x
 
 
-# ---------------- 注入：条件流 ----------------
+# ---------------- 模式：替换窗口头部 / 拼接到窗口前面 ----------------
+
+MODE_REPLACE = "替换窗口头部（推荐）"
+MODE_SPLICE = "拼接到窗口前面"
+_MODE = "replace"
+
+
+def set_mode(mode: str) -> str:
+    """记录当前模式（模块级：模型 patch 也要用）。值以 MODE_* 常量传入。"""
+    global _MODE
+    _MODE = "splice" if str(mode).startswith("拼接") else "replace"
+    return _MODE
+
+
+def current_mode() -> str:
+    return _MODE
+
+
+def _replace_frames_at(tensor, dim: int, extra, start: int = 0):
+    """把 tensor 沿 dim 的 [start, start+K) 帧替换为 extra 的前 K 帧（长度不变）。"""
+    if tensor is None or extra is None or tensor.ndim != extra.ndim:
+        return tensor
+    for d in range(tensor.ndim):
+        if d != dim and tensor.shape[d] != extra.shape[d]:
+            logging.warning("[ContextAnchor] 锚帧形状 %s 与目标 %s 不匹配（dim=%d），跳过替换",
+                            list(extra.shape), list(tensor.shape), dim)
+            return tensor
+    k = min(int(extra.shape[dim]), max(0, int(tensor.shape[dim]) - int(start)))
+    if k <= 0:
+        return tensor
+    sl_t = [slice(None)] * tensor.ndim
+    sl_t[dim] = slice(start, start + k)
+    sl_e = [slice(None)] * extra.ndim
+    sl_e[dim] = slice(0, k)
+    out = tensor.clone()
+    out[tuple(sl_t)] = extra[tuple(sl_e)].to(device=tensor.device, dtype=tensor.dtype)
+    return out
+
+
+def _replace_lead_frames(tensor, dim: int, pool):
+    """把 tensor 沿 dim 的前 K 帧替换为 pool 的前 K 帧（长度不变）；K = pool 的帧数。"""
+    return _replace_frames_at(tensor, dim, pool, 0)
+
+
+def _replace_one_cond(key, tensor, window, stats=None):
+    """替换模式：把窗口自己的驱动流头部 K 帧替换为锚帧（长度不变、x 不动、不动 history mask）。"""
+    if stats is None:
+        stats = {"extended": [], "skipped": []}
+    if tensor is None or _ANCHOR_COUNT <= 0 or key not in ANCHOR_POSE_KEYS:
+        return tensor
+    t_dim = _temporal_dim(tensor)
+    ch = int(tensor.shape[1]) if tensor.ndim > 1 else 1
+    pool = _get_pool("pose", tensor.shape[-2], tensor.shape[-1], target_channels=ch,
+                     device=tensor.device, dtype=tensor.dtype)
+    if pool is None:
+        stats["skipped"].append(key)
+        return tensor
+    window.anchor_pose_latent = pool
+    new_t = _replace_lead_frames(tensor, t_dim, pool)
+    if new_t is not tensor:
+        stats["extended"].append(f"{key}(替换头部)")
+        _log_once(("replace", key), "[ContextAnchor] 已把驱动流 '%s' 的前 %d 帧替换为锚帧（长度不变）",
+                  key, min(_ANCHOR_COUNT, int(tensor.shape[t_dim])))
+    return new_t
+
 
 # 掩码型通道（1/3/4ch）：锚定帧填 0。SCAIL-2 的 c_concat = 1 - mask（1=clean anchor），
 # 所以锚帧的 mask 取 0 才能让模型把锚帧当作 clean anchor；同样的道理适用于 denoise_mask / concat_mask。
@@ -390,12 +454,23 @@ def _prepend_one_cond(key, tensor, window, slice_len, frames_len, prefix_len, st
 
 
 def inject_anchor_conds(window, resized_cond, x_in=None, dim: int = 2):
-    """把锚帧插进窗口的条件流（就地更新 resized_cond 中的条目）。"""
+    """按当前模式处理窗口的条件流（就地更新 resized_cond 中的条目）。
+
+    替换模式：只把窗口自己的驱动流头部替换为锚帧（长度不变、x 不动）。
+    拼接模式：把锚帧作为额外帧前插到驱动流 / 逐帧流 / 标记流（需要长度判据用「窗口级」长度）。
+    """
     if _POOL_SOURCE["frames"] is None or resized_cond is None:
         return resized_cond
     slice_len, frames_len = _window_lengths(window, dim)
     prefix_len = int(getattr(window, "prefix_length", 0) or 0)
     stats = {"extended": [], "skipped": []}
+    mode = current_mode()
+
+    def _act(k, t):
+        if mode == "replace":
+            return _replace_one_cond(k, t, window, stats)
+        return _prepend_one_cond(k, t, window, slice_len, frames_len, prefix_len, stats)
+
     for actual in resized_cond:
         if not isinstance(actual, dict):
             continue
@@ -405,14 +480,14 @@ def inject_anchor_conds(window, resized_cond, x_in=None, dim: int = 2):
                     t = _cond_tensor(sub_value)
                     if t is None:
                         continue
-                    new_t = _prepend_one_cond(sub_key, t, window, slice_len, frames_len, prefix_len, stats)
+                    new_t = _act(sub_key, t)
                     if new_t is not t:
                         value[sub_key] = _cond_replace(sub_value, new_t)
             else:
                 t = _cond_tensor(value)
                 if t is None:
                     continue
-                new_t = _prepend_one_cond(key, t, window, slice_len, frames_len, prefix_len, stats)
+                new_t = _act(key, t)
                 if new_t is not t:
                     actual[key] = _cond_replace(value, new_t)
     if stats["extended"]:
@@ -428,10 +503,10 @@ def inject_anchor_conds(window, resized_cond, x_in=None, dim: int = 2):
 
 
 def prepend_anchor_mask(window, tensor, t_dim: int, insert_at=None):
-    """供 wan_scail_context.py 的模型 patch 调用：把锚定遮罩帧插入「已切片的」掩码张量。
+    """供 wan_scail_context.py 的模型 patch 调用，按当前模式处理「已切片的」掩码张量。
 
-    t_dim=1 → 原始 driving_mask_28ch 布局 (B,T,28,H,W)：直接前插；
-    t_dim=2 → sam_latents / ref_mask_latents 布局 (B,28,T,H,W)：permute 后插入（ref 掩码插在 N 帧参考之后）。
+    替换模式：把窗口（或 ref 掩码 N 帧参考之后的 video 段）前 K 帧替换为锚帧遮罩，长度不变；
+    拼接模式：把锚帧遮罩插入（t_dim=1 前插；t_dim=2 插在 insert_at 位置，ref 掩码用 N）。
     """
     if tensor is None or window is None or _POOL_SOURCE["frames"] is None or _ANCHOR_COUNT <= 0:
         return tensor
@@ -443,11 +518,22 @@ def prepend_anchor_mask(window, tensor, t_dim: int, insert_at=None):
     else:
         extra = _fit_frames(pool.permute(0, 2, 1, 3, 4), 2, _ANCHOR_COUNT).contiguous()
     pos = 0 if insert_at is None else int(insert_at)
+
+    if current_mode() == "replace":
+        new_t = _replace_frames_at(tensor, int(t_dim), extra, pos)
+        if new_t is not tensor:
+            window.anchor_mask_latent = pool
+            _log_once(("mask_replace", int(t_dim), pos),
+                      "[ContextAnchor] 已把掩码流前 %d 帧替换为锚帧遮罩（dim=%d, 起点=%d）",
+                      _ANCHOR_COUNT, int(t_dim), pos)
+        return new_t
+
     new_t = _insert_at(tensor, extra, int(t_dim), pos)
     if new_t is not tensor:
         window.anchor_mask_latent = pool
-        logging.info("[ContextAnchor] 掩码流已插入锚定 %d 帧（dim=%d, pos=%d）：%s → %s",
-                     _ANCHOR_COUNT, int(t_dim), pos, list(tensor.shape), list(new_t.shape))
+        _log_once(("mask_prepend", int(t_dim), pos),
+                  "[ContextAnchor] 掩码流已插入锚定 %d 帧（dim=%d, pos=%d）：%s → %s",
+                  _ANCHOR_COUNT, int(t_dim), pos, list(tensor.shape), list(new_t.shape))
     return new_t
 
 
@@ -518,7 +604,7 @@ def apply_window_extras(handler, windows, cfg: AnchorConfig) -> None:
 # ---------------- 安装 ----------------
 
 def _install(handler, cfg: AnchorConfig):
-    """把「锚定注入 + 双侧延伸」挂到 handler 实例上（实例属性遮蔽原方法）。重复调用只更新配置。"""
+    """把「锚定注入」挂到 handler 实例上（实例属性遮蔽原方法）。重复调用只更新配置。"""
     if getattr(handler, "_cwa_anchor_installed", False):
         handler._anchor_cfg = cfg
         return handler
@@ -533,7 +619,7 @@ def _install(handler, cfg: AnchorConfig):
         try:
             apply_window_extras(handler, windows, cfg)
         except Exception:
-            logging.exception("[ContextAnchor] 双侧延伸失败，本步回退为原始窗口")
+            logging.exception("[ContextAnchor] 窗口改写失败，本步回退为原始窗口")
         return windows
 
     def get_resized_cond(cond_in, x_in, window, device=None):
@@ -543,11 +629,12 @@ def _install(handler, cfg: AnchorConfig):
         try:
             return inject_anchor_conds(window, resized, x_in, dim=dim)
         except Exception:
-            logging.exception("[ContextAnchor] 锚定帧条件前插失败，本次跳过")
+            logging.exception("[ContextAnchor] 锚定帧处理失败，本次跳过")
             return resized
 
     def execute(calc_cond_batch, model, conds, x_in, timestep, model_options):
-        if cfg.anchor_frames is None:
+        # 只有「拼接模式」才动 x（替换模式长度不变、不碰 x）
+        if cfg.anchor_frames is None or current_mode() != "splice":
             return orig_execute(calc_cond_batch, model, conds, x_in, timestep, model_options)
 
         def calc_cond_batch_wrapped(m, c, sub_x, ts, mo, **kw):
@@ -581,6 +668,8 @@ class WanContextWindowAnchorNode:
                 "model": ("MODEL", {"tooltip": "已接入上下文窗口节点的模型（`Custom Context Windows (Manual)` 或 `Wan SCAIL-2 Context Windows` 的 model 输出）。Model that already has a context windows node applied."}),
                 "enabled": ("BOOLEAN", {"default": True,
                     "tooltip": "总开关；关闭时模型直接透传。Master switch."}),
+                "mode": ([MODE_REPLACE, MODE_SPLICE], {"default": MODE_REPLACE,
+                    "tooltip": "锚帧的用法：\n- 替换窗口头部（推荐，实测有效）：把窗口自己的驱动流前 K 帧替换为锚帧（长度不变、不动待生成序列、不动 history mask）；\n- 拼接到窗口前面：把锚帧作为额外帧拼在窗口最前（长度 +K，并标记为已知帧）。\nHow the anchors are used: replace the window's leading driving frames (recommended) / splice them in front of the window."}),
             },
             "optional": {
                 "anchor_frames": ("IMAGE", {"tooltip": "【基准帧】驱动/pose 视频里你想当统一基准的那几帧（例如整段视频开头几帧）。**给多少就用多少**（没有数量参数）：会 VAE 编码成 latent，作为「已知帧」拼在每个窗口最前面（驱动流 + 驱动遮罩 + 待生成序列），采样后裁掉、不参与融合。不接=关闭本节点。\nAnchor basis frames (driving/pose video): how many you feed is how many are used. Leave unconnected to disable."}),
@@ -596,14 +685,16 @@ class WanContextWindowAnchorNode:
     EXPERIMENTAL = True
     DESCRIPTION = (
         "上下文窗口「统一基准锚定」节点（⚠️ 实验性：有效性与副作用需自行开/关对比验证）。\n"
-        "把你给的那几帧当作**已知帧**（干净历史）拼在每个窗口最前面：驱动流 + 驱动遮罩(SCAIL-2) + "
-        "待生成序列；采样后裁掉、不参与融合，让所有窗口的对齐基准一致。\n"
+        "把「你给的几帧」当作统一基准作用在**每个窗口的驱动条件**上（两种用法见 mode）：\n"
+        "  · 替换窗口头部（推荐）：把窗口驱动流前 K 帧替换为锚帧——长度不变、不动待生成序列；\n"
+        "  · 拼接到窗口前面：作为额外帧拼在窗口最前（驱动流 + 驱动遮罩 + 待生成序列，标记为已知帧）。\n"
         "只需三根线：anchor_frames（给多少用多少）、vae（同一个 Wan VAE）、SCAIL-2 再加 anchor_mask_frames。\n"
         "不接 anchor_frames ⇒ 完全等价于不装本节点。必须接在上下文窗口节点之后。\n"
-        "Splice-style unified-basis anchoring for context windows (experimental)."
+        "Unified-basis anchoring for context windows (experimental)."
     )
 
-    def apply_anchor(self, model, enabled=True, anchor_frames=None, anchor_mask_frames=None, vae=None):
+    def apply_anchor(self, model, enabled=True, mode=MODE_REPLACE,
+                     anchor_frames=None, anchor_mask_frames=None, vae=None):
         frames = _as_image_batch(anchor_frames)
         mask_frames = _as_image_batch(anchor_mask_frames)
 
@@ -629,14 +720,17 @@ class WanContextWindowAnchorNode:
         cfg = AnchorConfig(halo_head=0, halo_tail=0, anchor_frames=frames,
                            anchor_mask_frames=mask_frames, vae=vae, log_debug=False)
         k = reset_pools(frames, mask_frames, vae)
+        resolved = set_mode(mode)
 
         model = model.clone()
         new_handler = copy.copy(handler)
         _install(new_handler, cfg)
         model.model_options["context_handler"] = new_handler
 
-        logging.info("[ContextAnchor] 已启用：%d 像素帧 → %d latent 帧，作为「已知帧」拼在每个窗口最前"
-                     "（驱动流 + 驱动遮罩 + 待生成序列），采样后裁掉", frames.shape[0], k)
+        logging.info("[ContextAnchor] 已启用：%d 像素帧 → %d latent 帧，模式=%s（%s）",
+                     frames.shape[0], k, resolved,
+                     "替换每个窗口驱动流的前 %d 帧" % k if resolved == "replace"
+                     else "作为已知帧拼在每个窗口最前（驱动流 + 驱动遮罩 + 待生成序列）")
         return (model,)
 
 

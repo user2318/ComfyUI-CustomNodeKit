@@ -293,16 +293,15 @@ A context window scheduling node for WAN-type video generation models. When vide
 
 **Problem it addresses**: animate2 / SCAIL-2 have no explicit spatial anchor (no skeleton), and under context windows RoPE is always `0..L-1` per window (no absolute time). Wan-Animate-2 §3.3/§3.4 show the driving↔generated alignment is **rigid and frame-wise** — and nothing guarantees that two windows infer the *same* reference↔driving mapping. So every window re-infers its basis from its own head: a different head → a different result for the same global frame (ghosting / motion mismatch); a hard head → the whole segment breaks structurally.
 
-**What it does**: treats the frames you feed as **known (clean-history) frames** and splices them at the front of every window, so all windows share one alignment basis — a window-level replication of the official long-video mechanism (SCAIL-2 is trained with "the first two latent frames = conditional history latents"):
+**What it does**: applies the frames you feed as a **shared basis** to every window's driving conditioning, so all windows share one alignment basis. Two usages (`mode`):
 
-```
-[reference prefix] [anchor frames (known basis)] [window frames (fused)]
-```
+| mode | What it does | Note |
+|---|---|---|
+| **Replace window head (default, recommended)** | Replaces the window's own leading K driving frames with the anchor frames (length unchanged, generation sequence untouched, history mask untouched) | This is the variant that showed *some* effect in testing |
+| Splice in front of the window | Prepends the anchor frames as **extra frames** (driving stream + driving mask + generation sequence, marked as **known**) | Length +K; showed no improvement in testing |
 
-- **Three streams at once** (automatic, nothing to configure): driving-video latent, SCAIL-2's driving mask (28ch, must match the driving frame count) and the generation sequence x (inserted after the reference prefix);
-- **Marked as known**: SCAIL-2's 4-channel history mask (`c_concat`) is filled with 1 on anchor frames (clean anchor), input masks (`concat_mask` / `denoise_mask`) with 0;
-- **Trimmed together with their predictions** after sampling — they never take part in window fusion;
-- **How many you feed is how many are used** (no count parameter; 1~9 pixel frames ≈ 1~3 latent frames is a natural range).
+- The **driving mask must match the driving frame count** (SCAIL-2's 28-channel mask is added token-wise into the driving stream), so masks are handled together in both modes;
+- **How many you feed is how many are used** (no count parameter; 1~9 pixel frames ≈ 1~3 latent frames).
 
 #### Parameters
 
@@ -310,6 +309,7 @@ A context window scheduling node for WAN-type video generation models. When vide
 |---|---|---|---|
 | `model` | MODEL | — | Model that already has a context windows node applied |
 | `enabled` | BOOLEAN | true | Master switch; when off the model passes through |
+| `mode` | COMBO | 替换窗口头部（推荐） | How anchors are used: `替换窗口头部（推荐）` (replace the window's leading driving frames, length unchanged) / `拼接到窗口前面` (prepend as extra frames, length +K) |
 | `anchor_frames` | IMAGE (optional) | unconnected = off | **Basis frames**: driving/pose frames you want as the shared basis (e.g. the first frames of the video). Feed as many as you want |
 | `anchor_mask_frames` | IMAGE (optional, SCAIL-2 only) | unconnected | Colored mask frames with the **same frame numbers** as `anchor_frames` (converted to 28 channels internally, no VAE). Recommended, otherwise the driving mask and driving video can drift apart |
 | `vae` | VAE (required when anchoring) | unconnected | The **same** Wan VAE as the conditioning node; connecting `anchor_frames` without `vae` raises an explicit error |
@@ -767,6 +767,7 @@ The `workflow/` directory contains complete ComfyUI workflow JSON files that can
 **Added**
 - `WanAnimate2ToVideoCustom`: WanAnimate2 (official second-gen architecture) video generation node
 - `Context Window Anchor (unified-basis anchoring)` (**experimental / test-only — effectiveness and side effects not fully validated**): **minimal interface** — required = `model` / `enabled`; optional = `anchor_frames`(IMAGE) / `anchor_mask_frames`(IMAGE, SCAIL-2 only) / `vae`(VAE, required when anchoring). Anchor frames are treated as **known (clean-history) frames** and spliced into the driving stream, the driving mask and the generation sequence at once (after the reference prefix; trimmed and never fused); **how many you feed is how many are used**; without `anchor_frames` it is exactly equivalent to not installing the node.
+  - **Mode**: new `mode` = `替换窗口头部（推荐）` / `拼接到窗口前面` (default = replace) — replace showed *some* effect in testing while splice showed none; replace keeps lengths unchanged and touches neither the generation sequence nor the history mask (only the window's leading K driving frames, with SCAIL-2's driving mask replaced in step).
   - **Key fix**: SCAIL-2's `c_concat` (4-channel history mask) is filled with **1** on anchor frames (= clean/known anchor) while input masks (`concat_mask` / `denoise_mask`) get 0 — the previous version had this reversed, which is why anchoring had no effect. **Removed**: replacement-style anchoring and `anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / anchor_source / halo_frames_* / log_debug`.
   - **Companion fixes**: `Custom_context.py` gained `cond_indices_for_window()`, which aligns the conditioning streams' coordinate system from the cond-vs-x length (`cond_len == x_len - 1` → one-frame reference-slot offset, matching the model's `rope_encode_pose(t_start=1)`), fixing a possible one-frame pose offset for prefixed animate2 windows; the `pose_video_latent` slice inside `Wan SCAIL Context Windows`, which always took the first N frames of the chunk, now follows the window's real frame indices (including anchor/halo frames) with an out-of-range warning.
   - **Not fully validated**: the mechanism rests on the assumption that the alignment basis is locked by the clip head; side effects (image quality / identity consistency / sampling stability / frame budget) have not been systematically evaluated. Always A/B it (see Experiment tips) before relying on it, and do not depend on it in production workflows.
