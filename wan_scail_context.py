@@ -73,7 +73,8 @@ def _apply_scail_model_patch():
                 video_part = video_part[:, :, safe_indices]
                 ref_mask_latents = torch.cat([ref_part, video_part], dim=2)
                 # 锚定帧（拼接式）：插在 N 帧参考之后，与姿态/驱动遮罩保持同一时间基准（未启用时原样返回）
-                ref_mask_latents = prepend_anchor_mask(window, ref_mask_latents, t_dim=2, insert_at=n_ref)
+                ref_mask_latents = prepend_anchor_mask(window, ref_mask_latents, t_dim=2, insert_at=n_ref,
+                                                       is_driving_mask=False)
 
             # sam_latents: SCAIL-2 SAM mask 流，时间在 dim=2（标准 latent 格式），按窗口切片。
             # 标准上下文已由 get_resized_cond 切成窗口帧（shape[2]==wlen），此时不再重复切；

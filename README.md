@@ -309,6 +309,8 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 |------|------|------|------|
 | `model` | MODEL | — | 已接入上下文窗口节点的模型（`Custom Context Windows (Manual)` 或 `Wan SCAIL-2 Context Windows` 的输出） |
 | `enabled` | BOOLEAN | true | 总开关；关闭时模型直接透传 |
+| `driving_only` | BOOLEAN | **开** | 只把锚帧接到「驱动流 + 驱动遮罩」，不注入待生成序列（不渗出锚帧画面、无伪影）；animate2 会自动强制改回「否」并在日志说明 |
+| `head_context_frames` | INT | 0 | 每个窗口头部纳入 N 帧「只读前文」（上一窗口尾部真实帧：参与注意力、**不参与融合**）；配 `overlap=0` 使用可消除硬接缝，0=关闭
 | `anchor_frames` | IMAGE（可选） | 不接=关闭 | **基准帧**：驱动/pose 视频里你想当统一基准的那几帧（例如整段视频开头几帧）。**给多少用多少** |
 | `anchor_mask_frames` | IMAGE（可选，仅 SCAIL-2） | 不接 | 与 `anchor_frames` **同帧号**的彩色遮罩帧（内部转 28 通道，不需要 VAE）。建议一起接，否则驱动遮罩与驱动视频的时间基准可能不一致 |
 | `vae` | VAE（接锚帧时必接） | 不接 | 与 conditioning 节点**同一个** Wan VAE；接了 `anchor_frames` 却没接 `vae` 会**直接报错** |
@@ -1101,6 +1103,7 @@ SCAIL-2 专用的上下文窗口节点，与通用的 `Custom Context Windows (M
 - `WanAnimate2ToVideoCustom`：WanAnimate2（官方二代架构）视频生成节点
 - `Context Window Anchor (上下文窗口锚定)`（**实验性 / 测试性——有效性与副作用尚未充分验证**）：**极简接口**——required = `model` / `enabled`；optional = `anchor_frames`(IMAGE) / `anchor_mask_frames`(IMAGE, 仅 SCAIL-2) / `vae`(VAE，接锚帧时必接)。把锚帧当作**已知帧（干净历史）**同时拼进驱动流、驱动遮罩与待生成序列（插在参考前缀之后，采样后裁掉、不参与融合），**给多少用多少**；不接锚帧即等价于不装本节点。必须接在上下文窗口节点之后。
   - **锚帧语义（本轮修正）**：锚帧按「手动把整段视频开头拼到片段开头」的分布注入——驱动流/驱动遮罩前插的同时，**待生成序列前插的锚帧走它自己的生成轨迹**（第 1 步 σ=1 纯噪声；之后用上一步模型对这几帧预测的 x0 重新加噪），并当**普通帧**（输入掩码=1 待生成、history mask=0）。**已移除** `mode`／替换式等分支，节点只有一个行为。
+  - **本轮又修**：① 运行期标记 gating（绕过/禁用锚定节点 ⇒ 真正零注入；修掉「上一次运行残留配置污染旁路运行」导致的 x(25) vs ref_mask(27) 崩）；② 新增 `driving_only`（默认开）与 `head_context_frames`（默认 0）。
   - **本轮再修**：① 由此去掉了「把**驱动者画面**钉在窗口头部」导致的**驱动者形象伪影**（此前 σ→0 时锚帧几乎就是一张干净的驱动者画面，模型顺着它续写）；② **掩码编码支持任意帧数**（此前 4/8 帧必崩：`_extract_mask_to_28ch` 的时间分组只对 1+4n 成立，7×7=49 ≠ 28）；③ 新增**采样前编码自检**（x/pose/mask 三池试编）与「SCAIL-2 必须同时接 `anchor_mask_frames`」的明确报错。
   - **关键修复**：SCAIL-2 的 `c_concat`（4 通道 history mask）在锚帧上填 **1**（= 干净/已知锚帧），输入掩码（`concat_mask`/`denoise_mask`）填 0——此前填反，导致锚定对模型实际不生效。**移除**：替换式锚定与 `anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / anchor_source / halo_frames_* / log_debug`。
   - **配套修复**：`Custom_context.py` 新增 `cond_indices_for_window()`（按 cond 与 x 的长度关系自动对齐坐标系，`cond_len == x_len - 1` 时按参考槽偏移 1 帧，与模型侧 `rope_encode_pose(t_start=1)` 一致），修掉了 animate2 带前缀窗口时 pose 切片可能整体偏 1 帧的问题；`Wan SCAIL Context Windows` 中原本固定取 chunk 前 N 帧的 `pose_video_latent` 切片改为按窗口真实帧索引（含锚定/延伸段）并带越界告警；`combine_context_window_results` 的融合前裁剪扩展为「前缀 + 锚定 + 头段 / 尾段」。
