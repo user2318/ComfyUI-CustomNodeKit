@@ -51,4 +51,8 @@ test_yaw_improved/
 
 # Local development notes (not for upload)
 md/
-_node_index.md  
+_node_index.md
+
+# local selftest logs (not for upload)
+selftest_out.txt
+selftest_err.txt
