@@ -104,6 +104,14 @@ def anchor_count() -> int:
 
 # ---------------- 基础工具 ----------------
 
+def _needs_driving_mask(model) -> bool:
+    """SCAIL-2 必须同时锚定驱动遮罩（28ch，逐 token 加进驱动流 → 必须与驱动同帧数）。"""
+    try:
+        return "SCAIL" in type(model.model).__name__.upper()
+    except Exception:
+        return False
+
+
 def _as_image_batch(value):
     """IMAGE 输入 → (T,H,W,C)；空/非法返回 None。"""
     if value is None:
@@ -127,9 +135,15 @@ def _resize_frames(frames, target_h, target_w):
     """(T,H,W,C) 缩放到目标像素尺寸（area/center，与仓库其它节点一致）。"""
     if frames.shape[1] == target_h and frames.shape[2] == target_w:
         return frames
-    import comfy.utils
-    return comfy.utils.common_upscale(frames.movedim(-1, 1).float(), int(target_w), int(target_h),
-                                      "area", "center").movedim(1, -1)
+    try:
+        import comfy.utils
+        return comfy.utils.common_upscale(frames.movedim(-1, 1).float(), int(target_w), int(target_h),
+                                          "area", "center").movedim(1, -1)
+    except Exception:
+        # 独立环境（无 comfy）兜底：面积插值，便于自测直接跑
+        x = frames.movedim(-1, 1).float()
+        return torch.nn.functional.interpolate(x, size=(int(target_h), int(target_w)),
+                                               mode="area").movedim(1, -1)
 
 
 def _match_channels(pool, target_channels: int):
@@ -232,42 +246,75 @@ def _cond_replace(value, tensor):
 
 # ---------------- 锚定池：编码（带缓存） ----------------
 
+def _mask_latents_any_t(frames):
+    """(T,H,W,3) 彩色遮罩（0..1）→ (1,T_lat,28,H/8,W/8)，**任意 T 都能编码**。
+
+    约定与 wan_scail_multi_ref._extract_mask_to_28ch 完全一致（所以 T=1+4n 时结果不变）：
+      latent 0 = 第 0 帧（重复 4 次）；latent i(i≥1) = 第 4i-3 .. 4i 帧，组内不足 4 帧时用该组最后一帧补足。
+    """
+    t = int(frames.shape[0])
+    t_lat = max(1, (t - 1) // 4 + 1)
+    thr = 225.0 / 255.0
+    m = frames.movedim(-1, 1).float()
+    r = (m[:, 0:1] > thr).float()
+    g = (m[:, 1:2] > thr).float()
+    b = (m[:, 2:3] > thr).float()
+    nr, ng, nb = 1 - r, 1 - g, 1 - b
+    seven = torch.cat([r * g * b, r * ng * nb, nr * g * nb, nr * ng * b,
+                       r * g * nb, r * ng * b, nr * g * b], dim=1)     # (T,7,H,W)
+    h_lat, w_lat = int(seven.shape[2]), int(seven.shape[3])
+    for _ in range(3):
+        h_lat = (h_lat + 1) // 2
+        w_lat = (w_lat + 1) // 2
+    seven = torch.nn.functional.interpolate(seven, size=(h_lat, w_lat), mode="area")
+
+    groups = []
+    for i in range(t_lat):
+        if i == 0:
+            lo, need, repeat0 = 0, 1, True
+        else:
+            lo, need, repeat0 = 4 * i - 3, 4, False
+        lo = max(0, min(lo, t - 1))
+        hi = min(t, lo + need)
+        grp = seven[lo:hi]
+        if grp.shape[0] < need:                       # 组内帧数不足 → 用该组最后一帧补足
+            grp = torch.cat([grp, grp[-1:].repeat(need - grp.shape[0], 1, 1, 1)], dim=0)
+        if repeat0:                                   # latent 0 = 第 0 帧重复 4 次（旧约定）
+            grp = grp.repeat(4, 1, 1, 1)
+        groups.append(grp)
+    stacked = torch.cat(groups, dim=0)                # (4*T_lat, 7, H_lat, W_lat)
+    return stacked.view(t_lat, 28, h_lat, w_lat).unsqueeze(0)
+
+
 def _encode_pool(kind: str, h: int, w: int):
+    """编码一个锚定池（失败时**抛异常**，由 _get_pool 统一降级）。"""
     src = _POOL_SOURCE
-    try:
-        target_h, target_w = int(h) * 8, int(w) * 8
-        if kind == "mask":
-            if src["mask_frames"] is None:
-                if "no_mask" not in _WARNED:
-                    _WARNED.add("no_mask")
-                    logging.warning("[ContextAnchor] 未接 anchor_mask_frames：驱动遮罩不锚定，"
-                                    "姿态与遮罩的时间基准可能不一致（SCAIL-2 建议一起接）")
-                return None
-            from .wan_scail_multi_ref import _extract_mask_to_28ch
-            frames = _resize_frames(src["mask_frames"], target_h, target_w)
-            pool = _extract_mask_to_28ch(frames[:, :, :, :3])      # (1,T',28,h,w)，时间在 dim=1
-            return _fit_frames(pool, 1, _ANCHOR_COUNT)
-        vae = src["vae"]
-        if vae is None:
-            if "no_vae" not in _WARNED:
-                _WARNED.add("no_vae")
-                logging.warning("[ContextAnchor] 锚定帧需要 VAE，但未提供（锚定已跳过）")
-            return None
-        frames = _resize_frames(src["frames"], target_h, target_w)
-        pool = vae.encode(frames[:, :, :, :3])
-        return _fit_frames(pool, 2, _ANCHOR_COUNT)
-    except Exception:
-        logging.exception("[ContextAnchor] 锚定池编码失败（kind=%s, spatial=(%d,%d)）", kind, h, w)
-        return None
+    target_h, target_w = int(h) * 8, int(w) * 8
+    if kind == "mask":
+        if src["mask_frames"] is None:
+            raise RuntimeError("未接 anchor_mask_frames（SCAIL-2 的驱动遮罩无法锚定）")
+        frames = _resize_frames(src["mask_frames"], target_h, target_w)
+        pool = _mask_latents_any_t(frames[:, :, :, :3])          # (1,T',28,h,w)，时间在 dim=1
+        return _fit_frames(pool, 1, _ANCHOR_COUNT)
+    vae = src["vae"]
+    if vae is None:
+        raise RuntimeError("没有 VAE，无法把锚帧编码成 latent")
+    frames = _resize_frames(src["frames"], target_h, target_w)
+    pool = vae.encode(frames[:, :, :, :3])
+    return _fit_frames(pool, 2, _ANCHOR_COUNT)
 
 
 def _get_pool(kind: str, spatial_h: int, spatial_w: int, target_channels=None, device=None, dtype=None):
-    """按目标 latent 空间尺寸取锚定池（kind ∈ x/pose/mask），带缓存。"""
+    """按目标 latent 空间尺寸取锚定池（kind ∈ x/pose/mask），带缓存；编码失败则返回 None（只报一次）。"""
     if _POOL_SOURCE["frames"] is None:
         return None
     key = (kind, int(spatial_h), int(spatial_w))
     if key not in _POOL_CACHE:
-        _POOL_CACHE[key] = _encode_pool(kind, int(spatial_h), int(spatial_w))
+        try:
+            _POOL_CACHE[key] = _encode_pool(kind, int(spatial_h), int(spatial_w))
+        except Exception:
+            logging.exception("[ContextAnchor] 锚定池编码失败（kind=%s, spatial=(%d,%d)）", kind, spatial_h, spatial_w)
+            _POOL_CACHE[key] = None
     pool = _POOL_CACHE[key]
     if pool is None:
         return None
@@ -301,23 +348,45 @@ def inject_anchor_x(model_options, x_slice, dim: int = 2, sigma: float = 0.0):
     if pool is None:
         return x_slice
     sigma = float(sigma)
-    anchor = pool
-    if sigma > 0.0:
-        step = int(getattr(window, "_anchor_x_applied_step", 0) or 0)
-        gen = torch.Generator(device="cpu").manual_seed(0x5EED + 7919 * (step + 1))
-        noise = torch.randn(pool.shape, generator=gen, device="cpu", dtype=torch.float32)
-        noise = noise.to(device=pool.device, dtype=pool.dtype)
-        anchor = pool * (1.0 - sigma) + noise * sigma
+    gen = torch.Generator(device="cpu").manual_seed(0x5EED)
+    noise = torch.randn(pool.shape, generator=gen, device="cpu", dtype=torch.float32)
+    noise = noise.to(device=pool.device, dtype=pool.dtype)
+    # 锚帧走「自己的生成轨迹」：有上一步模型对这几帧的 x0 就用它（= 参考图角色在做开头动作），
+    # 否则（第 1 步 σ=1）就是纯噪声 —— 不能把驱动者的像素钉在窗口头部，否则会渗出驱动者形象。
+    base = getattr(window, "_anchor_x0_prev", None)
+    if base is None or tuple(base.shape) != tuple(pool.shape):
+        base = pool
+    anchor = base * (1.0 - sigma) + noise * sigma
     prefix_len = int(getattr(window, "prefix_length", 0) or 0)
     new_x = _insert_at(x_slice, anchor, dim, prefix_len)
     if new_x is not x_slice:
         window._anchor_x_applied = True
         window.anchor_latent_count = int(pool.shape[dim])
         window.anchor_latent = pool
-        _log_once(("x", round(sigma, 3)),
-                  "[ContextAnchor] 待生成序列前已插入锚定 %d 帧（位置=%d, 按 σ=%.3f 加噪当普通帧）：%s → %s",
-                  pool.shape[dim], prefix_len, sigma, list(x_slice.shape), list(new_x.shape))
+        src = "上一步 x0" if base is not pool else "纯噪声/干净锚帧"
+        _log_once(("x",),
+                  "[ContextAnchor] 待生成序列前已插入锚定 %d 帧（位置=%d, σ=%.3f, 内容=%s）：%s → %s",
+                  pool.shape[dim], prefix_len, sigma, src, list(x_slice.shape), list(new_x.shape))
     return new_x
+
+
+def _capture_anchor_x0(model_options, extended, sub_x, out, dim):
+    """缓存模型对锚帧位置的 x0 预测，作为下一步锚帧的内容（让它像真实帧一样被生成）。"""
+    try:
+        if extended is sub_x or not torch.is_tensor(out):
+            return
+        window = ((model_options or {}).get("transformer_options") or {}).get("context_window", None)
+        if window is None:
+            return
+        k = int(getattr(window, "anchor_latent_count", 0) or 0)
+        if k <= 0 or out.ndim != extended.ndim or out.shape[dim] != extended.shape[dim]:
+            return
+        start = int(getattr(window, "prefix_length", 0) or 0)
+        sl = [slice(None)] * out.ndim
+        sl[dim] = slice(start, start + k)
+        window._anchor_x0_prev = out[tuple(sl)].detach().clone()
+    except Exception:
+        logging.debug("[ContextAnchor] 锚帧 x0 缓存失败（忽略）", exc_info=True)
 
 
 # ---------------- 注入：条件流 ----------------
@@ -572,7 +641,10 @@ def _install(handler, cfg: AnchorConfig):
             sigma = 0.0
 
         def calc_cond_batch_wrapped(m, c, sub_x, ts, mo, **kw):
-            return calc_cond_batch(m, c, inject_anchor_x(mo, sub_x, dim=dim, sigma=sigma), ts, mo, **kw)
+            extended = inject_anchor_x(mo, sub_x, dim=dim, sigma=sigma)
+            out = calc_cond_batch(m, c, extended, ts, mo, **kw)
+            _capture_anchor_x0(mo, extended, sub_x, out, dim)
+            return out
 
         return orig_execute(calc_cond_batch_wrapped, model, conds, x_in, timestep, model_options)
 
@@ -647,10 +719,22 @@ class WanContextWindowAnchorNode:
         if mask_frames is not None and mask_frames.shape[0] != frames.shape[0]:
             logging.warning("[ContextAnchor] anchor_mask_frames 帧数(%d) 与 anchor_frames 帧数(%d) 不一致，"
                             "遮罩会按自己的帧数编码", mask_frames.shape[0], frames.shape[0])
+        if mask_frames is None and _needs_driving_mask(model):
+            raise ValueError(
+                "[ContextAnchor] SCAIL-2 必须同时接 anchor_mask_frames（与 anchor_frames 同帧号的驱动彩色遮罩）；"
+                "否则驱动流与驱动遮罩帧数不一致，会在模型内部以形状不匹配报错。")
+
+        k = reset_pools(frames, mask_frames, vae)
+
+        # 编码自检（极小尺寸试编）：失败就在采样前给出明确错误，而不是在模型深处以形状不匹配崩掉
+        for kind in ("x", "pose") + (("mask",) if mask_frames is not None else ()):
+            try:
+                _encode_pool(kind, 4, 4)
+            except Exception as e:
+                raise ValueError(f"[ContextAnchor] 锚帧编码自检失败（{kind}）：{e}") from e
 
         cfg = AnchorConfig(halo_head=0, halo_tail=0, anchor_frames=frames,
                            anchor_mask_frames=mask_frames, vae=vae, log_debug=False)
-        k = reset_pools(frames, mask_frames, vae)
 
         model = model.clone()
         new_handler = copy.copy(handler)
