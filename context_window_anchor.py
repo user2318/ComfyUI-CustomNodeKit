@@ -4,15 +4,16 @@
 # 一句话：把「你自己提供的几个基准帧」和「窗口前后的真实相邻帧」作为**额外帧**拼进每个窗口参与采样，
 #         采样后裁掉；它们只做上下文/基准，不参与窗口融合。
 #
-# 生成的切片结构（x 坐标系，P = 参考前缀帧数）：
-#   [参考前缀] [锚定帧(你提供的基准)] [前延伸帧(紧邻)] [本窗口帧(参与融合)] [后延伸帧]
+# 生成的切片结构（x 坐标系，P = 参考前缀帧数；halo 关闭时中间两段为空）：
+#   [参考前缀] [锚定帧(已知基准)] [前延伸(内部·默认关)] [本窗口帧(参与融合)] [后延伸(内部·默认关)]
 #
-# 两个可独立开关的机制（参数为 0 / 不接图即关闭，完全等价于不装本节点）：
-#   1) 锚定（拼接式）：输入 `anchor_frames`（驱动/pose 视频的若干像素帧，VAE 编码；SCAIL-2 另可接
-#      `anchor_mask_frames` 提供同帧号的 SAM3 彩色遮罩）。**提供多少就用多少**，没有数量参数。
-#      它们拼在参考前缀之后、窗口帧之前；首窗同样拼接（基准是外部素材，不依赖窗口 0）。
-#   2) 双侧延伸（halo）：把窗口前后各 N 个 latent 帧的真实相邻帧纳入窗口视野但不参与融合，
-#      让每个「被拥有」的帧都处在窗口内部，而不是永远落在两个窗口的边缘。
+# 节点接口（极简）：只需要三根可选线
+#   - anchor_frames（IMAGE）：要当基准的那几帧，**给多少用多少**（没有数量参数）；
+#   - vae（VAE）：与 conditioning 节点同一个 Wan VAE；
+#   - anchor_mask_frames（IMAGE，仅 SCAIL-2）：与 anchor_frames 同帧号的驱动遮罩。
+# 这些帧会被当作「已知帧（干净历史）」拼在每个窗口最前面：驱动流 + 驱动遮罩 + 待生成序列，
+# 采样后裁掉、不参与融合；不接 anchor_frames 时完全等价于不装本节点。
+# （内部的 apply_window_extras 仍保留"双侧延伸"能力，但暂不暴露，默认 0=关闭。）
 #
 # 为什么需要（背景）：animate2 / SCAIL-2 无骨骼等显式空间锚，且窗口化后 RoPE 每窗恒为 0..L-1
 #   （不携带绝对时间）；Wan-Animate-2 论文 §3.3/§3.4 证实「驱动帧 ↔ 生成帧」是**逐帧刚性对齐**
@@ -49,10 +50,15 @@ from dataclasses import dataclass
 import torch
 
 
-# 原始 conditioning 里承载「驱动/pose latent」的键名（animate2 与 SCAIL-2 相同）
-ANCHOR_POSE_KEY = "pose_video_latent"
-# 长度与 x 相同、需要一起前插的掩码类键（值语义 0=已知）：锚定帧填 0
-ANCHOR_ZERO_KEYS = ("concat_mask",)
+# 「驱动/pose latent」的键名：原始键 + 模型侧键（animate2 与 SCAIL-2 都是这两个）
+ANCHOR_POSE_KEYS = ("pose_video_latent", "pose_latents")
+# 「已知/未知」标记类流的填法（锚定帧 = 已知/干净帧）：
+#   c_concat        ：SCAIL-2 的 4 通道 history mask，1 = 干净(已知)锚帧  → 锚帧填 1
+#   concat_mask / denoise_mask：输入掩码，1 = 去噪                    → 锚帧填 0
+ANCHOR_ONES_KEYS = ("c_concat",)
+ANCHOR_ZERO_KEYS = ("concat_mask", "denoise_mask")
+# 掩码型通道（按通道数识别的兜底：未知的掩码类流按「未知」填 0 并只告警一次）
+MASK_LIKE_CHANNELS = (1, 3, 4)
 
 
 @dataclass
@@ -70,6 +76,15 @@ _POOL_CACHE: dict = {}
 _POOL_SOURCE = {"frames": None, "mask_frames": None, "vae": None}
 _ANCHOR_COUNT = 0
 _WARNED = set()
+_LOGGED_ONCE = set()
+
+
+def _log_once(tag, msg, *args):
+    """同一条消息只打一次（避免每个采样步 × 每个窗口刷屏）。"""
+    if tag in _LOGGED_ONCE:
+        return
+    _LOGGED_ONCE.add(tag)
+    logging.info(msg, *args)
 
 
 def reset_pools(frames, mask_frames, vae):
@@ -77,6 +92,7 @@ def reset_pools(frames, mask_frames, vae):
     global _ANCHOR_COUNT
     _POOL_CACHE.clear()
     _WARNED.clear()
+    _LOGGED_ONCE.clear()
     _POOL_SOURCE.update(frames=frames, mask_frames=mask_frames, vae=vae)
     _ANCHOR_COUNT = latent_frames_of(frames.shape[0]) if frames is not None else 0
     return _ANCHOR_COUNT
@@ -179,14 +195,17 @@ def _insert_at(tensor, extra, dim: int, pos: int):
     return torch.cat([tensor[tuple(head)], extra, tensor[tuple(tail)]], dim=dim)
 
 
-def _zero_like_frames(tensor, dim: int, count: int):
-    """取 tensor 的前 count 帧并置 0（不够则重复末帧），用于「已知/未知」类掩码流。"""
+def _zero_like_frames(tensor, dim: int, count: int, value: float = 0.0):
+    """取 tensor 的前 count 帧并整体置为 value（不够则重复末帧），用于「已知/未知」标记类流。"""
     if tensor is None or count <= 0:
         return None
     idx = [slice(None)] * tensor.ndim
     idx[dim] = slice(0, min(count, tensor.shape[dim]))
     z = tensor[tuple(idx)].clone()
-    z.zero_()
+    if value == 0.0:
+        z.zero_()
+    else:
+        z.fill_(float(value))
     if z.shape[dim] < count:
         reps = [1] * tensor.ndim
         reps[dim] = count - z.shape[dim]
@@ -308,7 +327,7 @@ def _window_lengths(window, dim: int = 2):
 def _prepend_one_cond(key, tensor, window, slice_len, frames_len, prefix_len, stats=None):
     """按键类型把锚帧插进某个条件张量；返回新张量（不改则原样返回）。
 
-    长度判据必须是「窗口级」长度（slice_len / frames_len），**不能用全局 chunk 长度** ——
+    长度判据必须是「窗口级」长度（slice_len / frames_len），不能用全局 chunk 长度 ——
     否则窗口内部的逐帧流会被静默漏插，随后在 comfy 的 c_concat 通道拼接处以形状不匹配报错。
     """
     if stats is None:
@@ -319,41 +338,55 @@ def _prepend_one_cond(key, tensor, window, slice_len, frames_len, prefix_len, st
     cur = int(tensor.shape[t_dim])
     ch = int(tensor.shape[1]) if tensor.ndim > 1 else 1
 
-    # 1) pose / 驱动 latent 流：一定前插（窗口帧坐标系，不含参考前缀）
-    if key == ANCHOR_POSE_KEY:
-        pool = _get_pool("pose", tensor.shape[-2], tensor.shape[-1], target_channels=ch,
+    def _pool(kind):
+        return _get_pool(kind, tensor.shape[-2], tensor.shape[-1], target_channels=ch,
                          device=tensor.device, dtype=tensor.dtype)
+
+    # 1) 驱动/pose latent 流：一定前插（窗口帧坐标系，不含参考前缀）
+    if key in ANCHOR_POSE_KEYS:
+        pool = _pool("pose")
         if pool is None:
             stats["skipped"].append(key)
             return tensor
         window.anchor_pose_latent = pool
         new_t = _insert_at(tensor, pool, t_dim, 0)
         if new_t is not tensor:
-            stats["extended"].append(f"{key}(pose池)")
-            logging.info("[ContextAnchor] pose 流已插入锚定 %d 帧：%s → %s",
-                         _ANCHOR_COUNT, list(tensor.shape), list(new_t.shape))
+            stats["extended"].append(f"{key}(驱动池)")
+            _log_once(("pose", key), "[ContextAnchor] 已把锚定 %d 帧插入驱动流 '%s'：%s → %s",
+                      _ANCHOR_COUNT, key, list(tensor.shape), list(new_t.shape))
         return new_t
 
-    # 2) 与窗口切片 / 窗口帧等长的逐帧流：按通道决定填什么
-    if cur == slice_len or cur == frames_len:
-        pos = prefix_len if cur == slice_len else 0
-        if key in ANCHOR_ZERO_KEYS or ch in ANCHOR_ZERO_CHANNELS:
-            extra = _zero_like_frames(tensor, t_dim, _ANCHOR_COUNT)
-            what = f"填0({ch}ch)"
-        else:
-            extra = _get_pool("x", tensor.shape[-2], tensor.shape[-1], target_channels=ch,
-                              device=tensor.device, dtype=tensor.dtype)
-            what = f"x池({ch}ch)"
-        if extra is None:
-            stats["skipped"].append(f"{key}({ch}ch,长{cur})")
-            return tensor
-        new_t = _insert_at(tensor, extra, t_dim, pos)
-        if new_t is not tensor:
-            stats["extended"].append(f"{key}({what},pos={pos})")
-            logging.info("[ContextAnchor] 逐帧流 '%s'（%dch, 长 %d）已插入锚定 %d 帧：%s，位置=%d",
-                         key, ch, cur, _ANCHOR_COUNT, what, pos)
-        return new_t
-    return tensor
+    if cur != slice_len and cur != frames_len:
+        return tensor
+    pos = prefix_len if cur == slice_len else 0
+
+    # 2) SCAIL-2 的 28 通道掩码由模型 patch 前插（位置更精细：ref 掩码要插在 N 帧参考之后），此处不动
+    if ch == 28:
+        logging.debug("[ContextAnchor] 条件流 '%s'(28ch) 由模型 patch 处理，锚定注入跳过", key)
+        return tensor
+
+    # 3) 「已知/未知」标记类流：c_concat 填 1（= 干净/已知锚帧），输入掩码填 0
+    if key in ANCHOR_ONES_KEYS and ch in MASK_LIKE_CHANNELS:
+        extra, what = _zero_like_frames(tensor, t_dim, _ANCHOR_COUNT, value=1.0), "填1(已知锚)"
+    elif key in ANCHOR_ZERO_KEYS or ch in MASK_LIKE_CHANNELS:
+        extra, what = _zero_like_frames(tensor, t_dim, _ANCHOR_COUNT, value=0.0), "填0(未知)"
+    # 4) 20 通道 = 16 latent + 4 ones（SCAIL 的驱动格式）→ 用驱动池
+    elif ch == 20:
+        extra, what = _pool("pose"), "驱动池"
+    # 5) 其余（16ch 等）→ 用 x 池
+    else:
+        extra, what = _pool("x"), "x池"
+
+    if extra is None:
+        stats["skipped"].append(f"{key}({ch}ch,长{cur})")
+        return tensor
+    new_t = _insert_at(tensor, extra, t_dim, pos)
+    if new_t is not tensor:
+        stats["extended"].append(f"{key}({what})")
+        _log_once(("stream", key, what),
+                  "[ContextAnchor] 已把锚定 %d 帧插入条件流 '%s'（%dch, 长 %d → %d，%s）",
+                  _ANCHOR_COUNT, key, ch, cur, int(new_t.shape[t_dim]), what)
+    return new_t
 
 
 def inject_anchor_conds(window, resized_cond, x_in=None, dim: int = 2):
@@ -382,17 +415,15 @@ def inject_anchor_conds(window, resized_cond, x_in=None, dim: int = 2):
                 new_t = _prepend_one_cond(key, t, window, slice_len, frames_len, prefix_len, stats)
                 if new_t is not t:
                     actual[key] = _cond_replace(value, new_t)
-    if stats["extended"] or stats["skipped"]:
-        orig = getattr(window, "original_indices", None) or []
-        logging.info("[ContextAnchor] 窗口帧 %s..%s（切片长 %d / 帧长 %d）：已插=%s；等长未插=%s",
-                     orig[0] if orig else None, orig[-1] if orig else None,
-                     slice_len, frames_len, stats["extended"] or "无", stats["skipped"] or "无")
-        for name in stats["skipped"]:
-            tag = ("skip", name)
-            if tag not in _WARNED:
-                _WARNED.add(tag)
-                logging.warning("[ContextAnchor] 条件流 '%s' 长度等于窗口长度但未插入锚定帧："
-                                "若它在 comfy 内部参与通道拼接会以形状不匹配报错，请检查。", name)
+    if stats["extended"]:
+        _log_once(("summary",), "[ContextAnchor] 锚定生效：本窗口已插入的流 = %s",
+                  ", ".join(stats["extended"]))
+    for name in stats["skipped"]:
+        tag = ("skip", name)
+        if tag not in _WARNED:
+            _WARNED.add(tag)
+            logging.warning("[ContextAnchor] 条件流 '%s' 长度等于窗口长度但未插入锚定帧："
+                            "若它参与 comfy 内部的通道拼接会以形状不匹配报错，请检查。", name)
     return resized_cond
 
 
@@ -537,9 +568,10 @@ def _install(handler, cfg: AnchorConfig):
 # ---------------- 节点 ----------------
 
 class WanContextWindowAnchorNode:
-    """上下文窗口「统一基准锚定（拼接式）+ 双侧延伸」节点。
+    """上下文窗口「统一基准锚定」节点（实验性）。
 
-    两个机制都可独立关闭（halo=0 且不接锚定帧时，完全等价于不装本节点）。
+    只需要三根可选线：anchor_frames（要当基准的那几帧）、vae（同一个 Wan VAE）、
+    SCAIL-2 再加 anchor_mask_frames（同帧号的驱动遮罩）。其余行为内部定死，无需任何调参。
     """
 
     @classmethod
@@ -549,17 +581,11 @@ class WanContextWindowAnchorNode:
                 "model": ("MODEL", {"tooltip": "已接入上下文窗口节点的模型（`Custom Context Windows (Manual)` 或 `Wan SCAIL-2 Context Windows` 的 model 输出）。Model that already has a context windows node applied."}),
                 "enabled": ("BOOLEAN", {"default": True,
                     "tooltip": "总开关；关闭时模型直接透传。Master switch."}),
-                "halo_frames_head": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "【双侧延伸·前】把窗口之前的 N 个 latent 帧纳入窗口视野（只做上下文、不参与融合）；0=关闭。首窗自动为 0（前面是参考前缀区）。\nHead halo: preceding latent frames the window can see (context only, not fused). 0=off."}),
-                "halo_frames_tail": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "【双侧延伸·后】把窗口之后的 N 个 latent 帧纳入窗口视野（只做上下文、不参与融合）；0=关闭。末窗自动截断。\nTail halo: following latent frames the window can see (context only, not fused). 0=off."}),
             },
             "optional": {
-                "anchor_frames": ("IMAGE", {"tooltip": "【锚定基准帧】驱动/pose 视频里你想当统一基准的那几帧（例如整段视频开头几帧、或与参考图姿态最接近的一段）。**提供多少就用多少**（没有数量参数），会 VAE 编码后拼在每个窗口的参考前缀之后，采样后裁掉；不接=关闭锚定。\nAnchor basis frames (driving/pose video). How many you feed is how many are used; trimmed after sampling. Leave unconnected to disable."}),
-                "anchor_mask_frames": ("IMAGE", {"tooltip": "【可选，仅 SCAIL-2】与 anchor_frames **同帧号**的 SAM3 彩色遮罩帧；接上才能让驱动遮罩与姿态保持同一时间基准（掩码不需要 VAE）。\nOptional SCAIL-2 mask frames matching anchor_frames (no VAE needed)."}),
-                "vae": ("VAE", {"tooltip": "【接 anchor_frames 时必接】与 conditioning 节点同一个 Wan VAE，用于把锚定帧编码成 latent（SCAIL-2/近分辨率的 pose 分支会按各自 latent 尺寸自动缩放）。\nSame Wan VAE as the conditioning node; required when anchor_frames is connected."}),
-                "log_debug": ("BOOLEAN", {"default": False,
-                    "tooltip": "打印每个窗口的延伸/锚定明细。Log per-window halo/anchor details."}),
+                "anchor_frames": ("IMAGE", {"tooltip": "【基准帧】驱动/pose 视频里你想当统一基准的那几帧（例如整段视频开头几帧）。**给多少就用多少**（没有数量参数）：会 VAE 编码成 latent，作为「已知帧」拼在每个窗口最前面（驱动流 + 驱动遮罩 + 待生成序列），采样后裁掉、不参与融合。不接=关闭本节点。\nAnchor basis frames (driving/pose video): how many you feed is how many are used. Leave unconnected to disable."}),
+                "anchor_mask_frames": ("IMAGE", {"tooltip": "【仅 SCAIL-2】与 anchor_frames 同帧号的彩色遮罩帧（内部转成 28 通道，不需要 VAE）。建议一起接，否则驱动遮罩与驱动视频的时间基准可能不一致。\nSCAIL-2 only: colored mask frames matching anchor_frames (no VAE needed)."}),
+                "vae": ("VAE", {"tooltip": "【接了 anchor_frames 时必接】与 conditioning 节点**同一个** Wan VAE（用于把基准帧编码成 latent；接错 VAE 会得到无意义的条件）。\nSame Wan VAE as the conditioning node; required when anchor_frames is connected."}),
             },
         }
 
@@ -569,28 +595,22 @@ class WanContextWindowAnchorNode:
     CATEGORY = "context"
     EXPERIMENTAL = True
     DESCRIPTION = (
-        "窗口「统一基准锚定（拼接式）+ 双侧延伸」节点。⚠️ 实验性：有效性与副作用需自行开/关对比验证。\n"
-        "1) 锚定：把你提供的基准帧（anchor_frames，可选配 SCAIL-2 遮罩）VAE 编码后作为**额外帧**拼在"
-        "每个窗口的参考前缀之后参与采样，采样后裁掉（提供多少用多少）。\n"
-        "2) 双侧延伸：把窗口前后各 N 帧真实相邻帧纳入视野但不参与融合，让每帧都处在窗口内部。\n"
-        "切片结构：[参考前缀][锚定帧][前延伸帧][本窗口帧(参与融合)][后延伸帧]。\n"
-        "两者都可关闭（halo=0 且不接锚定帧 ⇒ 完全等价于不装本节点）。必须接在上下文窗口节点之后。\n"
-        "推荐：双侧延伸 + 上下文节点 overlap=0 → 每个全局帧只有一个拥有者，重影从机制上消失。\n"
-        "Splice-style unified-basis anchoring + two-sided halo for context windows (experimental)."
+        "上下文窗口「统一基准锚定」节点（⚠️ 实验性：有效性与副作用需自行开/关对比验证）。\n"
+        "把你给的那几帧当作**已知帧**（干净历史）拼在每个窗口最前面：驱动流 + 驱动遮罩(SCAIL-2) + "
+        "待生成序列；采样后裁掉、不参与融合，让所有窗口的对齐基准一致。\n"
+        "只需三根线：anchor_frames（给多少用多少）、vae（同一个 Wan VAE）、SCAIL-2 再加 anchor_mask_frames。\n"
+        "不接 anchor_frames ⇒ 完全等价于不装本节点。必须接在上下文窗口节点之后。\n"
+        "Splice-style unified-basis anchoring for context windows (experimental)."
     )
 
-    def apply_anchor(self, model, enabled=True, halo_frames_head=0, halo_frames_tail=0,
-                     anchor_frames=None, anchor_mask_frames=None, vae=None, log_debug=False):
+    def apply_anchor(self, model, enabled=True, anchor_frames=None, anchor_mask_frames=None, vae=None):
         frames = _as_image_batch(anchor_frames)
         mask_frames = _as_image_batch(anchor_mask_frames)
-        halo_head = max(0, int(halo_frames_head))
-        halo_tail = max(0, int(halo_frames_tail))
 
-        if not enabled or (frames is None and halo_head <= 0 and halo_tail <= 0):
+        if not enabled or frames is None:
             reset_pools(None, None, None)
-            logging.info("[ContextAnchor] 未启用（enabled=%s, anchor=%s, halo=%d/%d），模型直接透传",
-                         enabled, "未接" if frames is None else f"{frames.shape[0]} 像素帧",
-                         halo_head, halo_tail)
+            logging.info("[ContextAnchor] 未启用（enabled=%s, anchor=%s），模型直接透传",
+                         enabled, "未接" if frames is None else f"{frames.shape[0]} 像素帧")
             return (model,)
 
         handler = model.model_options.get("context_handler", None)
@@ -598,16 +618,16 @@ class WanContextWindowAnchorNode:
             raise ValueError(
                 "[ContextAnchor] 模型上没有 context_handler：请把本节点接在 "
                 "WAN Context Windows (Manual Custom) / Wan SCAIL Context Windows 之后。")
-        if frames is not None and vae is None:
+        if vae is None:
             raise ValueError(
-                "[ContextAnchor] 接了 anchor_frames 但没有接 vae：锚定帧必须用（与 conditioning 相同的）"
+                "[ContextAnchor] 接了 anchor_frames 但没有接 vae：基准帧必须用（与 conditioning 相同的）"
                 "Wan VAE 编码成 latent。")
-        if frames is not None and mask_frames is not None and mask_frames.shape[0] != frames.shape[0]:
+        if mask_frames is not None and mask_frames.shape[0] != frames.shape[0]:
             logging.warning("[ContextAnchor] anchor_mask_frames 帧数(%d) 与 anchor_frames 帧数(%d) 不一致，"
                             "遮罩会按自己的帧数编码", mask_frames.shape[0], frames.shape[0])
 
-        cfg = AnchorConfig(halo_head=halo_head, halo_tail=halo_tail, anchor_frames=frames,
-                           anchor_mask_frames=mask_frames, vae=vae, log_debug=bool(log_debug))
+        cfg = AnchorConfig(halo_head=0, halo_tail=0, anchor_frames=frames,
+                           anchor_mask_frames=mask_frames, vae=vae, log_debug=False)
         k = reset_pools(frames, mask_frames, vae)
 
         model = model.clone()
@@ -615,15 +635,8 @@ class WanContextWindowAnchorNode:
         _install(new_handler, cfg)
         model.model_options["context_handler"] = new_handler
 
-        ctx_len = int(getattr(handler, "context_length", 0) or 0)
-        budget = ctx_len + k + halo_head + halo_tail
-        logging.info(
-            "[ContextAnchor] 已应用：锚定 %d 帧（%s）+ 双侧延伸 %d/%d latent 帧；窗口总长 = %d + %d + %d/%d = %d latent",
-            k, "未接" if frames is None else f"输入 {frames.shape[0]} 像素帧", halo_head, halo_tail,
-            ctx_len, k, halo_head, halo_tail, budget)
-        if budget > 21:
-            logging.warning("[ContextAnchor] 窗口总长 %d latent 超过 ≈21（81 像素帧，模型训练长度）："
-                            "可能影响质量，建议减小锚定帧数或 halo。", budget)
+        logging.info("[ContextAnchor] 已启用：%d 像素帧 → %d latent 帧，作为「已知帧」拼在每个窗口最前"
+                     "（驱动流 + 驱动遮罩 + 待生成序列），采样后裁掉", frames.shape[0], k)
         return (model,)
 
 
