@@ -33,6 +33,9 @@ This release also fixes a crash in the SDPose yaw nodes on short segments, the B
   - [SmartVideoCrop](#smartvideocrop)
   - [VideoGridCompose](#videogridcompose)
   - [BatchImageReplace](#batchimagereplace)
+  - [ImageListSplitOutputs](#imagelistsplitoutputs)
+  - [ImageListReplaceAt](#imagelistreplaceat)
+  - [ImageListToBatch](#imagelisttobatch)
 - [Workflows](#workflows)
   - [Long Video Pose Detection Workflow](#long-video-pose-detection-workflow)
   - [WanAnimate Multi-Ref Long Video Workflow](#wananimate-multi-ref-long-video-workflow)
@@ -135,11 +138,14 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 
 | Node | Category | Description |
 |------|----------|-------------|
-| **Folder Image Loader** | `image` | Loads image batches from a folder sorted by filename. Supports skip, count limits, and size synchronization |
+| **Folder Image Loader** | `image` | Loads images from a folder sorted by filename; outputs a same-size batch `images`, a `count`, and a per-image list `images_list` (list semantics; with `size_mode=no_resize` the list keeps original sizes). Supports skip, count limits, and size handling |
 | **Image Batch Concat** | `image` | Concatenates two image batches. Passes through the non-empty input if only one is connected |
 | **Image Batch Resize** | `image` | Resizes image batches to specified dimensions. Optional directional cropping to maintain aspect ratio |
 | **Batch Image Replace** | `image` | Batch image replacement node. Replaces images at specified positions in a batch by start index and count. Supports overflow modes and underflow mode, with optional replacement source |
 | **Batch Frame Replicate** | `image` | Batch frame replication node. Replicates a specified image and inserts copies after it. Supports negative indexing and dual-channel independent input. Used for extending first/last frame duration, keyframe freeze effects |
+| **Image List Split** | `image` | Splits an **image list** into N independent outputs (1-16; the visible output slots are added/removed live with the widget). Outputs the items from `start_index` onwards; channels beyond the available items are empty (`None`, i.e. **exactly like an unconnected wire**: optional downstream inputs are treated as "not provided"). An unconnected input produces no output and no error. List items may have different sizes; a plain IMAGE batch is split into single-frame items automatically |
+| **Image List Replace** | `image` | Overwrites a run of a target image list starting at `start_index` with the replacement list; the length is decided by the replacement list and **never exceeds the original list length** (extra replacement items are dropped). Whole items are swapped, **no resizing**, list length unchanged; the output is a list (downstream runs per element) |
+| **Image List To Batch** | `image` | Converts an image list with **mixed sizes** into a single-size batch (**never crops or stretches**): the reference is the item with the longest short side (= largest area × squareness), **its own size becomes the output size** (zero resampling for it), every other item is padded on **one axis only** (symmetric) and scaled proportionally. `output_mode` defaults to `RGB` (3ch, black padding, most compatible with VL/VAE) and can be switched to `RGBA` (4ch, alpha=0 padding, for compositing) |
 | **MaskCompositeRef** | `image` | Mask batch compositing node — reference_image preprocessing for WanSCAILToVideo. Supports replacement mode and animation mode, auto-filters fully black mask frames, background compositing |
 
 ### Context Tools
@@ -251,6 +257,7 @@ A context window scheduling node for WAN-type video generation models. When vide
 | `freenoise` | BOOLEAN | Enable FreeNoise noise shuffling (improves inter-window continuity) |
 | `prefix_latent_num` | INT | Number of prefix reference frame latents. Set to match the count of images from reference image selector's raw_reference_images. These frames are prepended to each window as stable references |
 | `split_conds_to_windows` | BOOLEAN | Whether to assign multiple conditionings to windows by region index |
+| `fuse_sharpen` | FLOAT | **Fusion weight sharpening (power)**, default 1.0 = off (historical behaviour). 3~6 narrows the crossfade band inside the overlap so one window dominates at any instant ⇒ **stays continuous (still a gradual blend) yet no more two characters ghosted on top of each other**. Most useful with large overlap / large disagreement between windows |
 
 #### Scheduling Strategies (context_schedule)
 
@@ -258,8 +265,9 @@ A context window scheduling node for WAN-type video generation models. When vide
 |----------|-------------|----------|
 | `looped_uniform` | Cyclic uniform scheduling: windows distributed cyclically on timeline, stride increases exponentially | Scenarios requiring multiple iterative coverage |
 | `standard_uniform` | Standard uniform scheduling: similar to looped but without cycles, removing duplicate windows | First choice for most general scenarios |
-| `standard_static` | Standard static scheduling: fixed-step sliding windows (step = context_length - context_overlap) | Long videos needing simple segmented processing |
-| `batched` | Batch scheduling: direct slicing by context_length, no overlap | Quick batch processing without transitional fusion |
+| `standard_static` | Standard static scheduling: fixed-step sliding windows (step = context_length - context_overlap). ⚠️ When the last window overflows it **backs off to end-align**, making the last seam overlap much larger than requested (a warning is logged) | Long videos needing simple segmented processing |
+| `standard_even` | **Equal-length windows, last window does not back off**: starts are spread evenly over `[0, total - context_length]`, so the overlap is evened out | Fixing the oversized last seam without changing window length |
+| `batched` | Batch scheduling: direct slicing by context_length, **no overlap** (last window is shorter) | Pair with `Context Window Anchor`'s head/tail read-only context for "exactly one author per frame" |
 
 #### Fusion Methods (fuse_method)
 
@@ -275,6 +283,8 @@ A context window scheduling node for WAN-type video generation models. When vide
 1. **Frame conversion**: `context_length` and `context_overlap` are input in pixel frames; the node auto-converts to latent frames (every 4 pixel frames → 1 latent frame).
 2. **Prefix reference frames**: When `prefix_latent_num > 0`, that many reference latents are prepended to each window as stable references, suitable for tasks requiring global context.
 3. **freenoise**: Enable this to shuffle noise for improved texture continuity across windows. Recommended for long sequences with small overlaps.
+4. **Overlap & ghosting**: the overlap region is *weighted-averaged* (`fuse_method`); if two windows disagree about the character's scale/position you get "two characters on top of each other". Three remedies: ① `fuse_sharpen=3~6` (narrows the crossfade band, still continuous); ② switch to `standard_even` (removes the oversized last seam); ③ use `batched` + `Context Window Anchor`'s `head/tail_context_frames` so **each frame has exactly one author**.
+5. **The total overlap is locked by geometry**: `total overlap = #windows × window length − total length`. To make the overlap *small* you must use **shorter and more numerous** windows (e.g. 11 latent × 4 windows for 43 latent); no schedule can dodge that.
 
 #### Typical Workflow
 
@@ -288,17 +298,23 @@ A context window scheduling node for WAN-type video generation models. When vide
 
 ---
 
-### Context Window Anchor (unified-basis anchoring)
-> ⚠️ **Experimental / test-only node (not fully validated)**: effectiveness and side effects (quality, identity consistency, sampling stability) have not been systematically evaluated. A/B it with the **same seed** ("unconnected" vs "connected") before relying on it. **Without `anchor_frames` connected this node is exactly equivalent to not installing it.**
+### Context Window Anchor (unified-basis anchoring / read-only context / long-range motion memory)
+> ⚠️ **Experimental / test-only node (not fully validated)**: effectiveness and side effects (quality, identity consistency, sampling stability) have not been systematically evaluated. A/B it with the **same seed** (bypassed vs active) before relying on it. **Merely connecting this node with no inputs and no parameters is exactly equivalent to not installing it.**
 
-**Problem it addresses**: animate2 / SCAIL-2 have no explicit spatial anchor (no skeleton), and under context windows RoPE is always `0..L-1` per window (no absolute time). Wan-Animate-2 §3.3/§3.4 show the driving↔generated alignment is **rigid and frame-wise** — and nothing guarantees that two windows infer the *same* reference↔driving mapping. So every window re-infers its basis from its own head: a different head → a different result for the same global frame (ghosting / motion mismatch); a hard head → the whole segment breaks structurally.
+**Problem it addresses**: animate2 / SCAIL-2 have no explicit spatial anchor (no skeleton); under context windows every window's RoPE restarts at 0 (no absolute time), while SCAIL-2 aligns driving↔generated frames **rigidly 1:1 via identical RoPE positions**. Each window therefore infers its own basis from its own driving slice ⇒ two overlapping windows produce **two different motion predictions**, and fusion is a **weighted average** ⇒ ghosting / softened motion / one or two windows off. In addition, the `standard_static` schedule "backs off" the last window when it would overflow, making the **last seam overlap** much larger than requested (e.g. 11 latent instead of 6 with length/overlap = 20/6) — the most ghost-prone stretch.
 
-**What it does**: prepends your anchor frames to every window's **driving video (and, for SCAIL-2, its driving mask)**, and puts the same frames — **noised to the current σ** and treated as **ordinary frames** — at the front of the generation sequence, then trims them (with their predictions) after sampling. This mirrors doing it by hand: "prepend the video opening to a segment, generate, then crop".
+**Three content-level remedies (position encoding cannot fix any of these):**
 
-- **Why the generation sequence too**: SCAIL-2's driving mask is added **token-wise into the driving stream**, so it must have the **same frame count** as the driving video; and driving↔generated frames are **rigidly 1:1 aligned** (animate2 even asserts `pose = f_gen − 1`) → prepending on the driving side only would misalign them.
-- **Anchors follow their own generation trajectory** (key point): step 1 (σ=1) injects **pure noise**; afterwards each step re-noises **the x0 the model predicted for those frames** (`(1−σ)·x0_prev + σ·noise`) → the frames become "the reference character performing the opening motion" instead of pinning the **driver's footage** at the window head (which bleeds the driver's identity into the window head and causes the artifact).
-- **Treated as ordinary frames**: input mask = 1 (to generate), history mask = 0.
-- **Any frame count works** (1~13 pixel frames; K = `((T−1)//4)+1`; the mask encoder now handles arbitrary T). **SCAIL-2 requires `anchor_mask_frames`** — without it the driving stream and mask frame counts would differ; this is now reported **before sampling** instead of crashing deep inside the model.
+1. **Anchor frames** (`anchor_frames`, optional): one shared "preceding motion / basis" for every window.
+   - `driving_only = on` (default, SCAIL-2): anchors are **appended to the driving stream as extra tokens** and the RoPE patch places them **before this window** (`t = N_ref-K .. N_ref-1`) — they pair with no video frame and occupy no video position ⇒ **existing geometry is untouched and the animation is no longer shifted by K frames** (the old implementation prepended them, delaying the whole animation by K latent = 4K pixel frames).
+   - `driving_only = off`: anchors are prepended to the driving stream **and** the generation sequence (rigid 1:1 pairing, trimmed after sampling) — closest to the training semantics (each trained chunk starts with the previous chunk's output).
+2. **Read-only context** (`head_context_frames`, **unit = latent frames**): each window may attend to a few **real preceding frames** (attended but **not fused** — trimmed before fusion). With `overlap = 0` **every frame has exactly one author** (no averaging of two predictions).
+   - Content = those frames of the shared latent `x`, i.e. **the values from the previous iteration** (not this step's fresh output): early in sampling (σ≈1) they are basically noise and only become useful later.
+   - ⚠️ **The tail (`tail_context_frames`) has been removed**: it cannot produce a visible effect — its prediction is trimmed before fusion, and those frames are "authored" by the *following* window (you only peek, you cannot change the outcome).
+3. **Long-range motion memory** (`memory_frames`, **unit = latent frames**): history driving frames **before** this window, appended as extra driving tokens; their RoPE positions **encode the stride and ordering faithfully** (they are not mistaken for adjacent frames or for "future driving").
+   - **The stride is set by `memory_stride`**: `0` (default) = auto — spread the `memory_frames` points so they cover the **whole history** from the clip start to this window (so long clips / late windows still reach the beginning; the stride grows and time resolution gets coarser); `>0` = fixed stride (`4` ≈ one sample per 16 pixel frames).
+
+> ⚠️ **Frame units differ**: `anchor_frames` (IMAGE) is in **pixel frames** (as many as you feed; converted internally via `((T-1)//4)+1`); `head_context_frames` / `memory_frames` / `memory_stride` are all in **latent frames**.
 
 #### Parameters
 
@@ -306,11 +322,18 @@ A context window scheduling node for WAN-type video generation models. When vide
 |---|---|---|---|
 | `model` | MODEL | — | Model that already has a context windows node applied |
 | `enabled` | BOOLEAN | true | Master switch; when off the model passes through |
-| `driving_only` | BOOLEAN | **true** | Anchors go to the driving stream + driving mask only (nothing injected into the generation sequence → no anchor bleed, no artifact). animate2 forces this to false (log note) |
-| `head_context_frames` | INT | 0 | Read-only preceding frames each window may see (the previous window's real tail frames: attended but **not fused**); with `overlap=0` this removes the hard seam. 0=off |
-| `anchor_frames` | IMAGE (optional) | unconnected = off | **Basis frames**: driving/pose frames you want as the shared basis (e.g. the first frames of the video). Feed as many as you want |
-| `anchor_mask_frames` | IMAGE (optional, SCAIL-2 only) | unconnected | Colored mask frames with the **same frame numbers** as `anchor_frames` (converted to 28 channels internally, no VAE). Recommended, otherwise the driving mask and driving video can drift apart |
+| `driving_only` | BOOLEAN | **true** | true = anchors act as extra driving tokens placed *before* this window (nothing injected into the generation sequence, no frame shift); false = prepend to driving stream + generation sequence (1:1 pairing, closest to training). animate2 is forced to false (log note) |
+| `head_context_frames` | INT | 0 | Read-only preceding frames per window (attended, not fused); use with `overlap=0` |
+| `memory_stride` | INT | 0 | **Sampling stride for the long-range memory group** (latent frames): `0` = auto (recommended) — spread the `memory_frames` points over the whole history from the clip start to this window; `>0` = fixed stride (`4` ≈ one sample per 16 pixel frames). ⚠️ This parameter **takes over the old `tail_context_frames` slot**, so legacy workflows (whose value there was almost always 0) map onto `0` = auto — semantically compatible |
+| `memory_frames` | INT | 0 | Long-range memory: take **N history latent frames** before this window as extra driving tokens (0=off, SCAIL only); stride via `memory_stride`. In auto mode `N` is the **budget** (N=4 = summarise the whole preceding history with 4 points) |
+| `anchor_fixed` | BOOLEAN | false | Only for `driving_only=false`. true = identical anchor latent across all windows/steps (a truly constant basis); false = the anchor follows its own generation trajectory (re-noise the x0 the model predicted for those frames) |
+| `anchor_frames` | IMAGE (optional) | unconnected = no anchoring | **Basis frames**: driving/pose frames you want as the shared basis (e.g. the first frames of the video). Feed as many as you want |
+| `anchor_mask_frames` | IMAGE (optional, SCAIL-2 only) | unconnected | Colored mask frames with the **same frame numbers** as `anchor_frames` (converted to 28 channels internally, no VAE) |
 | `vae` | VAE (required when anchoring) | unconnected | The **same** Wan VAE as the conditioning node; connecting `anchor_frames` without `vae` raises an explicit error |
+
+> The read-only context (`head_context_frames`) and the memory group (`memory_frames` / `memory_stride`) need **no connections at all** — parameters only; the memory group does not even need a VAE.
+>
+> ⚠️ `anchor_frames` comes from the **driving video's picture**. Inside the generation sequence it is only a placeholder (the model grows the content itself); pinning it down as a "known clean frame" would leak the **driver's identity** into the output (the historical "driver-identity artifact").
 
 #### Wiring
 
@@ -326,14 +349,19 @@ A context window scheduling node for WAN-type video generation models. When vide
 
 #### Usage tips
 
-1. **A/B**: same seed, `anchor_frames` unconnected vs connected (5~9 pixel frames); compare the same frame's pose/scale and the window seams. The main criterion stays the **side-by-side video** (many differences are temporal and invisible in stills).
-2. **Which frames to use as the basis**: start with the first frames of the whole video; if some windows are still unstable, try the frames whose pose is closest to the reference image, or the frames immediately before that chunk (`ImageFromBatch` is enough).
-3. Change one variable at a time (`FreeNoise`, `overlap`, basis source separately).
+1. **Read-only context first**: `overlap = 0` (schedule → `batched`, or `standard_even` to spread the overlap) + `head_context_frames = 2` (latent frames; keep "own frames + head" within 21~23 latent).
+2. **Anchor frames**: 5~9 pixel frames from the segment opening (plus matching `anchor_mask_frames` for SCAIL-2); run `driving_only` on and off.
+3. **Long-range memory**: `memory_frames = 4 → 8` (leave `memory_stride = 0` = auto).
+
+> **Multi-seed paired A/B**: the only random source inside this node is **fixed-seed noise**, so a given seed + config is **deterministic**. "Some seeds work, some don't" is therefore a **real difference**, not noise ⇒ run several seeds, each with the feature on and off, and compare the success rate instead of judging from a single run.
+4. Change one variable at a time (`FreeNoise`, `overlap`, basis source separately).
 
 #### Known limits
 
-- Anchor frames must come from the **same driving/pose video** with matching frame numbers (plus matching masks for SCAIL-2), otherwise driving and masks drift apart.
-- The "two-sided halo" implementation (letting a window see neighbouring frames without fusing them) is still kept internally but **not exposed** (default off): it did not help and made results worse in testing. It can be re-enabled on request.
+- Anchor frames must come from the **same driving/pose video** with matching frame numbers (plus matching masks for SCAIL-2).
+- Memory tokens carry **no identity mask** (their 28ch mask is zeros): they provide motion context only, not identity.
+- "Anchors before the window" and the memory group rely on the SCAIL RoPE position patch (`_apply_scail_anchor_rope_patch`); in replacement mode or when there are no extra tokens the patch falls back and leaves the original geometry unchanged.
+- ⚠️ **The old `driving_only` test was inverted** (`and not _needs_driving_mask(model)`): on SCAIL-2 `driving_only=true` actually ran the **prepend (aligned)** path (anchors prepended to both the driving stream and the generation sequence, 1:1 pairing), while `driving_only=false` went driving-only; on animate2 it was the other way round (hitting the `pose = f_gen − 1` assert). This is now fixed to match the docs. ⇒ **A baseline you captured with `driving_only=true` corresponds to the "prepend" path; after the fix `driving_only=true` is the "tail + placed before the window" path. Both are alignment-safe — just A/B them (turn `driving_only` off to reproduce the old behaviour).**
 - The old replacement-style anchoring and `anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / anchor_source / halo_frames_* / log_debug` were removed.
 ### Reference Image Selector
 
@@ -429,7 +457,7 @@ Reads image batches from a specified folder, sorted by filename. Gracefully hand
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `folder_path` | STRING | ✅ | Image folder path. Supports absolute paths or relative paths (relative to ComfyUI root) |
-| `size_mode` | enum | ✅ | `resize_to_first`: resize all images to first image's dimensions; `filter_same_size`: only load images matching the first image's dimensions |
+| `size_mode` | enum | ✅ | `resize_to_first`: resize all images to the first image's dimensions; `filter_same_size`: only load images matching the first image's dimensions; `no_resize`: **only affects the `images_list` output** — the list keeps original sizes (no resize, no size filter), while the batch output cannot hold mixed sizes, so it falls back to `resize_to_first` and prints a notice |
 | `skip_first_n` | INT | ✅ | Skip the first N images (default 0) |
 | `load_count` | INT | ✅ | Maximum number of images to load (0=no limit, load all) |
 
@@ -437,16 +465,30 @@ Reads image batches from a specified folder, sorted by filename. Gracefully hand
 
 | Output | Type | Description |
 |--------|------|-------------|
-| `images` | IMAGE | Loaded image batch. Outputs None if path is invalid or no images found |
-| `count` | INT | Actual count of loaded images. Outputs 0 for error conditions |
+| `images` | IMAGE | Same-size image batch `[B,H,W,C]`. Outputs None if path is invalid or no images found |
+| `count` | INT | Actual count of loaded images (= batch size). Outputs 0 for error conditions |
+| `images_list` | IMAGE (list semantics) | Per-image list output, elements `[1,H,W,C]`; **downstream nodes run once per element** and sizes may differ |
+
+#### Relationship between the batch and the list output
+
+- List semantics follow the existing convention of this repo (same as `image_list_nodes.py`): empty output is always `[None]`
+  (a single None element) — it must **not** be `None` (ComfyUI's `execution.py::merge_result_data` calls `extend` on list
+  outputs; `extend(None)` raises TypeError) and must **not** be `[]` (downstream `slice_dict` takes `[-1]` on an empty list →
+  IndexError). `[None]` behaves downstream exactly like "this wire is not connected".
+- `resize_to_first` / `filter_same_size`: the list is a per-image **view** of the batch (zero-copy, no extra pixel memory),
+  and its content is identical to `images`.
+- `no_resize`: the list keeps original sizes and applies **no size filtering** (images with different sizes appear only in the
+  list, never in the batch); the batch falls back to `resize_to_first`. Memory-wise only the images whose size differs from the
+  first one keep an extra original copy — same-size originals reuse the batch row (same memory), so the common
+  "all images in the folder share one size" case costs **nothing extra**.
+- Connecting `images_list` to a plain IMAGE input makes ComfyUI run that downstream node **once per element**
+  (list propagation) — this is expected behavior.
 
 #### Error Handling
 
-- Empty folder path → Outputs `(None, 0)`, console warning
-- Folder not found → Outputs `(None, 0)`, console warning
-- No images in folder → Outputs `(None, 0)`, console warning
-- Skip count exceeds total images → Outputs `(None, 0)`, console warning
-- Single image read failure → Skips that image, continues loading others
+- Empty folder path / folder not found / no images in folder / skip count exceeds total images → outputs `(None, 0, [None])`, console warning
+- Single image read failure → skips that image, continues loading others
+- First image read failure → empty outputs as above (existing behavior, unchanged)
 
 ---
 
@@ -657,6 +699,155 @@ Replaces a contiguous run of frames in the main batch, starting at `start_index`
 
 ---
 
+### ImageListSplitOutputs
+
+Splits an **image list** into N independent outputs: the item at `start_index` goes to output 1, `start_index + 1` to output 2, and so on.
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `output_count` | INT | Number of outputs (1-16, default 2). **The output slots on the canvas are added/removed live with this value** — only the configured number is shown |
+| `start_index` | INT | Index of the first item to output (0 = first item) |
+| `images` | IMAGE | Image list input (optional). When not connected: no error, no output |
+
+#### Output rules
+
+| Situation | Result |
+|-----------|--------|
+| 5 items, `start_index=1`, `output_count=8` | Outputs 1-4 carry items 2-5; outputs 5-8 are empty (`None` = same as an unconnected wire) |
+| `start_index` >= list length | All outputs are empty (a warning is printed) |
+| `images` not connected / empty list | All outputs are empty, **no error** |
+| `output_count` out of 1-16 | Clamped to 1 / 16 |
+
+#### Empty outputs and list semantics (important)
+
+- **An empty channel returns `None`, which behaves exactly like "this wire is not connected"**:
+  - if the downstream declares that input as **optional**, it falls back to its Python default and the node
+    **runs normally**, treating it as "no such input" (e.g. `ImageBatchConcat` passes the other channel through,
+    `BatchImageReplace` / `MaskCompositeRef` just ignore it) — **other inputs are not affected**;
+  - if the downstream declares it as **required**, it errors inside that node with a `NoneType`-style message
+    (the runtime equivalent of the submit-time `Required input is missing`, just reported at execution time).
+- Do **not** use an empty list `[]` (ComfyUI's `slice_dict` indexes `[-1]` on an empty list → IndexError), and do
+  **not** use `ExecutionBlocker(None)`: it makes the downstream node skip execution **entirely** and silently drags
+  every other input of that node (and the whole branch below it) down with it, with no UI hint at all.
+- The node uses **list semantics** (`INPUT_IS_LIST`): it receives the whole list in one execution and
+  **items may have different sizes** (a plain batch requires uniform sizes). A plain IMAGE batch fed into it is
+  split into single-frame items automatically (batch → list); 3D `[H,W,C]` items are promoted to `[1,H,W,C]`.
+- Each output carries a **single image** (`[1,H,W,C]`), so downstream nodes run exactly once.
+- The backend declares 16 outputs only to satisfy ComfyUI's prompt type validation; **the visible slot count is
+  really added/removed by the frontend (`js/image_list_nodes.js`, `addOutput`/`removeOutput`)**, so the node never
+  turns into a long 16-slot strip.
+
+---
+
+### ImageListReplaceAt
+
+Overwrites a run of the target image list starting at `start_index`: item `start_index + i` is replaced wholesale
+by item `i` of the replacement list.
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `start_index` | INT | Index where replacement starts (0 = first item) |
+| `images` | IMAGE | Target image list (optional). When not connected: no error, no output |
+| `replace_images` | IMAGE | Replacement list (optional). When not connected the target list is passed through |
+
+#### Replacement rules
+
+- Replacement count = `min(len(replace_images), len(images) - start_index)` ⇒ **never exceeds the original list length**
+  - e.g. 5 target items, `start_index=2`, 4 replacement items → only items 3-5 are replaced (the 4th replacement is dropped)
+  - e.g. 5 target items, `start_index=2`, 2 replacement items → items 3-4 are replaced, item 5 stays
+- `start_index` >= target list length → prints a warning and returns the target list unchanged
+- **No resizing / padding / extension**: list items may have different sizes (this is the biggest difference
+  from batch replacement)
+
+#### Difference from [BatchImageReplace](#batchimagereplace)
+
+| | ImageListReplaceAt | BatchImageReplace |
+|---|---|---|
+| Data unit | List items (sizes may differ) | Same-size images inside one batch |
+| Replacement length | Decided by the replacement list, **never exceeds the original length** | Set by `replace_count` (-1 = to the end) |
+| Count mismatch | Extra replacement items are dropped | `overflow_mode` / `underflow_mode` strategies |
+| Size mismatch | **No resizing**, whole items are swapped | Auto-resized to the main batch size |
+| Output | A list (downstream runs per element) | A single batch |
+
+---
+
+### ImageListToBatch
+
+Converts an image list with **mixed sizes** into a single-size batch (for nodes that only accept batches).
+It **never crops and never stretches**: the missing area is padded on a single axis (pure black by default,
+or **alpha=0** in `RGBA` mode), so every image keeps all of its content.
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `output_mode` | enum | `RGB` (**default**) = 3 channels, black padding, **most compatible** (VL/vision encoders, VAE, save/preview all work); `RGBA` = 4 channels, `alpha=0` padding (real transparency, for compositing — but **3-channel-only consumers will fail**, see Notes) |
+| `images` | IMAGE | Image list input (optional, list semantics). When not connected: no error, no output |
+
+Output `images` (batch `[B, Rh, Rw, C]`, C = 3 or 4).
+
+#### Rules
+
+1. **Reference item** = the item with the largest `min(w, h)` (= largest "area × squareness", i.e. the
+   "biggest and squarest" one); ties go to the squarest (smaller long side).
+   That item's ratio becomes the output ratio and **its own size becomes the output size**.
+   - e.g. `[1024×1024, 1920×1080, 800×1200]` → short sides 1024 / **1080** / 800 → reference = `1920×1080`
+   - e.g. `[4000×1000 (extreme strip), 1024×1024]` → short sides 1000 / **1024** → reference = `1024×1024`
+     (an extreme strip does **not** blow the canvas up to 4000 wide, keeping batch memory/time sane)
+2. The reference item gets **zero resampling** (pixel-for-pixel identical; in `RGBA` mode only an alpha channel is added).
+3. Every other item: **wider** than the reference → pad **top/bottom only**; **taller** → pad **left/right only**
+   (centered, split evenly). Same ratio → no padding. The limiting axis uses its exact size, so an item is
+   **never** padded on all four sides.
+4. Padding follows `output_mode`: `RGB` → pure black (`0,0,0`); `RGBA` → `alpha=0` outside and `alpha=1` inside
+   (a source alpha channel is preserved); 3-channel input gets an alpha channel in `RGBA` mode.
+5. Items already at the output size **skip resampling entirely** (no numpy/PIL round-trip).
+
+#### Example (reference = 1920×1080, 16:9)
+
+| Input | Content size in the output | Padding (black by default / alpha=0 in RGBA mode) |
+|-------|----------------------------|---------------------------------------------------|
+| 1920×1080 (reference) | 1920×1080 | none (zero resampling) |
+| 1024×1024 (taller) | 1080×1080 | 420 left + 420 right |
+| 2000×1000 (wider) | 1920×960 | 60 top + 60 bottom |
+
+#### Log
+
+Every run prints the reference selection, the output size and the channel mode:
+
+```
+[ImageListToBatch] 基准候选: #0 1920×1080 min=1080 | #1 1024×1024 min=1024 | #2 800×1200 min=800  -> 选定 #0
+[ImageListToBatch] 输出尺寸 = 1920×1080（基准 #0，比例 16:9），共 3 张，通道 = RGB(3)
+```
+
+When the output size is not a multiple of 8 an extra hint is printed (VAE downsampling is 8/16, so a size
+alignment is required before VAE encoding).
+
+#### Notes
+
+- **Why the default is RGB**: 4-channel (RGBA) images hit consumers that hard-code 3 channels. A typical example is
+  the Qwen VL vision tower: `Qwen35VisionPatchEmbed.forward` → `x.view(-1, 3, 2, 16, 16)` (`in_channels=3`).
+  With 4 channels the patch count grows by 1/3 (`8·H·W/1536 = 4608` for 1024×864, while the position embeddings
+  are `6·H·W/1536 = 3456`), failing with
+  `RuntimeError: The size of tensor a (4608) must match the size of tensor b (3456)`.
+  So keep the default `RGB` when feeding VL text encoders / VAE / most nodes.
+- Switch to `RGBA` only when you really need transparent padding (compositing, saving PNG with transparency).
+  If you then need to feed a 3-channel-only node, insert the core node **`Split Image with Alpha`**:
+  its IMAGE output is `i[:,:,:3]` and its MASK output is `1 - alpha` (i.e. the padded area = 1).
+- The output size comes from the **reference item's own size**, so it may not be a multiple of 8/16
+  (e.g. `876×1024`). Align it before VAE encoding — the node prints a hint in that case.
+- Difference from [ImageBatchResize](#image-batch-resize): that one scales to **a size you specify**
+  (optionally cropping/stretching); this one **picks the reference from the list itself** and pads on a single axis
+  without ever losing content.
+- Internally it does **not** "pad a big canvas first and then scale everything"; it scales the content to its exact
+  size inside the final canvas and pastes it centered. Mathematically equivalent, but the padding never bleeds into
+  the content edges through LANCZOS (no dark halo).
+
+---
+
 ## Workflows
 
 The `workflow/` directory contains complete ComfyUI workflow JSON files that can be loaded directly in the ComfyUI interface.
@@ -760,6 +951,32 @@ The `workflow/` directory contains complete ComfyUI workflow JSON files that can
 
 ## Changelog
 
+### v1.8.1 (Context Window Anchor revision)
+
+**Fixed**
+- **`anchor_fixed` never worked (real bug)**: the "previous-step x0" cache was stored on the **window object**, and window objects are **rebuilt every sampling step** (`Custom_context.get_context_windows` allocates new ones each step) ⇒ the cache was lost every step and the code always fell back to the clean anchor frame. Two consequences: (1) `anchor_fixed` on/off produced **bit-identical** results; (2) late in sampling (σ→0) the anchor became almost a **clean driver frame** that the model continued from ⇒ the **"driver-identity artifact"** (the one v1.8.0 claimed to have fixed).
+  The cache now lives on the **handler** (shared for the whole sampling run, surviving step rebuilds) and prefers the CFG-positive output. New self-test covers "a rebuilt window still reads the previous step's cache".
+- **The RoPE position patch could silently die**: it is a process-level monkey patch (`SCAILWanModel.rope_encode` class attribute). If comfy core hot-reloads and restores the original, the `_SCAIL_ANCHOR_ROPE_PATCH_APPLIED` flag stays `True` ⇒ the patch is **never re-installed** and **nothing is reported**, so the extra tokens are treated as "future driving" (wrong positions, worse results). The patch is now **self-healing**: before every use it checks whether the current function is ours, reinstalls if not, and logs "applied / already in place / was lost, reinstalled".
+- **GBK safety**: two **log strings** in `context_window_anchor.py` contained `⇒`(U+21D2) / `−`(U+2212), which raise `UnicodeEncodeError` on a cp936 console (a known trap in this repo). Replaced with ASCII equivalents; the self-test script was made GBK-safe as well.
+
+**Changed**
+- **Removed `tail_context_frames`** (read-only tail context): it cannot produce a visible effect — its prediction is trimmed before fusion and those frames are authored by the following window. The internals (`halo_tail` / `tail_extra_indices` / pre-fusion trimming) are kept but fixed at 0.
+- **Added `memory_stride` (`0` = auto)**, **taking over the old `tail_context_frames` parameter slot** (so legacy workflow widget values do not shift; that slot was almost always 0 and 0 happens to mean auto — semantically compatible). `0` = spread the `memory_frames` points over the whole history from the clip start to this window (fixes "long clips / late windows cannot reach the beginning"); `>0` = fixed stride.
+- **Decoupled `memory_frames` from `head_context_frames`**: the memory group's sampling baseline is now the window's own start, so enabling head context no longer shifts its sampling positions.
+- **Docs now follow the code**: corrected stale entries such as "`c_concat` = 1" (belonging to withdrawn experiments) and documented the frame units (`anchor_frames` = pixel frames; `head_context_frames` / `memory_frames` / `memory_stride` = latent frames).
+
+**Self-test**
+- `md/context_window_anchor_selftest.py`: **16/16 pass** (new/updated: cross-step x0 cache, auto & fixed memory stride, memory/head decoupling, RoPE patch hot-reload self-healing, interface contains `memory_stride` and no `tail_context_frames`); the script is now GBK-safe and runs on a cp936 console.
+
+### Errata & withdrawn experiments (do not re-introduce historical records as "bugs")
+
+| Historical record | Status | Why it was withdrawn |
+|---|---|---|
+| `c_concat` filled with **1** on anchor frames ("clean/known") | ❌ withdrawn | Belongs to the "replacement / pinned anchoring" era. Anchors come from the **driving video**; pinning them as known clean frames leaks the driver's identity into the picture. Current semantics: anchors are ordinary frames (`concat_mask`=1 / `c_concat`=0), and `c_concat` is derived by the model from `1 - mask` anyway |
+| Replacement-style anchoring and `anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / anchor_source / halo_frames_* / log_debug` | ❌ removed | Replacement breaks the rigid 1:1 pairing and feeds synthetic intermediate states; the interface must stay minimal |
+| Read-only tail context (`tail_context_frames`) | ❌ removed | Its prediction is trimmed and those frames belong to the following window ⇒ no visible effect |
+| Fixed 4-latent-stride "long-range memory" | 🔄 now auto by default | A fixed stride cannot reach the beginning of long clips, defeating "long-range" (a fixed stride is still available with `memory_stride > 0`) |
+
 ### v1.8.0
 
 **Added**
@@ -768,7 +985,7 @@ The `workflow/` directory contains complete ComfyUI workflow JSON files that can
   - **Anchor semantics (this round)**: anchors are injected the way your manual "prepend the video opening to a segment" does — the driving stream and driving mask get them prepended, and the copies injected into the generation sequence **follow their own generation trajectory** (step 1: σ=1 pure noise; afterwards re-noise the x0 the model predicted for those frames) and are treated as **ordinary frames** (input mask=1, history mask=0). `mode` / replacement branches were **removed**; the node now has a single behaviour.
   - **Also fixed (run scoping + new options)**: runtime gating on every injection path (bypassing/disabling the anchor node is now truly zero-effect; fixes the x(25) vs ref_mask(27) crash caused by stale module state leaking into a bypassed run); new `driving_only` (default true) and `head_context_frames` (default 0).
   - **Also fixed this round**: (1) this removes the **driver-identity artifact** caused by pinning the **driver's footage** at the window head (at σ→0 the anchor was almost a clean driver frame, so the model continued from it); (2) the **mask encoder now supports any frame count** (4/8 frames used to crash: `_extract_mask_to_28ch`'s temporal grouping only holds for 1+4n, 7×7=49 ≠ 28); (3) added a **pre-sampling encode self-check** (x/pose/mask) and an explicit "SCAIL-2 requires `anchor_mask_frames`" error.
-  - **Key fix**: SCAIL-2's `c_concat` (4-channel history mask) is filled with **1** on anchor frames (= clean/known anchor) while input masks (`concat_mask` / `denoise_mask`) get 0 — the previous version had this reversed, which is why anchoring had no effect. **Removed**: replacement-style anchoring and `anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / anchor_source / halo_frames_* / log_debug`.
+  - **~~Key fix: `c_concat` = 1~~ (void — see "Errata & withdrawn experiments" at the end of the changelog)**: that entry belongs to the **withdrawn "replacement / pinned anchoring"** semantics. The current implementation treats anchors as **ordinary frames to be generated**: `concat_mask` / `denoise_mask` = **1**, `c_concat` = **0**. Note that the model derives `c_concat` itself from `1 - mask` (`comfy/model_base.py::WAN21_SCAIL2.concat_cond`), so the node only needs to insert the matching number of frames. **Removed**: replacement-style anchoring and `anchor_targets / anchor_offset / blend / anchor_steps / apply_to_negative / global_pose_frames / global_mask_frames / anchor_source / halo_frames_* / log_debug`.
   - **Companion fixes**: `Custom_context.py` gained `cond_indices_for_window()`, which aligns the conditioning streams' coordinate system from the cond-vs-x length (`cond_len == x_len - 1` → one-frame reference-slot offset, matching the model's `rope_encode_pose(t_start=1)`), fixing a possible one-frame pose offset for prefixed animate2 windows; the `pose_video_latent` slice inside `Wan SCAIL Context Windows`, which always took the first N frames of the chunk, now follows the window's real frame indices (including anchor/halo frames) with an out-of-range warning.
   - **Not fully validated**: the mechanism rests on the assumption that the alignment basis is locked by the clip head; side effects (image quality / identity consistency / sampling stability / frame budget) have not been systematically evaluated. Always A/B it (see Experiment tips) before relying on it, and do not depend on it in production workflows.
 

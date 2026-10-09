@@ -182,7 +182,8 @@ class IndexListContextHandler(ContextHandlerABC):
     def __init__(self, context_schedule: ContextSchedule, fuse_method: ContextFuseMethod,
                  context_length: int = 1, context_overlap: int = 0, context_stride: int = 1,
                  closed_loop: bool = False, dim: int = 0, freenoise: bool = False,
-                 prefix_latent_len: int = 0, split_conds_to_windows: bool = False):
+                 prefix_latent_len: int = 0, split_conds_to_windows: bool = False,
+                 fuse_sharpen: float = 1.0):
         self.context_schedule = context_schedule
         self.fuse_method = fuse_method
         self.context_length = context_length          # 原始窗口长度（不含前缀）
@@ -192,6 +193,8 @@ class IndexListContextHandler(ContextHandlerABC):
         self.dim = dim
         self._step = 0
         self.freenoise = freenoise
+        # 融合权重幂次锐化：>1 时「更靠窗中心」的一方占绝对优势 ⇒ 交叉淡化带变窄（重叠区不再出现两个角色）
+        self.fuse_sharpen = max(1e-3, float(fuse_sharpen or 1.0))
         # 前缀索引（前 N 个 latent 帧作为参考帧）
         self.prefix_latent_len = prefix_latent_len
         self.prefix_indices = list(range(prefix_latent_len))
@@ -496,6 +499,11 @@ class IndexListContextHandler(ContextHandlerABC):
                     # bias = 1 - distance / max_distance，窗口中心权重最大
                     bias = 1 - abs(idx - (center_min + center_max) / 2) / ((center_max - center_min + 1e-2) / 2)
                     bias = max(1e-2, bias)
+                    # ---- 权重锐化：把「整段重叠区 50/50 混合」压窄（防止过渡区同时出现两个角色） ----
+                    #   power=1.0 = 不锐化（历史行为）；power↑ ⇒ 任一瞬间基本只取更靠窗中心的那一方，
+                    #   但仍是渐变（不是硬切），并且有 1e-2 下限保证归一化稳定。
+                    if self.fuse_sharpen != 1.0:
+                        bias = max(1e-2, sharpen_weight(bias, self.fuse_sharpen))
                     # ---- 首尾 ramp 修正 ----
                     if ramp_up is not None and pos < overlap_len:
                         bias *= ramp_up[pos].item()
@@ -518,6 +526,12 @@ class IndexListContextHandler(ContextHandlerABC):
                                           window.original_indices, self, sigma=timestep)
             # 转 tensor
             weights_t = torch.tensor(weights, device=x_in.device, dtype=x_in.dtype)
+
+            # ---- 权重锐化（同 relative 分支）：归一化后取幂 + 下限，保证计数不为 0 ----
+            if self.fuse_sharpen != 1.0:
+                w_max = weights_t.max().clamp(min=1e-12)
+                weights_t = (weights_t / w_max).clamp(min=0.0) ** self.fuse_sharpen
+                weights_t = weights_t.clamp(min=1e-6)
 
             # ---- 首尾窗口 ramp 保护（参考 WanAnimatePlus 做法） ----
             # 对首个窗口的左端 overlap 区：强制 ramp_up 0→1
@@ -638,7 +652,35 @@ class ContextSchedules:
     UNIFORM_LOOPED = "looped_uniform"
     UNIFORM_STANDARD = "standard_uniform"
     STATIC_STANDARD = "standard_static"
+    EVEN_STANDARD = "standard_even"
     BATCHED = "batched"
+
+
+# 末窗「回头对齐」造成超大重叠只告警一次（按 C/O 组合去重，避免每步刷屏）
+_LASTWINDOW_WARNED = set()
+
+
+def _warn_last_window_overlap(windows: list, handler, reason: str = "末窗「回头对齐」") -> None:
+    """末窗与前一窗的重叠远大于 context_overlap 时告警（该处会被加权平均 ⇒ 最容易重影）。"""
+    try:
+        if len(windows) < 2:
+            return
+        ov = len(set(windows[-1]) & set(windows[-2]))
+        want = int(getattr(handler, "context_overlap", 0) or 0)
+        if ov <= max(1, want) * 1.5 + 1:
+            return
+        tag = (int(getattr(handler, "context_length", 0) or 0), want, ov)
+        if tag in _LASTWINDOW_WARNED:
+            return
+        _LASTWINDOW_WARNED.add(tag)
+        ratio = f"{ov / want:.1f} 倍" if want else "无穷（设定 0 = 无重叠）"
+        logging.warning(
+            "[ContextWindows] %s 使末缝重叠 = %d latent（设定 overlap = %d latent，%s）："
+            "该重叠区会被加权平均，最容易出现重影/动作发软。建议改用 standard_even（等长窗口、末窗不回退）"
+            "或 batched（无重叠、末窗变短），也可以配 Context Window Anchor 的 head/tail 只读上下文。",
+            reason, ov, want, ratio)
+    except Exception:
+        logging.debug("[ContextWindows] 末窗重叠告警检查失败（忽略）", exc_info=True)
 
 
 def create_windows_uniform_looped(num_frames: int, handler: IndexListContextHandler, model_options: dict[str]):
@@ -706,6 +748,36 @@ def create_windows_static_standard(num_frames: int, handler: IndexListContextHan
             windows.append(list(range(final_start_idx, final_start_idx + handler.context_length)))
             break
         windows.append(list(range(start_idx, start_idx + handler.context_length)))
+    _warn_last_window_overlap(windows, handler)
+    return windows
+
+
+def create_windows_static_even(num_frames: int, handler: IndexListContextHandler, model_options: dict[str]):
+    """等长窗口 + 末窗不回退：窗口起点在 [0, num_frames-C] 上均匀分布。
+
+    与 static_standard 的区别：后者在末窗越界时会「回头对齐到序列尾」，于是末两个窗口的重叠
+    比 context_overlap 大得多（重叠区会被加权平均 ⇒ 那一段最容易重影）。本调度宁可让重叠均匀地
+    略大于设定值，也不产生「超大重叠」，并且所有窗口等长。
+    """
+    C = max(1, int(handler.context_length))
+    if num_frames <= C:
+        return [list(range(num_frames))]
+    delta = max(1, C - int(handler.context_overlap))
+    span = num_frames - C                       # 末窗起点的最大取值
+    n = 1 + max(0, math.ceil(span / delta))     # 窗口数（至少 2）
+    if n <= 1:
+        return [list(range(num_frames))]
+    starts = []
+    for i in range(n):
+        s = int(round(i * span / (n - 1)))
+        if not starts or s > starts[-1]:
+            starts.append(s)
+    if starts[0] != 0:
+        starts.insert(0, 0)
+    if starts[-1] != span:
+        starts.append(span)
+    windows = [list(range(s, s + C)) for s in starts]
+    _warn_last_window_overlap(windows, handler, reason="等长窗口的重叠摊平")
     return windows
 
 
@@ -727,6 +799,7 @@ CONTEXT_MAPPING = {
     ContextSchedules.UNIFORM_LOOPED: create_windows_uniform_looped,
     ContextSchedules.UNIFORM_STANDARD: create_windows_uniform_standard,
     ContextSchedules.STATIC_STANDARD: create_windows_static_standard,
+    ContextSchedules.EVEN_STANDARD: create_windows_static_even,
     ContextSchedules.BATCHED: create_windows_batched,
 }
 
@@ -740,6 +813,24 @@ def get_matching_context_schedule(context_schedule: str) -> ContextSchedule:
 
 def get_context_weights(length: int, full_length: int, idxs: list[int], handler: IndexListContextHandler, sigma: torch.Tensor = None):
     return handler.fuse_method.func(length, sigma=sigma, handler=handler, full_length=full_length, idxs=idxs)
+
+
+def sharpen_weight(value: float, power: float) -> float:
+    """融合权重幂次锐化：`power > 1` ⇒ 越靠近窗口中心的帧权重优势越大（交叉淡化带变窄）。
+
+    为什么要它：重叠区里两份预测本来会被「整段重叠区 50/50 混合」，如果两个窗口对尺度/位置
+    的判断不同，就会在过渡区同时出现两个角色（重影）。锐化后任一瞬间基本只取「更靠窗中心」
+    的那一方 ⇒ **既保留连续性（仍是渐变，不是硬切）又不出现重影**。
+    `power = 1.0` 等价于不锐化（默认，保持历史行为）。
+    """
+    try:
+        p = float(power)
+        v = float(value)
+    except Exception:
+        return value
+    if p == 1.0 or v <= 0.0:
+        return v
+    return v ** p
 
 
 def create_weights_flat(length: int, **kwargs) -> list[float]:
@@ -873,6 +964,7 @@ class CustomWanContextWindowsManualNode:
             ContextSchedules.UNIFORM_LOOPED,
             ContextSchedules.UNIFORM_STANDARD,
             ContextSchedules.STATIC_STANDARD,
+            ContextSchedules.EVEN_STANDARD,
             ContextSchedules.BATCHED,
         ]
         fuse_options = ContextFuseMethods.LIST_STATIC
@@ -897,6 +989,8 @@ class CustomWanContextWindowsManualNode:
                                               "tooltip": "前缀参考帧的 latent 数量。接参考图选择器 raw_reference_images 的图片数量即可（每张图片编码为1个 latent）。这些帧会作为稳定参考拼接到每个窗口前。"}),
                 "split_conds_to_windows": ("BOOLEAN", {"default": False,
                                                        "tooltip": "是否根据区域索引将多个 conditioning 拆分到每个窗口。Whether to split multiple conditionings to each window based on region index."}),
+                "fuse_sharpen": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 8.0, "step": 0.1,
+                                                       "tooltip": "融合权重锐化（幂次）。1.0=不锐化（历史行为）；设 3~6 可把重叠区的交叉淡化带压窄 —— 重叠区任一瞬间基本只取「更靠窗中心」的那一方，**既保留连续性（仍是渐变）又不出现两个角色叠在一起的重影**。窗口重叠越大、两个窗口分歧越大时越有用。\nFusion weight sharpening (power). 1.0 = off; 3~6 narrows the crossfade band inside the overlap so one window dominates at any instant (no double-image ghosting) while staying continuous."}),
             },
             "optional": {
                 "window_reference_images": ("IMAGE", {"tooltip": "原始参考图批次（来自 ReferenceImageSelector 的 raw_reference_images 输出），用于动态前缀。Raw reference image batch from ReferenceImageSelector's raw_reference_images output, used for dynamic prefix."}),
@@ -919,6 +1013,7 @@ class CustomWanContextWindowsManualNode:
     def apply_context_windows(self, model, context_length, context_overlap, context_schedule,
                               context_stride, closed_loop, fuse_method, freenoise,
                               prefix_latent_num=0, split_conds_to_windows=False,
+                              fuse_sharpen=1.0,
                               window_reference_images=None, latent_yaw_angles=None, vae=None,
                               reference_angle_map="", allow_switch_main=True, background_images=None):
         # 前缀 latent 数直接用传入值（单位已经是 latent 帧）
@@ -939,8 +1034,12 @@ class CustomWanContextWindowsManualNode:
             freenoise=freenoise,
             prefix_latent_len=prefix_latent_len,
             split_conds_to_windows=split_conds_to_windows,
+            fuse_sharpen=fuse_sharpen,
         )
         model.model_options["context_handler"] = handler
+        if float(fuse_sharpen or 1.0) != 1.0:
+            logging.info("[ContextWindows] 融合权重锐化已启用：fuse_sharpen=%.2f（重叠区交叉淡化带变窄，"
+                         "避免过渡区出现两个角色；仍为渐变而非硬切）", float(fuse_sharpen))
 
         # ---- 动态前缀预计算 ----
         has_all_inputs = all([

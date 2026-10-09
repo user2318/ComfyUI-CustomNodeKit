@@ -259,7 +259,14 @@ class PathValidatorNode:
 class FolderImageLoaderNode:
     """文件夹图片载入器
     从指定文件夹中按文件名升序读取图片，支持跳过、数量限制和尺寸处理。
-    路径不存在、文件夹为空等情况不抛出异常，仅输出控制台警告和空结果。
+
+    输出三路：
+    - images      : 同尺寸批次 [B, H, W, C]
+    - count       : 批次张数
+    - images_list : 逐张列表（列表语义，元素 [1, H, W, C]，下游按元素逐个执行）
+
+    路径不存在、文件夹为空等情况不抛出异常，仅输出控制台警告和空结果
+    （列表输出回空为 [None]，等价于「这根线没接」）。
     """
     _IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
 
@@ -272,9 +279,19 @@ class FolderImageLoaderNode:
                     "multiline": False,
                     "tooltip": "包含图片文件的文件夹路径。支持绝对路径，或相对于ComfyUI根目录的相对路径。仅读取本目录下的图片，不会检索子目录。Folder path containing image files. Supports absolute paths or relative paths to the ComfyUI root directory. Only reads images from this directory, not subdirectories."
                 }),
-                "size_mode": (["resize_to_first", "filter_same_size"], {
+                "size_mode": (["resize_to_first", "filter_same_size", "no_resize"], {
                     "default": "resize_to_first",
-                    "tooltip": "图片尺寸处理方式：resize_to_first — 所有图片统一缩放至第一张图的宽高；filter_same_size — 仅加载与第一张图尺寸完全相同的图片，尺寸不同的会被跳过并在控制台提示。Size mode: resize_to_first — resize all images to the first image's dimensions; filter_same_size — only load images exactly matching the first image's dimensions."
+                    "tooltip": "图片尺寸处理方式（no_resize 只对列表输出 images_list 有效，批次输出 images 会自动回退）："
+                               "resize_to_first — 所有图片统一缩放至第一张图的宽高（批次与列表内容一致）；"
+                               "filter_same_size — 仅加载与第一张图尺寸完全相同的图片，尺寸不同的会被跳过并在控制台提示（批次与列表内容一致）；"
+                               "no_resize — 列表输出保持原尺寸、既不缩放也不按尺寸过滤（元素尺寸可互不相同），"
+                               "此时批次输出无法容纳不同尺寸，会自动回退为 resize_to_first 并在控制台提示。"
+                               "Size mode (no_resize only affects the images_list output; the batch output falls back): "
+                               "resize_to_first — resize all images to the first image's dimensions (batch and list agree); "
+                               "filter_same_size — only load images exactly matching the first image's dimensions (batch and list agree); "
+                               "no_resize — the images_list output keeps original sizes (no resize, no size filter, "
+                               "elements may differ in size); the batch output cannot hold mixed sizes, "
+                               "so it falls back to resize_to_first and prints a notice."
                 }),
                 "skip_first_n": ("INT", {
                     "default": 0,
@@ -291,11 +308,18 @@ class FolderImageLoaderNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "INT")
-    RETURN_NAMES = ("images", "count")
+    # 第 3 路 images_list 是「列表语义」输出（OUTPUT_IS_LIST），下游按元素逐个执行。
+    # 注意：输出槽只能追加在末尾 —— 工作流 JSON 的连线用 origin_slot 索引，插到中间会让
+    # 既有工作流里接在 count 上的连线错位到列表输出上。
+    RETURN_TYPES = ("IMAGE", "INT", "IMAGE")
+    RETURN_NAMES = ("images", "count", "images_list")
     FUNCTION = "load_images"
     CATEGORY = "image"
     OUTPUT_NODE = False
+    OUTPUT_IS_LIST = (False, False, True)
+    DESCRIPTION = ("从文件夹按文件名升序载入图片：images 为同尺寸批次；images_list 为逐张列表"
+                   "（元素 [1,H,W,C]，尺寸可互不相同，下游按元素逐个执行）。"
+                   "size_mode=no_resize 时列表保持原尺寸（不缩放、不过滤），批次回退为 resize_to_first。")
 
     def _resolve_path(self, folder_path: str) -> str:
         """将输入路径解析为绝对路径
@@ -352,28 +376,31 @@ class FolderImageLoaderNode:
         return torch.from_numpy(img_np)
 
     def load_images(self, folder_path: str, size_mode: str, skip_first_n: int, load_count: int):
+        # 列表输出（第 3 路）的「空」= [None]：不能是 None（execution.py::merge_result_data 对
+        # 列表输出做 value.extend(o[i]) -> TypeError），也不能是 []（下游 slice_dict 取 v[-1] -> IndexError）。
+        # [None] 传给下游等价于「这根线没接」，与 image_list_nodes.py 的既有约定一致。
         # ==================== 1. 路径解析与验证 ====================
         if not folder_path or not folder_path.strip():
             print("[FolderImageLoader] 警告: 未提供文件夹路径")
-            return (None, 0)
+            return (None, 0, [None])
 
         actual_path = self._resolve_path(folder_path.strip())
 
         if not os.path.isdir(actual_path):
             print(f"[FolderImageLoader] 警告: 文件夹不存在或不是有效目录: {actual_path}")
-            return (None, 0)
+            return (None, 0, [None])
 
         # ==================== 2. 获取图片文件列表 ====================
         image_files = self._get_image_files(actual_path)
 
         if len(image_files) == 0:
             print(f"[FolderImageLoader] 警告: 文件夹内无图片文件: {actual_path}")
-            return (None, 0)
+            return (None, 0, [None])
 
         # ==================== 3. 跳过前 N 张 ====================
         if skip_first_n >= len(image_files):
             print(f"[FolderImageLoader] 警告: skip_first_n={skip_first_n} 超出图片总数 {len(image_files)}")
-            return (None, 0)
+            return (None, 0, [None])
 
         if skip_first_n > 0:
             image_files = image_files[skip_first_n:]
@@ -382,18 +409,26 @@ class FolderImageLoaderNode:
         if load_count > 0 and load_count < len(image_files):
             image_files = image_files[:load_count]
 
+        # no_resize：只有列表输出保持原尺寸；批次输出（torch.stack 要求批内同尺寸）必须回退为 resize_to_first
+        keep_original = (size_mode == "no_resize")
+        batch_mode = "resize_to_first" if keep_original else size_mode
+
         # ==================== 5. 加载第一张图，确定目标尺寸 ====================
         try:
             first_file_path = os.path.join(actual_path, image_files[0])
             first_tensor = self._load_image_tensor(first_file_path)
         except Exception as e:
             print(f"[FolderImageLoader] 警告: 无法读取第一张图片 {image_files[0]}: {e}")
-            return (None, 0)
+            return (None, 0, [None])
 
         target_h, target_w = first_tensor.shape[0], first_tensor.shape[1]
 
         # ==================== 6. 按模式加载剩余图片 ====================
-        loaded_tensors = [first_tensor]
+        # batch_tensors : 交给批次输出的同尺寸张量（第一张恒为目标尺寸，且尺寸相同的图不会被重采样）
+        # mismatch_originals : 仅 no_resize 时使用，**只记下尺寸与目标不一致的那些原图**
+        #                      （尺寸一致的原图与批次行逐位相同，列表输出直接用批次行视图，省一份内存）
+        batch_tensors = [first_tensor]
+        mismatch_originals = {}
         for fname in image_files[1:]:
             file_path = os.path.join(actual_path, fname)
             try:
@@ -403,24 +438,56 @@ class FolderImageLoaderNode:
                 continue
 
             h, w = img_tensor.shape[0], img_tensor.shape[1]
+            same_size = (h == target_h and w == target_w)
 
-            if size_mode == "resize_to_first":
-                if h != target_h or w != target_w:
+            if keep_original:
+                # 列表输出要原尺寸、不做尺寸过滤；批次仍需同尺寸 -> 只对不一致的做缩放
+                if same_size:
+                    batch_tensors.append(img_tensor)
+                else:
+                    mismatch_originals[len(batch_tensors)] = img_tensor
+                    batch_tensors.append(self._resize_tensor(img_tensor, target_h, target_w))
+            elif batch_mode == "resize_to_first":
+                if not same_size:
                     img_tensor = self._resize_tensor(img_tensor, target_h, target_w)
-                loaded_tensors.append(img_tensor)
+                batch_tensors.append(img_tensor)
             else:  # filter_same_size
-                if h == target_h and w == target_w:
-                    loaded_tensors.append(img_tensor)
+                if same_size:
+                    batch_tensors.append(img_tensor)
                 else:
                     print(f"[FolderImageLoader] 提示: 跳过尺寸不匹配的图片 {fname} (尺寸: {w}x{h})")
 
         # ==================== 7. 构建批次 ====================
-        if len(loaded_tensors) == 0:
+        if len(batch_tensors) == 0:
             print("[FolderImageLoader] 警告: 没有有效图片可加载")
-            return (None, 0)
+            return (None, 0, [None])
 
-        batch = torch.stack(loaded_tensors, dim=0)
-        return (batch, batch.shape[0])
+        batch = torch.stack(batch_tensors, dim=0)
+        # torch.stack 已把数据拷进新张量；立刻释放 stack 前的单张引用（含第一张），避免多占一份内存
+        del batch_tensors, first_tensor
+
+        # ==================== 8. 构建列表输出 ====================
+        # 元素统一为 [1, H, W, C]（与 image_list_nodes.normalize_image_list 的元素形态一致）。
+        # 非 no_resize：列表就是批次的逐张视图（零拷贝），内容与批次完全一致；
+        # no_resize  ：列表保持原尺寸 —— 尺寸与目标一致的用批次行视图，只有不一致的才保留原图。
+        if not keep_original:
+            images_list = [batch[i:i + 1] for i in range(batch.shape[0])]
+        else:
+            images_list = []
+            for i in range(batch.shape[0]):
+                orig = mismatch_originals.get(i)
+                images_list.append(orig.unsqueeze(0) if orig is not None else batch[i:i + 1])
+
+        if keep_original:
+            if len(mismatch_originals) > 0:
+                print(f"[FolderImageLoader] 提示: size_mode=no_resize -> 列表输出 {len(images_list)} 张保持原尺寸"
+                      f"（其中 {len(mismatch_originals)} 张与第一张尺寸不同）；"
+                      f"批次输出无法容纳不同尺寸，已回退为 resize_to_first（{target_w}x{target_h}）。")
+            else:
+                print(f"[FolderImageLoader] 提示: size_mode=no_resize -> 列表输出 {len(images_list)} 张保持原尺寸"
+                      f"（本次图片尺寸一致，未发生重采样）；批次输出与列表内容一致（{target_w}x{target_h}）。")
+
+        return (batch, batch.shape[0], images_list)
 
 
 class ImageBatchConcatNode:

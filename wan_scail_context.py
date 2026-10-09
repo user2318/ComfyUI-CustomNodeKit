@@ -293,6 +293,7 @@ class WanSCAILContextWindowsNode:
             ContextSchedules.UNIFORM_LOOPED,
             ContextSchedules.UNIFORM_STANDARD,
             ContextSchedules.STATIC_STANDARD,
+            ContextSchedules.EVEN_STANDARD,
             ContextSchedules.BATCHED,
         ]
         fuse_options = ContextFuseMethods.LIST_STATIC
@@ -328,6 +329,12 @@ class WanSCAILContextWindowsNode:
                     "default": False,
                     "tooltip": "FreeNoise 噪声混洗，改善窗口间融合。FreeNoise noise shuffling, improves inter-window blending."
                 }),
+                "fuse_sharpen": ("FLOAT", {
+                    "default": 1.0, "min": 0.1, "max": 8.0, "step": 0.1,
+                    "tooltip": "融合权重锐化（幂次）。1.0=不锐化（历史行为）；设 3~6 可把重叠区的交叉淡化带压窄 —— "
+                               "任一瞬间基本只取「更靠窗中心」的那一方，**既保留连续性（仍是渐变）又不出现两个角色叠在一起的重影**。\n"
+                               "Fusion weight sharpening (power). 1.0 = off; 3~6 narrows the crossfade band so one window dominates at any instant."
+                }),
             },
         }
 
@@ -346,7 +353,7 @@ class WanSCAILContextWindowsNode:
 
     def apply_context_windows(self, model, context_length, context_overlap,
                               context_schedule, context_stride, closed_loop,
-                              fuse_method, freenoise):
+                              fuse_method, freenoise, fuse_sharpen=1.0):
         context_length = max(((context_length - 1) // 4) + 1, 1)
         context_overlap = max(((context_overlap - 1) // 4) + 1, 0)
 
@@ -364,6 +371,7 @@ class WanSCAILContextWindowsNode:
             freenoise=freenoise,
             prefix_latent_len=0,
             split_conds_to_windows=False,
+            fuse_sharpen=fuse_sharpen,
         )
         model.model_options["context_handler"] = handler
 
@@ -373,9 +381,9 @@ class WanSCAILContextWindowsNode:
 
         logging.info(
             "[SCAILContext] 已应用上下文窗口: len=%d_latent overlap=%d_latent "
-            "schedule=%s fuse=%s",
+            "schedule=%s fuse=%s fuse_sharpen=%.2f",
             context_length, context_overlap,
-            context_schedule, fuse_method
+            context_schedule, fuse_method, float(fuse_sharpen or 1.0)
         )
         return (model,)
 

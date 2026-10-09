@@ -56,3 +56,6 @@ _node_index.md
 # local selftest logs (not for upload)
 selftest_out.txt
 selftest_err.txt
+
+# Context Window Anchor 诊断开关（哨兵文件，本地用）
+CWA_DEBUG.on
