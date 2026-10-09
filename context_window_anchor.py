@@ -73,6 +73,14 @@ from dataclasses import dataclass
 
 import torch
 
+# handler 包装链（多节点共用同一个 handler 时的唯一包装入口，见 handler_wrap.py）。
+# 注意：本模块会被两种方式导入 —— ComfyUI 以「包」加载（相对导入可用），
+# 而 md/ 下的自测脚本把本目录加进 sys.path 后按「顶层模块」导入（相对导入会 ImportError）。
+try:
+    from .handler_wrap import install as _wrap_install, describe as _wrap_describe
+except ImportError:                                     # pragma: no cover - 顶层导入（自测脚本）
+    from handler_wrap import install as _wrap_install, describe as _wrap_describe
+
 
 # 「驱动/pose latent」的键名：原始键 + 模型侧键（animate2 与 SCAIL-2 都是这两个）
 ANCHOR_POSE_KEYS = ("pose_video_latent", "pose_latents")
@@ -1536,75 +1544,104 @@ def _register_overlap_diag(handler) -> None:
     handler.callbacks = new
 
 
-# ---------------- 安装 ----------------
+# ---------------- 安装（S1：改为 handler_wrap 包装链） ----------------
+# 旧实现（已删）直接在实例上 `handler.execute = execute` 并自存 `_cwa_originals`；
+# 第二个节点也想包 handler 时会互相覆盖/嵌套。现在统一走 `handler_wrap.install()`，
+# 参见下方 `_make_*` 工厂 + `_install`。
+
+# 包装链里的 owner 标识：同一 owner 重复安装 = 原地替换（不叠加），换 cfg 重装即生效
+_WRAP_OWNER = "ContextWindowAnchor"
+
+
+def _make_get_context_windows(handler, cfg: AnchorConfig):
+    """工厂：把「每步窗口规划 + 锚定/只读/记忆组改写」包在下一层之外。
+
+    这是「每步」的分界点：窗口对象每步重建，故在此清空诊断状态并轮转跨窗共享头。
+    """
+    def factory(next_call):
+        def get_context_windows(model, x_in, model_options):
+            _DIAG.clear()          # 每步清空诊断状态（窗口对象每步重建 => 这里就是「步」的边界）
+            # 步边界轮转「跨窗共享头」：上一步 leader 产出的头 -> 本步全员（含 leader）共用同一份
+            _advance_shared_head((model_options or {}).get("context_handler", None))
+            windows = next_call(model, x_in, model_options)
+            try:
+                for w in windows:
+                    w._anchor_active = True    # 运行期标记：绕过本节点时窗口上没有该标记
+                apply_window_extras(handler, windows, cfg)
+                logging.info("[ContextAnchor] %s｜窗口边界: %s",
+                             _sigma_step_str(handler, model_options), describe_windows(windows))
+            except Exception:
+                logging.exception("[ContextAnchor] 窗口改写失败，本步回退为原始窗口")
+            return windows
+        return get_context_windows
+    return factory
+
+
+def _make_get_resized_cond(cfg: AnchorConfig, dim: int):
+    """工厂：把「锚定帧 / 记忆组注入条件流」包在下一层之外。"""
+    cond_active = cfg.anchor_frames is not None or int(cfg.memory_frames or 0) > 0
+
+    def factory(next_call):
+        def get_resized_cond(cond_in, x_in, window, device=None):
+            resized = next_call(cond_in, x_in, window, device)
+            if not cond_active:
+                return resized
+            try:
+                full_pose = None
+                if int(cfg.memory_frames or 0) > 0:
+                    # 记忆组需要「尚未切片的全量驱动流」来切出本窗之前的历史帧
+                    full_pose = _find_full_stream(cond_in, ANCHOR_POSE_KEYS)
+                return inject_anchor_conds(window, resized, x_in, dim=dim,
+                                           only_pose=cfg.driving_only, full_pose=full_pose)
+            except Exception:
+                logging.exception("[ContextAnchor] 锚定帧处理失败，本次跳过")
+                return resized
+        return get_resized_cond
+    return factory
+
+
+def _make_execute(cfg: AnchorConfig, dim: int):
+    """工厂：把「待生成序列头部的锚帧注入 + x0 捕获」包在下一层之外。
+
+    仅在 `driving_only=关` 且有锚帧时介入（SCAIL 的 `driving_only=开` 只走驱动流，不碰 x）。
+    """
+    def factory(next_call):
+        def execute(calc_cond_batch, model, conds, x_in, timestep, model_options):
+            if cfg.anchor_frames is None or cfg.driving_only:
+                return next_call(calc_cond_batch, model, conds, x_in, timestep, model_options)
+            try:
+                sigma = float(timestep.reshape(-1)[0])
+            except Exception:
+                sigma = 0.0
+
+            def calc_cond_batch_wrapped(m, c, sub_x, ts, mo, **kw):
+                extended = inject_anchor_x(mo, sub_x, dim=dim, sigma=sigma)
+                out = calc_cond_batch(m, c, extended, ts, mo, **kw)
+                _capture_anchor_x0(mo, extended, sub_x, out, dim)
+                return out
+
+            return next_call(calc_cond_batch_wrapped, model, conds, x_in, timestep, model_options)
+        return execute
+    return factory
+
 
 def _install(handler, cfg: AnchorConfig):
-    """把「锚定注入」挂到 handler 实例上（实例属性遮蔽原方法）。重复调用只更新配置。
+    """把「锚定注入」挂到 handler 的**包装链**上（见 handler_wrap.py）。
 
-    注意：包装器闭包会捕获 cfg，所以**不能**在「已安装」时只替换 `_anchor_cfg` ——
-    每次安装都用 `_cwa_originals` 里保存的原始方法重新绑定（既不叠加包装层，也保证新配置生效）。
+    与旧实现的差别（按设计行为不变，只换了挂载方式）：
+      · 不再自存 `_cwa_originals`：真原始由包装链统一解析（优先取**类**方法）
+        => 浅拷贝（`copy.copy(handler)`）与重复安装都不会叠加包装层；
+      · 同一 owner 重复安装 = 原地替换，闭包里的 cfg 随之更新
+        （旧实现靠每次用 `_cwa_originals` 重绑达到同样效果）；
+      · 三个方法**互相独立**地安装（旧实现在 get_resized_cond / execute 任一缺失时两个都不装）。
     """
     dim = int(getattr(handler, "dim", 2) or 2)
-    cond_active = cfg.anchor_frames is not None or int(cfg.memory_frames or 0) > 0
-    originals = getattr(handler, "_cwa_originals", None)
-    if originals is None:
-        originals = (getattr(handler, "get_context_windows", None),
-                     getattr(handler, "get_resized_cond", None),
-                     getattr(handler, "execute", None))
-        handler._cwa_originals = originals
-    orig_get_context_windows, orig_get_resized_cond, orig_execute = originals
-
-    def get_context_windows(model, x_in, model_options):
-        _DIAG.clear()          # 每步清空诊断状态（窗口对象每步重建 ⇒ 这里就是「步」的边界）
-        # 步边界轮转「跨窗共享头」：上一步 leader 产出的头 → 本步全员（含 leader）共用同一份
-        _advance_shared_head((model_options or {}).get("context_handler", None))
-        windows = orig_get_context_windows(model, x_in, model_options)
-        try:
-            for w in windows:
-                w._anchor_active = True        # 运行期标记：绕过本节点时窗口上没有该标记
-            apply_window_extras(handler, windows, cfg)
-            logging.info("[ContextAnchor] %s｜窗口边界: %s",
-                         _sigma_step_str(handler, model_options), describe_windows(windows))
-        except Exception:
-            logging.exception("[ContextAnchor] 窗口改写失败，本步回退为原始窗口")
-        return windows
-
-    def get_resized_cond(cond_in, x_in, window, device=None):
-        resized = orig_get_resized_cond(cond_in, x_in, window, device)
-        if not cond_active:
-            return resized
-        try:
-            full_pose = None
-            if int(cfg.memory_frames or 0) > 0:
-                # 记忆组需要「尚未切片的全量驱动流」来切出本窗之前的历史帧
-                full_pose = _find_full_stream(cond_in, ANCHOR_POSE_KEYS)
-            return inject_anchor_conds(window, resized, x_in, dim=dim,
-                                       only_pose=cfg.driving_only, full_pose=full_pose)
-        except Exception:
-            logging.exception("[ContextAnchor] 锚定帧处理失败，本次跳过")
-            return resized
-
-    def execute(calc_cond_batch, model, conds, x_in, timestep, model_options):
-        if cfg.anchor_frames is None or cfg.driving_only:
-            return orig_execute(calc_cond_batch, model, conds, x_in, timestep, model_options)
-        try:
-            sigma = float(timestep.reshape(-1)[0])
-        except Exception:
-            sigma = 0.0
-
-        def calc_cond_batch_wrapped(m, c, sub_x, ts, mo, **kw):
-            extended = inject_anchor_x(mo, sub_x, dim=dim, sigma=sigma)
-            out = calc_cond_batch(m, c, extended, ts, mo, **kw)
-            _capture_anchor_x0(mo, extended, sub_x, out, dim)
-            return out
-
-        return orig_execute(calc_cond_batch_wrapped, model, conds, x_in, timestep, model_options)
-
-    if orig_get_context_windows is not None:
-        handler.get_context_windows = get_context_windows
-    if orig_get_resized_cond is not None and orig_execute is not None:
-        handler.get_resized_cond = get_resized_cond
-        handler.execute = execute
+    applied = _wrap_install(handler, _WRAP_OWNER, {
+        "get_context_windows": _make_get_context_windows(handler, cfg),
+        "get_resized_cond": _make_get_resized_cond(cfg, dim),
+        "execute": _make_execute(cfg, dim),
+    })
+    logging.debug("[ContextAnchor] 已挂载包装链：%s（本次安装 %s）", _wrap_describe(handler), applied)
     # ---- 诊断（只读）：两窗重叠区分歧审计；CWA_DEBUG=1 时输出 ----
     try:
         _register_overlap_diag(handler)
