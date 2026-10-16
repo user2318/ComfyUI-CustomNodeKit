@@ -7,33 +7,32 @@
 （重叠只读化）已经能让每帧只有一个作者，但**后窗看到的仍是「上一步的融合值」**，
 它在本步的 forward 里并不知道前窗**本步**已经决定了什么。
 
-本节点做的事（S2.1：`noise=content_delta` 为默认）
-------------------------------------------------
+本节点做的事（步内 x 前移；**2026-10-11 精简：参数 11 -> 5；2026-10-15 面板再精简为 3 个控件**）
+------------------------------------------------------------------------
 在**同一个去噪步内**，让后面的窗口看到前面窗口**本步刚产出的 x0**：
 
     窗 k forward 之前（对待提交的帧 i）：
-        Δ_i        = x0_prev[i] - (上一步的融合 x0)[i]
-        x_sub[i]  <- x_sub[i] + A · β · Δ_i        ← 只平移「内容」，噪声一字不动
-        其中 x0_prev[i] = 前窗**本步**对帧 i 的 x0 预测
-             A = dx/dx0（auto：用最小二乘从 x_in 与上一步 x0 直接量出来）
+        target_i  = (1 - σ) · x0_prev[i] + σ · ε(seed, σ, i)   ← ε 按种子确定 => 两窗共享同一份噪声
+        x_sub[i]  <- (1 - β_eff) · x_sub[i] + β_eff · target_i
+        其中 x0_prev[i] = 前窗**本步**对帧 i 的 x0 预测（不是上一步的融合值）
+             β_eff     = roll_beta（本窗拥有的帧）/ roll_beta_inherited（继承帧），再乘 curve 衰减
     窗 k forward 之后：
-        记录本窗**拥有**的帧（`window.original_indices`）在本步的 x0，供后续窗口使用
-        execute 结束时，把「本步的融合 x0」缓存到 handler 上，供【下一步】当基准
+        记录本窗**拥有**的帧（`window.original_indices`）在本步的 x0，供后面的窗口使用
 
-**为什么不沿用"带新噪声的再噪"**（旧行为，现由 `roll_noise=legacy_fresh` 保留）
-旧公式 `(1-β)·x + β·[(1-σ)·x0_prev + σ·ε_new]` 有两个副作用：
-  1. 把该帧的噪声换成「混合噪声」，幅值压到 √((1-β)^2+β^2) 倍（β=0.5 时最低 0.707）；
-  2. σ→1 时 `(1-σ)→0`，提交退化成「纯新噪声」—— 既没传内容、又打乱了噪声，
-     而第 1 步恰恰是 4 步蒸馏里最重要的一步。
-后果：「动作连贯」与「背景色一致」互相牺牲（实测 β=0.3 动作好/背景差，β=1 背景好/动作散）。
-`content_delta` 把两者**解耦**：内容对齐与噪声共享可以同时 100% 拿到。
+σ→1（片段首步）时 (1-σ)→0 => 提交值退化成「两窗共享的那块噪声」（内容项天然为 0）。
+「动作连贯」与「背景色一致」的取舍由 roll_beta / roll_beta_inherited 调（实测 0.45 + 0.6 最健康）。
 
-天然零改动的三种情况
---------------------
-· σ=1（片段第 1 步）：A 里含 (1-σ) 因子（auto 量出来就是 0）=> 不动
-· 片段首步 / 新 phase：σ 回跳 => 跨步缓存自动失效 => 无基准 => 不动
-  （这条保证长流程，例如「25 段 × 4 步」，不会跨片段串味）
-· `roll_beta=0` / `mode=off` / `enabled=关` => 完全透传
+历史（已删除的实现，仅备查）：`content_delta`（只平移内容、不换噪声，A=dx/dx0 由最小二乘自动估计）
+曾作为默认实现（提交 02366db），同 seed 实测更差 => 已整体回退删除。随之删除的还有
+`mode` / `noise` / `content_scale` / `w_content` / `w_noise` / `roll_seed` / `roll_beta_step1` 等控件，
+以及只喂日志、**从不参与计算**的「跨步 x0 缓存」。
+
+天然零改动的情况
+----------------
+· σ=1（片段第 1 步）：(1-σ)=0 => 提交值只剩「两窗共享的那块噪声」，内容项天然为 0
+· `roll_beta=0` 且 `roll_beta_inherited=-1` => 完全透传（原样返回同一个 model，不 clone、不装包装器）
+· `enabled=关` => 完全透传
+· β=0 但 `roll_beta_inherited>=0` => **按设计仍生效**：只把「继承帧（只读前文）」单作者化，本窗拥有帧不动
 
 关键事实（本机代码已验证）
 --------------------------
@@ -64,22 +63,21 @@
 ----------
 必须接在上下文窗口节点（`Wan SCAIL-2 Context Windows` / `Custom Context Windows (Manual)`）
 **之后**；与 `Context Window Anchor` 可共存（都通过 handler_wrap 包装链挂载，互不覆盖）。
-`roll_mode=off` 或 `roll_beta=0` 或 `enabled=关` => 完全透传（等价于没装本节点）。
+`enabled=关`、或（`roll_beta=0` 且 `roll_beta_inherited=-1`）=> 完全透传（等价于没装本节点）。
 """
 
 from __future__ import annotations
 
 import copy
 import logging
-import math
 from dataclasses import dataclass
 
 import torch
 
 try:
-    from .handler_wrap import install as _wrap_install, describe as _wrap_describe
+    from .handler_wrap import install as _wrap_install
 except ImportError:                                     # pragma: no cover - 顶层导入（自测脚本）
-    from handler_wrap import install as _wrap_install, describe as _wrap_describe
+    from handler_wrap import install as _wrap_install
 
 
 # 包装链里的 owner 标识（与 ContextWindowAnchor 平级，互不覆盖）
@@ -88,102 +86,22 @@ _WRAP_OWNER = "RollingWindows"
 
 @dataclass
 class RollingConfig:
-    mode: str = "intra_step_x"      # off / intra_step_x
-    beta: float = 0.5               # 提交强度：0=透传，1=内容完全用前窗本步 x0
-    scope: str = "readonly"         # readonly=只改本窗只读帧 / both=也改本窗拥有的重叠帧
-    seed: int = 0                   # 再噪用的确定性噪声种子（仅 legacy_fresh 用）
-    noise: str = "content_delta"    # content_delta（默认：不引入任何新噪声）/ legacy_fresh（旧行为）
-    content_scale: str = "auto"     # auto（最小二乘估计 dx/dx0）/ one_minus_sigma / one
+    """滚动提交配置。
 
-
-# 跨步 x0 缓存挂在 handler 上（与 Context Window Anchor 的 x0 缓存同一套路）
-_X0_CACHE_ATTR = "_roll_x0_cache"
-
-
-def _handler_of(model_options):
-    try:
-        return (model_options or {}).get("context_handler", None)
-    except Exception:
-        return None
-
-
-def _read_base_x0(model_options, sigma: float):
-    """取「上一步的融合 x0」（= 采样器真正拿去构造当前 x 的那个基准）。
-
-    σ 在一个片段内单调下降；**新片段 / 新 phase 会让 σ 跳回高位** =>
-    用 `sigma >= cached_sigma` 判定缓存过期。这条规则保证长流程（例如 25 段 × 4 步）
-    里「跨片段不串味」—— 每段第一步必然失效 => 那一步天然零改动。
+    ⚠️ 这里的默认值是**内部 / 自测**用的兜底档（`curve="flat"` = 不做随步衰减）；
+       节点 `WanSCAIL2RollingWindowsNode` 每次都显式传入实测档（`scope="both"` / `curve="late"`）
+       覆盖它们 => 改这里的默认值只影响直接构造本对象的调用方（含自测），不影响节点行为。
     """
-    h = _handler_of(model_options)
-    if h is None:
-        return None
-    cache = getattr(h, _X0_CACHE_ATTR, None)
-    if not isinstance(cache, dict):
-        return None
-    cs = cache.get("sigma")
-    x0 = cache.get("x0")
-    if cs is None or x0 is None:
-        return None
-    try:
-        if float(sigma) >= float(cs):
-            return None
-    except Exception:
-        return None
-    return x0
+    beta: float = 0.45              # 提交强度：0=透传；1=该帧输入完全换成「前窗本步 x0 按当前 σ 再噪」
+    beta_inherited: float = -1.0    # 继承帧（= 本窗的只读前文）的单独强度；-1 = 跟随 beta
+    curve: str = "flat"             # 随步 β 曲线：flat（兜底=恒 β）/ late（早期弱、后期强）/ mid（前半程不提交）
+    scope: str = "both"             # readonly=只改本窗只读帧 / both=也改本窗拥有的重叠帧
+    seed: int = 0                   # 再噪用的确定性噪声种子（内部固定，不再暴露成参数）
 
-
-def _write_base_x0(model_options, sigma: float, result) -> None:
-    """把本次 execute 的融合 x0（= 采样器构造下一步 x 所用的值）缓存到 handler 上。"""
-    h = _handler_of(model_options)
-    if h is None:
-        return
-    tensor = result
-    if isinstance(result, (list, tuple)):
-        tensor = result[0] if len(result) else None
-    if not torch.is_tensor(tensor):
-        return
-    try:
-        setattr(h, _X0_CACHE_ATTR, {"sigma": float(sigma), "x0": tensor.detach()})
-    except Exception:
-        logging.debug("[RollingWindows] 缓存上一步 x0 失败（忽略）", exc_info=True)
-
-
-def _estimate_content_scale(x_in, base, sigma: float, cfg: RollingConfig):
-    """估计 A = dx/dx0，使 `x_in ≈ A·base + 噪声`。
-
-    为什么不能硬编码 `1-σ`：`x` 与 `x0` 的关系**依赖采样器与阶段** ——
-      · euler / lcm（单阶段、真噪声）：`x = (1-σ)·x0 + σ·ε`            => A = 1-σ
-      · `WanSCAIL2PhaseSampler` 的 phase_schedule 第 2..N 段
-        （`noise=0` + `latent_image=上一段输出`）：`x = (1-σ)^2·x0 + ...` => A = (1-σ)^2
-    所以这里用**最小二乘投影**直接量出来：
-
-        A ≈ <x_in, base> / <base, base>
-
-    噪声与 base 独立，且全长序列有 400 万+ 个元素 => 估计误差约 1e-3（实际等于精确）。
-    这样「换了采样器 / 换了阶段」都不用改公式。
-    """
-    mode = str(getattr(cfg, "content_scale", "auto") or "auto")
-    if mode == "one_minus_sigma":
-        return max(0.0, 1.0 - float(sigma))
-    if mode == "one":
-        return 1.0
-    try:
-        if not (torch.is_tensor(x_in) and torch.is_tensor(base)):
-            raise ValueError("x_in/base 不是张量")
-        if tuple(x_in.shape) != tuple(base.shape):
-            raise ValueError("x_in/base 形状不一致")
-        a = x_in.detach().float()
-        b = base.detach().float()
-        denom = float((b * b).sum())
-        if denom <= 1e-12:
-            raise ValueError("base 范数为 0")
-        est = float((a * b).sum()) / denom
-        if math.isnan(est) or math.isinf(est) or est <= 0.0:
-            raise ValueError("估计值非法：%r" % (est,))
-        return min(1.0, est)           # A 不可能大于 1（x 里 x0 的系数）
-    except Exception:
-        logging.debug("[RollingWindows] content_scale 自动估计失败，回退 1-σ", exc_info=True)
-        return max(0.0, 1.0 - float(sigma))
+# 2026-10-15 删除：跨步 x0 缓存（`_X0_CACHE_ATTR` / `_handler_of` / `_read_base_x0` / `_write_base_x0`）。
+#   它被 `execute` 读出并写进 `state["base_x0"]`，但**从未参与任何计算**（只喂「（无基准…）」那条日志），
+#   真正传递信息的「前窗本步 x0」走的是 `state["committed"]`（见 _record_commit / _apply_commit）。
+#   删掉它 = 少一次「每步一个全长张量 detach + 挂在 handler 上」的开销，逐位不改结果（自测已覆盖）。
 
 
 def _current_window(model_options):
@@ -230,27 +148,15 @@ def _frame_slice(tensor: torch.Tensor, dim: int, pos: int):
     return tuple(sl)
 
 
-def _global_frame(tensor, dim: int, idx: int):
-    """取全长张量在全局帧 `idx` 上的切片（保持 dim 维）。越界/非张量 => None。"""
-    if not torch.is_tensor(tensor) or tensor.ndim <= dim:
-        return None
-    if idx < 0 or idx >= tensor.shape[dim]:
-        return None
-    return tensor[_frame_slice(tensor, dim, idx)]
-
-
 def _apply_commit(sub_x, pos_of, own, state, sigma, cfg: RollingConfig):
-    """把「已被前面窗口写过的帧」在本窗输入里做提交。两种模式：
+    """把「已被前面窗口写过的帧」在本窗输入里做提交。
 
-    · `noise="content_delta"`（**默认**）：
-          Δ = x0_prev - 上一步融合 x0
-          x ← x + A · β · Δ          （A = dx/dx0，自动估计）
-      **不引入任何新噪声** —— 帧原有的噪声实现被完整保留（σ·ε 一字不动），
-      只把「内容」朝前窗平移。σ=1（或 A≈0）时天然零改动。
-    · `noise="legacy_fresh"`（保留旧行为，供 A/B）：
-          x ← (1-β)·x + β·[(1-σ)·x0_prev + σ·ε_new]
-      代价：该帧噪声被换成"混合噪声"，幅值被压到 √((1-β)^2+β^2) 倍
-      （β=0.3 → 0.762；β=0.5 → 0.707；β=1 → 1.0）。
+        target = (1 - sigma) * x0_prev + sigma * eps     # eps 按 (seed, sigma, 帧) 确定
+        x      = (1 - beta) * x + beta * target
+
+    · sigma 接近 1（片段首步）：target 基本等于 eps => 两窗共享同一份噪声（内容项天然为 0）。
+    · beta_eff：本窗拥有的帧用 `roll_beta`；「继承帧（只读前文）」在 `roll_beta_inherited >= 0` 时单独取值。
+    · 再乘 `curve` 衰减（late = σ 大时不提交、σ<=0.5 满量）。
     """
     committed = state["committed"]
     if not committed:
@@ -260,29 +166,28 @@ def _apply_commit(sub_x, pos_of, own, state, sigma, cfg: RollingConfig):
     if not targets:
         return sub_x
     dim = state["dim"]
-    base = state.get("base_x0")
-    scale = state.get("content_scale")
-    if cfg.noise == "content_delta":
-        if base is None or scale is None or float(scale) <= 0.0:
-            return sub_x          # 第一步 / 新片段 / 拿不到基准 => 天然零改动
     out = sub_x.clone()
     for i in targets:
         sl = _frame_slice(out, dim, pos_of[i])
         ref = out[sl]
         prev = committed[i].to(ref.device, ref.dtype)
-        if cfg.noise == "content_delta":
-            b = _global_frame(base, dim, i)
-            if b is None:
-                continue
-            delta = prev - b.to(ref.device, ref.dtype)
-            out[sl] = ref + (float(scale) * cfg.beta) * delta
-        else:
-            eps = _seeded_noise_like(ref, cfg.seed, state["step"], i)
-            target = (1.0 - sigma) * prev + sigma * eps
-            out[sl] = (1.0 - cfg.beta) * ref + cfg.beta * target
+        beta_i = float(cfg.beta)
+        if float(getattr(cfg, "beta_inherited", -1.0)) >= 0.0 and i not in own:
+            beta_i = float(cfg.beta_inherited)
+            state["hits_inherited"] = int(state.get("hits_inherited", 0)) + 1
+        # ★ roll_beta_curve：早期少干预（预测还糙，融合只会抹细节）→ 后期让两窗对齐
+        _curve = str(getattr(cfg, "curve", "flat"))
+        if _curve == "late":
+            beta_i *= max(0.0, min(1.0, (1.0 - float(sigma)) / 0.5))   # σ>=1 => 0；σ<=0.5 => 满量
+        elif _curve == "mid":
+            beta_i *= 0.0 if float(sigma) > 0.5 else 1.0               # 前半程不提交
+        if beta_i <= 0.0:
+            continue
+        eps = _seeded_noise_like(ref, cfg.seed, state["step"], i)
+        target = (1.0 - sigma) * prev + sigma * eps
+        out[sl] = (1.0 - beta_i) * ref + beta_i * target
         state["hits"] += 1
     return out
-
 
 def _record_commit(out, pos_of, own, state):
     """记录本窗**拥有**的帧在本步的 x0（供后面的窗口使用）。
@@ -307,26 +212,17 @@ def _record_commit(out, pos_of, own, state):
 
 
 def _make_execute(cfg: RollingConfig, dim: int):
-    """工厂：在 `execute` 外层包一圈「步内 x 前移」。
-
-    注意 `calc_cond_batch` 参数**就是单窗 forward** —— base execute 会按窗口顺序逐次调用它，
-    所以在这里包它即可拿到「每窗 + 每步」的粒度，且不需要改动 `Custom_context.py`。
-    """
+    """工厂：在 `execute` 外层包一圈「步内 x 前移」（`calc_cond_batch` 就是单窗 forward）。"""
     def factory(next_call):
         def execute(calc_cond_batch, model, conds, x_in, timestep, model_options):
-            if cfg.mode == "off" or float(cfg.beta) <= 0.0:
+            if float(cfg.beta) <= 0.0 and float(cfg.beta_inherited) < 0.0:
                 return next_call(calc_cond_batch, model, conds, x_in, timestep, model_options)
             try:
                 sigma = float(timestep.reshape(-1)[0])
             except Exception:
                 sigma = 0.0
-            # 跨步基准：上一步的融合 x0（σ 回跳 => 新片段 => 自动失效）
-            base = _read_base_x0(model_options, sigma)
-            # A = dx/dx0；每步只算一次（全长张量上统计量最稳），与窗口数无关
-            scale = _estimate_content_scale(x_in, base, sigma, cfg) if base is not None else None
-            # 步内状态：每次 execute（= 每个去噪步）重置一次
             state = {"step": _sigma_step_key(sigma), "dim": dim, "committed": {},
-                     "windows": 0, "hits": 0, "base_x0": base, "content_scale": scale}
+                     "windows": 0, "hits": 0, "hits_inherited": 0}
 
             def rolling_cb(m, c, sub_x, ts, mo, **kw):
                 window = _current_window(mo)
@@ -343,18 +239,13 @@ def _make_execute(cfg: RollingConfig, dim: int):
                 return out
 
             result = next_call(rolling_cb, model, conds, x_in, timestep, model_options)
-            # 把本次的融合 x0 存起来，供【下一步】当基准（下一片段第一步会因 σ 回跳而自动失效）
-            _write_base_x0(model_options, sigma, result)
-            logging.info("[RollingWindows] σ=%.3f 步完成：%d 窗，提交命中 %d 帧"
-                         "（mode=%s noise=%s beta=%.2f scope=%s A=%s%s）",
-                         sigma, state["windows"], state["hits"],
-                         cfg.mode, cfg.noise, cfg.beta, cfg.scope,
-                         ("%.4f" % scale) if scale is not None else "n/a",
-                         "（无基准：片段首步 / 缓存已失效）" if base is None else "")
+            logging.info("[RollingWindows] σ=%.3f 步完成：%d 窗，提交命中 %d 帧（其中继承帧 %d）"
+                         "（beta=%.2f beta_inherited=%.2f scope=%s curve=%s）",
+                         sigma, state["windows"], state["hits"], state["hits_inherited"],
+                         cfg.beta, cfg.beta_inherited, cfg.scope, cfg.curve)
             return result
         return execute
     return factory
-
 
 # ---------------- 节点 ----------------
 
@@ -367,35 +258,18 @@ class WanSCAIL2RollingWindowsNode:
             "required": {
                 "model": ("MODEL", {"tooltip": "已接入上下文窗口节点的模型（`Wan SCAIL-2 Context Windows` 或 `Custom Context Windows (Manual)` 的 model 输出）。Model that already has a context windows node applied."}),
                 "enabled": ("BOOLEAN", {"default": True,
-                    "tooltip": "总开关；关闭时模型直接透传。Master switch."}),
-                "roll_mode": (["off", "intra_step_x"], {"default": "intra_step_x",
-                    "tooltip": "off = 透传（等价于没装本节点）；\n"
-                               "intra_step_x = 步内 x 前移：后面的窗口在【本步】就能看到前面窗口刚产出的 x0。\n"
-                               "off = passthrough; intra_step_x = later windows see the previous window's current-step x0."}),
-                "roll_beta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "提交强度 β：0 = 完全不改（透传）；1 = 该帧的输入完全换成「前窗本步 x0 按当前 σ 再噪」。\n"
-                               "建议先试 0.3~0.6；若出现噪点感/闪烁就往回收。\n"
-                               "Commit strength. 0 = passthrough, 1 = full replace with re-noised previous-window x0."}),
-                "roll_scope": (["readonly", "both"], {"default": "readonly",
-                    "tooltip": "readonly（推荐）= 只改【本窗只读的帧】（已被前窗写过），永不动本窗拥有的帧\n"
-                               "    => 所有权不变、不引入新的平均；\n"
-                               "both = 连本窗拥有的重叠帧也改（仅在 overlap_scope=average 时有区别；single 下两者等价）。"}),
-                "roll_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff,
-                    "tooltip": "再噪用的确定性噪声种子（**仅 noise=legacy_fresh 时有效**）。\n"
-                               "Deterministic noise seed (only used when noise=legacy_fresh)."}),
-                "roll_noise": (["content_delta", "legacy_fresh"], {"default": "content_delta",
-                    "tooltip": "content_delta（默认，推荐）= 只把「内容」朝前窗平移，**帧原有的噪声一字不动**；\n"
-                               "    σ=1、片段首步、拿不到基准时天然零改动\n"
-                               "    => 「内容对齐」与「噪声共享」可以同时拿到（两者不再互相牺牲）。\n"
-                               "legacy_fresh = 旧行为：把该帧换成 (1-σ)·前窗x0 + σ·新噪声\n"
-                               "    （代价：该帧噪声被换成混合噪声，幅值压到 0.76~0.71 倍）。\n"
-                               "content_delta = move content only, never touch the noise (recommended)."}),
-                "roll_content_scale": (["auto", "one_minus_sigma", "one"], {"default": "auto",
-                    "tooltip": "x 里 x0 的系数 A（即 dx/dx0），决定「内容平移」该按多大比例施加。\n"
-                               "auto（推荐）= 用最小二乘从 x_in 与上一步 x0 直接量出来\n"
-                               "    => 自动适配单阶段采样器（A=1-σ）与 phase_schedule 后续阶段（A=(1-σ)^2）；\n"
-                               "one_minus_sigma = 固定 1-σ；one = 固定 1.0。\n"
-                               "Auto-estimated content coefficient."}),
+                    "tooltip": "总开关；关闭时模型直接透传（等价于不装本节点）。Master switch: off = exactly like not installing this node."}),
+                "roll_beta": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "提交强度 β（**主力旋钮**）：0 = 透传；1 = 该帧输入完全换成「前窗本步 x0 按当前 σ 再噪」。"
+                               "实测推荐 0.45~0.50（0.30 / 0.60 / 1.00 都出现过缝上 26~40px 瞬移）。Commit strength; measured sweet spot 0.45~0.50."}),
+                "roll_beta_inherited": ("FLOAT", {"default": 0.6, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "【只作用于「继承帧」（本窗的只读前文）的提交强度】-1 = 跟随 roll_beta；>=0 = 单独指定。同 seed 实测：0.6 => 质心 10.3px；-1 => 21.3px => 0.6 明显更好（默认 0.6）。\n"
+                               "Commit strength for inherited frames only (measured: 0.6 much better than -1)."}),
+                # 2026-10-15：roll_scope / roll_beta_curve 两个控件的**控件已移除**，值固定在 `apply_rolling`
+                #   的签名默认里（both / late，均为实测档）。==> 面板现只有 enabled / roll_beta / roll_beta_inherited。
+                # 删掉的两个控件（原值备查）：
+                #   roll_scope      = ["readonly", "both"]，默认 both（readonly = 只改本窗只读帧）
+                #   roll_beta_curve = ["flat", "late", "mid"]，默认 late（flat = 恒 β / mid = 前半程不提交）
             },
         }
 
@@ -405,19 +279,26 @@ class WanSCAIL2RollingWindowsNode:
     CATEGORY = "context"
     EXPERIMENTAL = True
     DESCRIPTION = (
-        "SCAIL-2 滚动窗口：在同一步内让后面的窗口看到前面窗口【本步】刚产出的 x0。\n"
-        "默认 noise=content_delta —— 只平移「内容」、**完全不动该帧的噪声**；\n"
-        "σ=1 与片段首步天然零改动（因此跨片段不会串味）。\n"
-        "需接在上下文窗口节点之后；与 overlap_scope=average 搭配时建议 roll_scope=both。\n"
-        "roll_mode=off / roll_beta=0 / enabled=关 => 完全透传。"
+        "SCAIL-2 滚动窗口：在同一步内让后面的窗口看到前面窗口【本步】刚产出的 x0。",
+        "提交公式：x = (1-β)·x + β·[(1-σ)·前窗本步x0 + σ·ε]（ε 按 seed 确定 ⇒ 两窗共享同一份噪声）。",
+        "2026-10-11 精简：参数 11 -> 5（删掉 mode / noise / content_scale / w_content / w_noise / beta_step1；",
+        "content_delta 与 w_noise<1 实测更差 => 固定「再噪」公式，且「第 1 步不提交」由 (1-σ) 天然给出）。",
+        "2026-10-15 面板再精简：只留 enabled / roll_beta / roll_beta_inherited"
+        "（roll_scope 固定 both、roll_beta_curve 固定 late；参数保留在签名里，去掉控件不改行为）。",
+        "需接在上下文窗口节点之后；roll_scope=both 与 overlap_scope=average 搭配。",
+        "enabled=关 /（roll_beta=0 且 roll_beta_inherited=-1）=> 完全透传。"
     )
 
-    def apply_rolling(self, model, enabled=True, roll_mode="intra_step_x", roll_beta=0.5,
-                      roll_scope="readonly", roll_seed=0,
-                      roll_noise="content_delta", roll_content_scale="auto"):
-        if not enabled or str(roll_mode) == "off" or float(roll_beta) <= 0.0:
-            logging.info("[RollingWindows] 未启用（enabled=%s, mode=%s, beta=%.3f），模型直接透传",
-                         enabled, roll_mode, roll_beta)
+    # 2026-10-15：roll_scope / roll_beta_curve 的**控件已从面板移除**，值固定在下方的签名默认里
+    #   （both / late，均为实测档）。理由：overlap_scope 已在锚定侧硬固定为 average => 只有 both 有意义；
+    #   curve=late 是正收益（内容异常 -29%）且早已是默认。参数本身保留 => 代码/自测仍可按任意档调用，
+    #   节点行为与「去掉控件前」逐位一致。
+    def apply_rolling(self, model, enabled=True, roll_beta=0.45,
+                      roll_scope="both", roll_beta_inherited=0.6, roll_beta_curve="late"):
+        b_inh = float(roll_beta_inherited) if roll_beta_inherited is not None else -1.0
+        if not enabled or (float(roll_beta) <= 0.0 and b_inh < 0.0):
+            logging.info("[RollingWindows] 未启用（enabled=%s beta=%.3f beta_inherited=%.2f），模型直接透传",
+                         enabled, roll_beta, b_inh)
             return (model,)
 
         handler = model.model_options.get("context_handler", None)
@@ -426,25 +307,18 @@ class WanSCAIL2RollingWindowsNode:
                 "[RollingWindows] 模型上没有 context_handler：请把本节点接在上下文窗口节点"
                 "（`Wan SCAIL-2 Context Windows` 或 `Custom Context Windows (Manual)`）之后。")
 
-        cfg = RollingConfig(mode=str(roll_mode), beta=float(roll_beta),
-                            scope=str(roll_scope), seed=int(roll_seed),
-                            noise=str(roll_noise), content_scale=str(roll_content_scale))
-
+        cfg = RollingConfig(beta=float(roll_beta), scope=str(roll_scope),
+                            beta_inherited=b_inh, seed=0,
+                            curve=str(roll_beta_curve))
         model = model.clone()
         # 浅拷贝：包装链会为副本重建并重放既有包装（handler_wrap 保证原 handler 不被污染）
         new_handler = copy.copy(handler)
-        # 新运行必须从零开始：清掉可能被浅拷贝带过来的旧「上一步 x0」基准
-        try:
-            delattr(new_handler, _X0_CACHE_ATTR)
-        except AttributeError:
-            pass
         dim = int(getattr(new_handler, "dim", 2) or 2)
         applied = _wrap_install(new_handler, _WRAP_OWNER, {"execute": _make_execute(cfg, dim)})
         model.model_options["context_handler"] = new_handler
 
-        logging.info("[RollingWindows] 已启用：mode=%s noise=%s beta=%.2f scope=%s seed=%d scale=%s（dim=%d）",
-                     cfg.mode, cfg.noise, cfg.beta, cfg.scope, cfg.seed, cfg.content_scale, dim)
-        logging.info("[RollingWindows] 包装链：%s（本次安装 %s）", _wrap_describe(new_handler), applied)
+        logging.info("[RollingWindows] 已启用：beta=%.2f beta_inherited=%.2f scope=%s noise_seed=%d（dim=%d）",
+                     cfg.beta, cfg.beta_inherited, cfg.scope, cfg.seed, dim)
         return (model,)
 
 
@@ -454,5 +328,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "WanSCAIL2RollingWindows": "Wan SCAIL-2 Rolling Windows (步内滚动)",
+    "WanSCAIL2RollingWindows": "步内滚动",
 }

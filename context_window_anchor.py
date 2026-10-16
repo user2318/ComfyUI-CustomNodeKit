@@ -106,6 +106,18 @@ class AnchorConfig:
     anchor_fixed: bool = False          # True=锚帧 latent 在窗口间逐位相同（真正恒定基准）
     anchor_image_blank: bool = False    # True=待生成序列里的锚帧只放噪声占位（不写锚帧画面内容）
     log_debug: bool = False
+    # ---- 以下四个原本**只存在于模块全局**：节点被 ComfyUI 缓存时 reset_pools 不会执行 ⇒
+    #      采样期会读到上一次执行残留的值（跨运行/跨工作流串味）。放进 cfg 后，每步开头刷新即可免疫。 ----
+    anchor_scope: str = "fresh_only"    # fresh_only / all
+    shared_head: str = "off"            # off / leader / consensus
+    overlap_scope: str = "average"      # average / single
+    memory_position: str = "tail"       # tail / head（记忆帧的物理摆放；RoPE 时间码两者相同）
+    x_prefix: str = "anchor_only"       # x 侧前缀（2026-10-11）：anchor_only（默认）/ anchor_memory / none
+    drive_memory: str = "on"            # 16ch 驱动流是否接收记忆帧（2026-10-11 A/B 开关）：on/off
+    anchor_slot: str = "context"
+    memory_order: str = "sparse"
+    # 记忆排布（2026-10-11）：sparse=现状 / contig_mem_anc=连续块置于锚之前（锚仍紧邻窗口）
+    # 锚帧的时间码语义（2026-10-11）：context（默认，锚紧邻窗口）/ leading（锚=窗口之前）
 
 
 # ---------------- 模块级锚定池（按最后一次 apply_anchor 生效） ----------------
@@ -115,8 +127,22 @@ _ANCHOR_COUNT = 0
 _DRIVING_ONLY = True
 _MEMORY_FRAMES = 0
 _MEMORY_STRIDE = 0      # 记忆组的抽样间距（latent 帧）：0 = 自动（覆盖「片段开头 → 本窗口之前」全部历史）
+# ⚠️ 下面这些「模块全局」只是**兜底默认值**：节点每次执行都会把 cfg 刷进来（`_apply_cfg_to_globals`，
+#    每采样步还会再刷一次）。其中 memory_position / drive_memory / anchor_slot / anchor_image_blank
+#    在节点侧是**恒定注入**的（head / off / aligned / True，见 apply_anchor 签名默认）
+#    => 这里的默认值只影响「直接调内部函数」的场合，**不要拿它们当节点行为来读**
+#    （自测里显式钉住本文件的旧默认值，属有意为之）。
+_MEMORY_POSITION = "tail"   # 兜底默认 tail；节点恒定注入 "head"（规范物理顺序 [锚][记忆][本窗]）
+                            # ★ 两种摆放的 RoPE 时间码【完全相同】，只有 token 的物理位置不同。
+                            #   若 Wan 的注意力确实非因果（model.py:90 不传 mask），两者输出必须【逐位相同】
+                            #   ⇒ 同 seed 跑 tail/head 各一遍比像素，即可验证「摆放是否影响结果」。
 _ANCHOR_FIXED = False
-_ANCHOR_IMAGE_BLANK = False   # True = 待生成序列里的锚帧只放噪声占位（不写入 anchor_frames 的画面内容）
+_X_PREFIX = "anchor_only"    # x 侧前缀（2026-10-11）：anchor_only / anchor_memory / none
+_DRIVE_MEMORY = "on"         # 兜底默认 on；节点恒定注入 "off"（实测档：坏种子好 4.9px / 好种子差 0.7px）
+_MEMORY_ORDER = "sparse"
+_ANCHOR_SLOT = "context"     # 兜底默认 context；节点恒定注入 "aligned"（锚=窗口之前的独立块）
+                             #               leading=[锚][记忆][窗]（锚=窗口之前；★ 必须与 x 段同步，见 RoPE 补丁）
+_ANCHOR_IMAGE_BLANK = False   # 兜底默认 False；节点恒定注入 True（待生成序列里只放噪声占位，不写锚帧画面）
 _WARNED = set()
 _LOGGED_ONCE = set()
 
@@ -136,7 +162,7 @@ _OVERLAP_SCOPE = "average"
 # 可用环境变量 CWA_ANCHOR_NOISE_SEED 覆盖（十进制或 0x 前缀），便于做「换一块噪声会不会影响结果」
 # 的对比实验；也可据此判断它是否会与周围帧的噪声产生不连续。
 # 注意：它只影响「锚帧那几帧」的噪声；其他帧的噪声仍由你在采样器里设的 seed 决定。
-_ANCHOR_NOISE_SEED = int(os.environ.get("CWA_ANCHOR_NOISE_SEED", "24301"), 0)   # 24301 = 0x5EED
+_ANCHOR_NOISE_SEED = int(os.environ.get("CWA_ANCHOR_NOISE_SEED", "0"), 0)   # 0 = 默认（统计上任意值等价；仅复用历史结果时才需要指定）
 
 # ---- 诊断开关（默认关）：CWA_DEBUG=1 时输出「空间 / 布局 / 两窗重叠区分歧」日志 ----
 _DEBUG_ENV = str(os.environ.get("CWA_DEBUG", "")).strip() not in ("", "0", "false", "False", "no")
@@ -279,6 +305,32 @@ def _dbg(msg, *args):
         logging.info(msg, *args)
 
 
+# ---- 详细档（默认关）：CWA_DEBUG_VERBOSE=1 时才输出「逐流统计 / 逐帧列表」这类长内容 ----
+#   目的：默认日志保持**可读、可整段复制**；深水区排查时才开这一档。
+_DEBUG_VERBOSE = str(os.environ.get("CWA_DEBUG_VERBOSE", "")).strip() not in ("", "0", "false", "False", "no")
+
+
+def _dbg_v(msg, *args):
+    """详细档诊断（`CWA_DEBUG` 与 `CWA_DEBUG_VERBOSE` 同时开才输出）。"""
+    if _DEBUG and _DEBUG_VERBOSE:
+        logging.info(msg, *args)
+
+
+def _dbg_once(key, msg, *args):
+    """**每个片段只打一次**的诊断（几何 / 流长度这类"每步都一样"的量）。
+
+    为什么：窗口几何与条件流长度是**本片段的固定属性**，旧实现每步重打一遍 ⇒ 一次 prompt 几百行、
+    其中约 90% 是重复内容（还常常复制不全）。`_LOGGED_ONCE` 在 `reset_pools` 里清空（= 每次节点执行重置）
+    ⇒ 每个片段留一份几何快照，既短又不丢信息；每步变化的量（分歧/命中/A）仍逐步打印。
+    """
+    if not _DEBUG:
+        return
+    if key in _LOGGED_ONCE:
+        return
+    _LOGGED_ONCE.add(key)
+    logging.info(msg, *args)
+
+
 def _capture_latent_normalizer(model):
     """捕获模型的 latent 归一化函数（`BaseModel.process_latent_in`）供锚定池转「模型空间」用。
 
@@ -383,10 +435,10 @@ def reset_pools(frames, mask_frames, vae, driving_only: bool = True,
                 memory_frames: int = 0, memory_stride: int = 0,
                 anchor_fixed: bool = False, anchor_image_blank: bool = False, model=None,
                 anchor_scope: str = "fresh_only", shared_head: str = "off",
-                overlap_scope: str = "average"):
+                overlap_scope: str = "average", memory_position: str = "tail"):
     """设置锚定素材并清空编码缓存；返回锚定 latent 帧数。"""
     global _ANCHOR_COUNT, _DRIVING_ONLY, _MEMORY_FRAMES, _MEMORY_STRIDE, _ANCHOR_FIXED, _ANCHOR_IMAGE_BLANK
-    global _ANCHOR_SCOPE, _SHARED_HEAD_MODE, _OVERLAP_SCOPE
+    global _ANCHOR_SCOPE, _SHARED_HEAD_MODE, _OVERLAP_SCOPE, _MEMORY_POSITION
     _POOL_CACHE.clear()
     _DIAG.clear()
     _capture_latent_normalizer(model)
@@ -396,6 +448,7 @@ def reset_pools(frames, mask_frames, vae, driving_only: bool = True,
     _MEMORY_FRAMES = max(0, int(memory_frames or 0))
     # 0 = 自动（不要用 `or 4` 兜底：0 是合法值，会被 falsy 判断吞掉）
     _MEMORY_STRIDE = max(0, int(memory_stride if memory_stride is not None else 0))
+    _MEMORY_POSITION = (str(memory_position) if str(memory_position) in ("tail", "head") else "tail")
     _ANCHOR_FIXED = bool(anchor_fixed)
     _ANCHOR_IMAGE_BLANK = bool(anchor_image_blank)
     _ANCHOR_SCOPE = str(anchor_scope or "fresh_only") if str(anchor_scope) in ("fresh_only", "all") else "fresh_only"
@@ -465,6 +518,23 @@ def _match_channels(pool, target_channels: int):
         return pool
     if pool.shape[1] + 4 == target_channels:
         return torch.cat([pool, torch.ones_like(pool[:, :4])], dim=1)
+    if target_channels + 4 == pool.shape[1]:
+        # 2026-10-11：反向（20 -> 16）也必须支持 —— 原始空间键 pose_video_latent 是 16ch，
+        #   而记忆帧取自模型空间键（20ch）⇒ 不裁掉那 4 个 ones 通道，这条流永远拿不到记忆。
+        # ★ A/B 开关（节点控件 drive_memory，默认 on；环境变量 CWA_DRIVE_MEMORY=0 可强制关）：
+        #   off ⇒ 恢复旧行为（16ch 驱动流不接收记忆帧）⇒ 同 seed 对比即可判断本改动是否正向。
+        _off = (_DRIVE_MEMORY != "on")
+        if os.environ.get("CWA_DRIVE_MEMORY", "1") == "0":
+            _off = True
+        if _off:
+            _log_once(("drive_memory_off",),
+                      "[ContextAnchor] 16ch 驱动流【不】接收记忆帧（drive_memory=%s；旧行为，A/B 对照档）",
+                      _DRIVE_MEMORY)
+            return pool
+        _log_once(("drive_memory_on",),
+                  "[ContextAnchor] 16ch 驱动流补齐记忆帧（20→16 裁剪 4 个 ones 通道）；"
+                  "对照档：把节点上的 drive_memory 切成 off（无需重启）")
+        return pool[:, :target_channels]
     return pool
 
 
@@ -666,6 +736,8 @@ def inject_anchor_x(model_options, x_slice, dim: int = 2, sigma: float = 0.0):
         window = None
     if window is None or not _anchor_on(window) or getattr(window, "_anchor_x_applied", False):
         return x_slice
+    if _X_PREFIX == "none":          # ★ 2026-10-11：x 侧完全不当前缀（锚只进驱动流）
+        return x_slice
     pool = _get_pool("x", x_slice.shape[-2], x_slice.shape[-1],
                      target_channels=x_slice.shape[1] if x_slice.ndim > 1 else None,
                      model_space=True,      # 采样中的 x = 归一化空间（samplers.py:1224）
@@ -711,19 +783,37 @@ def inject_anchor_x(model_options, x_slice, dim: int = 2, sigma: float = 0.0):
     anchor = noise if base is None else base * (1.0 - sigma) + noise * sigma
     prefix_len = int(getattr(window, "prefix_length", 0) or 0)
     new_x = _insert_at(x_slice, anchor, dim, prefix_len)
+    # ★ 2026-10-11 x_prefix=anchor_memory：x 也镜像驱动流结构 ⇒ 在锚之后补一块【空白(噪声)记忆槽】
+    _mslots = _x_memory_slots(window)     # ★ 与条件流/掩码用同一个数（顺序无关）
+    if _mslots > 0:
+        _ms = list(pool.shape)
+        _ms[dim] = int(_mslots)
+        _g = torch.Generator(device="cpu").manual_seed(_ANCHOR_NOISE_SEED + 1)
+        _mn = torch.randn(_ms, generator=_g, device="cpu", dtype=torch.float32)
+        _mn = _mn.to(device=pool.device, dtype=pool.dtype)
+        new_x = _insert_at(new_x, _mn, dim, prefix_len + int(pool.shape[dim]))
+        window._x_prefix_mem_count = int(_mslots)      # 仅供诊断（真值现算）
     if new_x is not x_slice:
         window._anchor_x_applied = True
         window.anchor_latent_count = int(pool.shape[dim])
+        # ★ 记录 x 切片【实际】多出来的帧数，供跨流一致性自检（2026-10-11 事故守护）
+        window._x_slice_extra = int(new_x.shape[dim]) - int(x_slice.shape[dim])
         window.anchor_latent = pool
         if _ANCHOR_IMAGE_BLANK:
             src = "纯噪声占位（不写锚帧画面）"
         else:
             src = base_src or "上一步 x0"
         _log_once(("x",),
-                  "[ContextAnchor] 待生成序列前已插入锚定 %d 帧（位置=%d, σ=%.3f, 内容=%s）：%s → %s",
-                  pool.shape[dim], prefix_len, sigma, src, list(x_slice.shape), list(new_x.shape))
-        _dbg("[ContextAnchor][diag] σ=%.3f 窗 %s：x 前插锚 %d 帧（内容=%s, 锚块 %s）",
-             sigma, _win_range(window), pool.shape[dim], src, _stat_str(anchor))
+                  "[ContextAnchor] 待生成序列前已插入锚定 %d 帧 = 锚 %d + 记忆空白 %d"
+                  "（位置=%d, σ=%.3f, 内容=%s）：%s → %s",
+                  int(new_x.shape[dim]) - int(x_slice.shape[dim]), pool.shape[dim], _mslots,
+                  prefix_len, sigma, src, list(x_slice.shape), list(new_x.shape))
+        # 默认档：**同一步内各窗内容相同**（共享头 / 纯噪声占位）⇒ 每步只打一行；逐窗细节进详细档
+        _dbg_once(("xanchor", round(float(sigma), 3)),
+                  "[ContextAnchor][diag] σ=%.3f x 前插锚 %d 帧（内容=%s；例：窗 %s —— 同一步各窗相同）",
+                  sigma, pool.shape[dim], src, _win_range(window))
+        _dbg_v("[ContextAnchor][diag]   （详细）σ=%.3f 窗 %s：锚块 %s",
+               sigma, _win_range(window), _stat_str(anchor))
     return new_x
 
 
@@ -767,8 +857,10 @@ def _capture_anchor_x0(model_options, extended, sub_x, out, dim):
                 lst = []
                 cache[_SHARED_HEAD_KEY] = lst
             lst.append((key, block))
-            _dbg("[ContextAnchor][diag] 窗 %s 的头已计入本步共识（%d 份，%s）",
-                 _win_range(window), len(lst), _stat_str(block))
+            # 默认档：只打"份数增长"（1/2/3 份 = 本片段只 3 行）；逐窗统计进详细档
+            _dbg_once(("consensus_count", len(lst)),
+                      "[ContextAnchor][diag] 窗 %s 的头已计入本步共识（%d 份）", _win_range(window), len(lst))
+            _dbg_v("[ContextAnchor][diag]   共识块 %s：%s", _win_range(window), _stat_str(block))
         else:                                      # leader
             if _SHARED_HEAD_KEY not in cache:
                 cache[_SHARED_HEAD_KEY] = (key, block)
@@ -846,10 +938,28 @@ def _memory_tokens(window, full_pose, tensor, t_dim, ch):
     if not indices:
         return None, 0, max(1, int(_MEMORY_STRIDE) or 1)
     lo = min(indices)
-    stride = _memory_stride_for(lo)
     full_len = int(full_pose.shape[t_dim])
-    idx = sorted(i for i in (lo - stride * (m + 1) for m in range(int(_MEMORY_FRAMES)))
-                 if 0 <= i < full_len)
+    _n_mem = max(1, int(_MEMORY_FRAMES))
+    if int(_MEMORY_STRIDE) > 0:
+        # 固定间距（老行为，零回归）
+        stride = max(1, int(_MEMORY_STRIDE))
+        idx = sorted(i for i in (lo - stride * (m + 1) for m in range(_n_mem))
+                     if 0 <= i < full_len)
+    else:
+        # 自动 = 两段式：先覆盖「窗口开头 + head」，多出来的帧再均匀铺在更早的空白区。
+        # 动机：均匀铺全历史时近端只有 1 个采样点 => 窗口附近的动作过程（如「坐下」）会被跳过。
+        _n_near = min(_n_mem, len(list(getattr(window, "head_extra_indices", None) or [])))
+        _n_far = _n_mem - _n_near
+        _near = [i for i in range(max(0, lo - _n_near), lo) if 0 <= i < full_len]
+        _far = []
+        _hi = lo - _n_near - 1
+        if _n_far > 0 and _hi >= 0:
+            if _n_far == 1:
+                _far = [0]
+            else:
+                _far = sorted(set((k * (lo - _n_near)) // _n_far for k in range(_n_far)))
+        idx = sorted(set(_near) | set(_far))
+        stride = max(1, int(lo) // _n_mem)   # 码仍按等效稀疏间距 => 时间码不变，只改「取哪些帧」
     if not idx:
         return None, 0, stride
     sl = [slice(None)] * full_pose.ndim
@@ -860,13 +970,14 @@ def _memory_tokens(window, full_pose, tensor, t_dim, ch):
     if mem is None or int(mem.shape[1]) != int(ch):
         return None, 0, stride
     _log_once(("memory_span",),
-              "[ContextAnchor] 记忆组：窗口起点 %d，间距 %d latent，取到 %d 帧（覆盖到第 %d 帧）",
-              lo, stride, len(idx), (idx[0] if idx else -1))
+              "[ContextAnchor] 记忆组：窗口起点 %d，等效间距 %d，取到 %d 帧：%s",
+              lo, stride, len(idx), (str(idx) if len(idx) <= 12 else (str(idx[:12]) + "...")))
     return mem.to(device=tensor.device, dtype=tensor.dtype), len(idx), stride
 
 
 def _set_anchor_plan(window, head: int, tail_pool: int, tail_zero: int,
-                     prehistory: int, memory: int, stride: int) -> None:
+                     prehistory: int, memory: int, stride: int,
+                     head_zero: int = 0, mem_at_head: bool = False) -> None:
     """把「本窗口怎么扩流」的精确方案记到窗口上。
 
     单一事实来源：条件流注入写它，SCAIL 掩码注入（prepend_anchor_mask）读它，
@@ -874,16 +985,21 @@ def _set_anchor_plan(window, head: int, tail_pool: int, tail_zero: int,
       head        : 前插到驱动流最前的锚帧数（0 = 不前插）
       tail_pool   : 追加到驱动流尾部的「锚帧」数（对应尾部 token，用遮罩池）
       tail_zero   : 追加到驱动流尾部的「历史记忆帧」数（掩码填 0：无身份信息）
+      head_zero   : 【记忆帧摆在最前时】前插到驱动流最前的「历史记忆帧」数（掩码填 0）
+                    （与 tail_zero 互斥：记忆帧要么在尾部、要么在最前）
       prehistory  : RoPE 需要放在窗口之前的锚帧 token 数（= driving_only 时的 head→tail）
       memory      : RoPE 需要放在窗口之前的低帧率历史 token 数
+      mem_at_head : 记忆帧是否物理摆放在【最前】（= memory_position=head）
+                    仅影响【分块顺序】；RoPE 时间码与 tail 摆放完全相同。
     """
     window._anchor_plan = {"head": int(head), "tail_pool": int(tail_pool),
-                           "tail_zero": int(tail_zero)}
+                           "tail_zero": int(tail_zero), "head_zero": int(head_zero)}
     window.anchor_head_count = int(head)
     window.anchor_tail_count = int(tail_pool) + int(tail_zero)
     window.anchor_prehistory_count = int(prehistory)
     window.anchor_memory_count = int(memory)
     window.anchor_memory_stride = int(stride)
+    window.anchor_memory_at_head = bool(mem_at_head)
 
 
 def _window_lengths(window, dim: int = 2):
@@ -894,6 +1010,44 @@ def _window_lengths(window, dim: int = 2):
     except Exception:
         frames_len = len(getattr(window, "original_indices", None) or index_list)
     return len(index_list), frames_len
+
+
+def _x_memory_slots(window) -> int:
+    """x 侧「记忆空白槽」帧数（2026-10-11）—— **唯一事实来源、与调用顺序无关**。
+
+    事故：条件流（c_concat 等）先注入、x 侧后注入（inject_anchor_x）。此前两边各算一次：
+    条件流读 window._x_prefix_mem_count（由 inject_anchor_x **事后**写入）=> 那时还是 0 => 只 +K；
+    而 x 侧 +K+M => 两边差 M 帧 => comfy 在 torch.cat([xc, c_concat]) 处崩：
+    Sizes of tensors must match ... Expected size 25 but got size 21。
+    现在三处（inject_anchor_x / _x_side_prefix_len / 16ch x 池与 prepend_anchor_mask）都调用本函数。
+    """
+    if _X_PREFIX != "anchor_memory":
+        return 0
+    m = int(_MEMORY_FRAMES or 0)
+    if m <= 0:
+        return 0
+    try:
+        _idx = list(getattr(window, "original_indices", None) or [])
+        _lo = min(_idx) if _idx else 0
+    except Exception:
+        _lo = 0
+    return m if _lo > 0 else 0        # 首窗（前面没有历史）与驱动侧一致：不加
+
+
+def _x_side_prefix_len(window) -> int:
+    """x（待生成序列）侧本窗口的额外前缀帧数（2026-10-11）。
+
+    x_prefix=anchor_only   => K（锚帧）
+    x_prefix=anchor_memory => K + M（锚帧 + 记忆空白槽；M 由 _x_memory_slots() 现算，首窗=0）
+    x_prefix=none          => 0（x 侧不加前缀）
+
+    与 x **逐帧对齐**的流（concat_mask / denoise_mask / c_concat / 1,3,4ch 掩码 / 16ch x 池流）
+    必须用同一个数：否则 x 与这些流长度不一致 => comfy 在 c_concat 拼接处直接报 shapes 不匹配。
+    """
+    if _X_PREFIX == "none":
+        return 0
+    k = int(_ANCHOR_COUNT or 0)
+    return k + _x_memory_slots(window)
 
 
 def _prepend_one_cond(key, tensor, window, slice_len, frames_len, prefix_len, stats=None, only_pose=False,
@@ -933,31 +1087,67 @@ def _prepend_one_cond(key, tensor, window, slice_len, frames_len, prefix_len, st
             return tensor
         if _DRIVING_ONLY:
             k_pre = int(pool.shape[t_dim]) if pool is not None else 0
+            mem_at_head = mem is not None and _MEMORY_POSITION == "head"
             new_t = tensor
+            if mem_at_head:
+                new_t = _insert_at(new_t, mem, t_dim, 0)        # ★ 历史帧放【最前】
             if k_pre > 0:
                 new_t = _insert_at(new_t, pool, t_dim, int(new_t.shape[t_dim]))
+            if mem is not None and not mem_at_head:
+                new_t = _insert_at(new_t, mem, t_dim, int(new_t.shape[t_dim]))
+            _set_anchor_plan(window, head=0, tail_pool=k_pre,
+                             tail_zero=(0 if mem_at_head else mem_n),
+                             prehistory=k_pre, memory=mem_n, stride=stride,
+                             head_zero=(mem_n if mem_at_head else 0), mem_at_head=mem_at_head)
+            if new_t is not tensor:
+                stats["extended"].append(
+                    f"{key}({'前插历史' + str(mem_n) + '+' if mem_at_head else '尾部:'}锚{k_pre}"
+                    f"{'' if mem_at_head else '+历史' + str(mem_n)})")
+                _log_once(("pose_tail", key, mem_at_head),
+                          "[ContextAnchor] 驱动流 '%s' 追加 %d 帧 token（锚定 %d + 低帧率历史 %d，间距 %d；"
+                          "摆放=%s；RoPE 会放在窗口之前 => 不再产生 K 帧错位）：%s → %s",
+                          key, k_pre + mem_n, k_pre, mem_n, stride,
+                          "历史在最前/锚在尾部" if mem_at_head else "锚与历史都在尾部",
+                          list(tensor.shape), list(new_t.shape))
+            _record_driving_tokens(window, new_t, t_dim)
+            return new_t
+        mem_at_head = mem is not None and _MEMORY_POSITION == "head"
+        # ★ anchor_slot 两档：物理顺序必须与「锚的时间码语义」一致（否则静默错位）：
+        #   context（默认）：物理 [记忆][锚][本窗] + prehistory=0
+        #       ⇒ 锚帧留在 main 里、与窗口【紧邻且连续】⇒ 与 x 的顺序编号同相。
+        #   aligned：物理 [锚][记忆][本窗] + prehistory=K（锚=窗口之前的独立块），
+        #       且 x 段同步拆分、整轴平移到非负（见 _patched_scail_rope 的 aligned 分支）。
+        #   （leading / shifted 两档实测更差，已移除。）
+        k_head = int(pool.shape[t_dim]) if pool is not None else 0
+        _lead = bool(mem_at_head and _ANCHOR_SLOT == "aligned")
+        if mem_at_head:
+            if _lead:
+                new_t = _insert_at(tensor, pool, t_dim, 0) if pool is not None else tensor
+                if mem is not None:
+                    new_t = _insert_at(new_t, mem, t_dim, k_head)      # 记忆紧随锚之后
+            else:
+                new_t = _insert_at(tensor, mem, t_dim, 0)             # 历史帧放【最前】
+                if pool is not None:
+                    new_t = _insert_at(new_t, pool, t_dim, int(mem.shape[t_dim]))
+        else:
+            new_t = _insert_at(tensor, pool, t_dim, 0) if pool is not None else tensor
             if mem is not None:
                 new_t = _insert_at(new_t, mem, t_dim, int(new_t.shape[t_dim]))
-            _set_anchor_plan(window, head=0, tail_pool=k_pre, tail_zero=mem_n,
-                             prehistory=k_pre, memory=mem_n, stride=stride)
-            if new_t is not tensor:
-                stats["extended"].append(f"{key}(尾部:锚{k_pre}+历史{mem_n})")
-                _log_once(("pose_tail", key),
-                          "[ContextAnchor] 驱动流 '%s' 尾部追加 %d 帧 token（锚定 %d + 低帧率历史 %d，间距 %d；"
-                          "RoPE 会放在窗口之前 => 不再产生 K 帧错位）：%s → %s",
-                          key, k_pre + mem_n, k_pre, mem_n, stride, list(tensor.shape), list(new_t.shape))
-            return new_t
-        new_t = _insert_at(tensor, pool, t_dim, 0) if pool is not None else tensor
-        if mem is not None:
-            new_t = _insert_at(new_t, mem, t_dim, int(new_t.shape[t_dim]))
-        k_head = int(pool.shape[t_dim]) if pool is not None else 0
-        _set_anchor_plan(window, head=k_head, tail_pool=0, tail_zero=mem_n,
-                         prehistory=0, memory=mem_n, stride=stride)
+        window.anchor_slot = str(_ANCHOR_SLOT)     # 供 prepend_anchor_mask / RoPE 补丁判定档位
+        window.memory_order = str(_MEMORY_ORDER)   # 供 RoPE 补丁判定记忆排布
+        _set_anchor_plan(window, head=k_head, tail_pool=0,
+                         tail_zero=(0 if mem_at_head else mem_n),
+                         prehistory=(k_head if _lead else 0), memory=mem_n, stride=stride,
+                         head_zero=(mem_n if mem_at_head else 0),
+                         mem_at_head=mem_at_head)
         if new_t is not tensor:
-            stats["extended"].append(f"{key}(前插锚{k_head}+历史{mem_n})")
-            _log_once(("pose_head", key),
-                      "[ContextAnchor] 驱动流 '%s' 前插锚定 %d 帧 + 尾部低帧率历史 %d 帧：%s → %s",
-                      key, k_head, mem_n, list(tensor.shape), list(new_t.shape))
+            stats["extended"].append(
+                f"{key}(前插锚{k_head}" + (f"+最前历史{mem_n})" if mem_at_head else f"+尾部历史{mem_n})"))
+            _log_once(("pose_head", key, mem_at_head),
+                      "[ContextAnchor] 驱动流 '%s' 前插锚定 %d 帧 + %s低帧率历史 %d 帧：%s → %s",
+                      key, k_head, "【最前】" if mem_at_head else "尾部", mem_n,
+                      list(tensor.shape), list(new_t.shape))
+        _record_driving_tokens(window, new_t, t_dim)
         return new_t
 
     if only_pose:
@@ -972,16 +1162,38 @@ def _prepend_one_cond(key, tensor, window, slice_len, frames_len, prefix_len, st
         return tensor
 
     # 3) 「已知/未知」标记类流：输入掩码填 1（= 待生成/普通帧），history mask 填 0
+    #    ★ 2026-10-11：这些流与 **x（待生成序列）逐帧对齐** => 必须跟随 x_prefix
+    _xextra = _x_side_prefix_len(window)
+    _xactual = int(getattr(window, "_x_slice_extra", -1))
+    if _xactual >= 0 and _xactual != _xextra:
+        logging.warning("[ContextAnchor] ! 跨流一致性检查：x 侧实际额外帧=%d，但按 x_prefix=%s 应为 %d"
+                        " => 与 x 对齐的流（c_concat/concat_mask/掩码）可能错位（comfy 会在 c_concat 拼接处报 shapes 不匹配）",
+                        _xactual, _X_PREFIX, _xextra)
     if key in ANCHOR_ONE_KEYS:
-        extra, what = _zero_like_frames(tensor, t_dim, _ANCHOR_COUNT, value=1.0), "填1(待生成)"
+        if _xextra <= 0:
+            return tensor
+        extra, what = _zero_like_frames(tensor, t_dim, _xextra, value=1.0), "填1(待生成)"
     elif key in ANCHOR_ZERO_KEYS or ch in MASK_LIKE_CHANNELS:
-        extra, what = _zero_like_frames(tensor, t_dim, _ANCHOR_COUNT, value=0.0), "填0(普通帧)"
+        if _xextra <= 0:
+            return tensor
+        extra, what = _zero_like_frames(tensor, t_dim, _xextra, value=0.0), "填0(普通帧)"
     # 4) 20 通道 = 16 latent + 4 ones（SCAIL 的驱动格式）→ 用驱动池
     elif ch == 20:
         extra, what = _pool("pose"), "驱动池"
-    # 5) 其余（16ch 等）→ 用 x 池
+    # 5) 其余（16ch 等）→ 用 x 池（同样跟随 x_prefix：池 K 帧 + 记忆空白 M 帧）
     else:
-        extra, what = _pool("x", str(key) not in RAW_LATENT_KEYS), "x池"
+        if _xextra <= 0:
+            return tensor
+        extra = _pool("x", str(key) not in RAW_LATENT_KEYS)
+        what = "x池"
+        _memx = _x_memory_slots(window)
+        if extra is not None and _memx > 0:
+            _bs = list(extra.shape)
+            _bs[t_dim] = _memx
+            _gx = torch.Generator(device="cpu").manual_seed(_ANCHOR_NOISE_SEED + 1)
+            _bn = torch.randn(_bs, generator=_gx, device="cpu", dtype=torch.float32).to(extra.device, extra.dtype)
+            extra = torch.cat([extra, _bn], dim=int(t_dim))
+            what = "x池+记忆空白"
 
     if extra is None:
         stats["skipped"].append(f"{key}({ch}ch,长{cur})")
@@ -990,45 +1202,52 @@ def _prepend_one_cond(key, tensor, window, slice_len, frames_len, prefix_len, st
     if new_t is not tensor:
         stats["extended"].append(f"{key}({what})")
         _log_once(("stream", key, what),
-                  "[ContextAnchor] 已把锚定 %d 帧插入条件流 '%s'（%dch, 长 %d → %d，%s）",
-                  _ANCHOR_COUNT, key, ch, cur, int(new_t.shape[t_dim]), what)
+                  "[ContextAnchor] 已把锚定 %d 帧插入条件流 '%s'（%dch, 长 %d → %d，%s；x_prefix=%s）",
+                  int(new_t.shape[t_dim]) - int(cur), key, ch, cur, int(new_t.shape[t_dim]), what, _X_PREFIX)
     return new_t
 
 
 def _log_anchor_layout(window, resized_cond, dim: int) -> None:
     """诊断：打印本窗口的条件流布局 + 「锚段 vs 窗口自身帧」统计（**空间自检**）。
 
-    关键读数：**锚段与窗口自身驱动帧应当同尺度**（mean/std 同数量级）。
-    若锚段 std 是窗口帧的 2~3 倍且带直流偏移 ⇒ 锚定池没走到模型空间 ⇒ 锚帧无法当「共同基准」。
+    · **默认档**：每个片段**只打 1 行/窗**（几何是固定的）——`锚=kx 头只读=hd 切片=a..b(n帧) plan=… ｜ 流: k=len …`
+    · **详细档**（`CWA_DEBUG_VERBOSE=1`）：再打每路流的 ch/统计与锚段自检。
+    关键读数：**锚段与窗口自身驱动帧应当同尺度**（mean/std 同数量级）；若锚段 std 是窗口帧的 2~3 倍
+    且带直流偏移 ⇒ 锚定池没走到模型空间 ⇒ 锚帧无法当「共同基准」。
     """
     plan = getattr(window, "_anchor_plan", None) or {}
     kx = int(getattr(window, "anchor_latent_count", 0) or 0)
     orig = list(getattr(window, "original_indices", None) or [])
-    _dbg("[ContextAnchor][diag] 窗 %s：x 侧锚=%d 帧 | plan=%s | 头只读=%d | index_list=%s / 共 %d 帧",
-         _win_range(window), kx, plan,
-         len(getattr(window, "head_extra_indices", None) or []),
-         [int(i) for i in (getattr(window, "index_list", None) or [])][:3],
-         len(getattr(window, "index_list", None) or []))
-    if not resized_cond:
-        return
-    for actual in resized_cond:
-        if not isinstance(actual, dict):
-            continue
-        for key, value in actual.items():
-            if not isinstance(value, dict):
+    hd = len(getattr(window, "head_extra_indices", None) or [])
+    idx = [int(i) for i in (getattr(window, "index_list", None) or [])]
+
+    lens, detail = [], []
+    if resized_cond:
+        for actual in resized_cond:
+            if not isinstance(actual, dict):
                 continue
-            for sk, sv in value.items():
-                t = _cond_tensor(sv)
-                if t is None or t.ndim < 3:
+            for key, value in actual.items():
+                if not isinstance(value, dict):
                     continue
-                td = _temporal_dim(t)
-                n = int(t.shape[td])
-                _dbg("[ContextAnchor][diag]   流 '%s': len=%d ch=%d（窗口帧=%d, 额外=%+d）%s",
-                     sk, n, int(t.shape[1]), len(orig), n - len(orig), _stat_str(t))
-                if sk in ANCHOR_POSE_KEYS and kx > 0 and n > kx:
-                    _dbg("[ContextAnchor][diag]     ↳ 锚段自检 '%s'：前 %d 帧 %s ｜ 后 %d 帧 %s",
-                         sk, kx, _stat_str(_slice_frames(t, td, slice(0, kx))),
-                         kx, _stat_str(_slice_frames(t, td, slice(n - kx, n))))
+                for sk, sv in value.items():
+                    t = _cond_tensor(sv)
+                    if t is None or t.ndim < 3:
+                        continue
+                    td = _temporal_dim(t)
+                    n = int(t.shape[td])
+                    lens.append("%s=%d" % (sk, n))
+                    detail.append("    流 '%s': len=%d ch=%d（窗口帧=%d, 额外=%+d）%s"
+                                  % (sk, n, int(t.shape[1]), len(orig), n - len(orig), _stat_str(t)))
+                    if sk in ANCHOR_POSE_KEYS and kx > 0 and n > kx:
+                        detail.append("      ↳ 锚段自检 '%s'：前 %d 帧 %s ｜ 后 %d 帧 %s"
+                                      % (sk, kx, _stat_str(_slice_frames(t, td, slice(0, kx))),
+                                         kx, _stat_str(_slice_frames(t, td, slice(n - kx, n)))))
+    _dbg_once(("layout", _win_range(window), tuple(idx)),
+              "[ContextAnchor][diag] 窗 %s：锚=%d 头只读=%d 切片=%s..%s（%d 帧）plan=%s ｜ 流: %s",
+              _win_range(window), kx, hd, idx[0] if idx else -1, idx[-1] if idx else -1, len(idx),
+              plan, " ".join(lens))
+    if detail:
+        _dbg_v("[ContextAnchor][diag] 窗 %s 的逐流细节：\n%s", _win_range(window), "\n".join(detail))
 
 
 def inject_anchor_conds(window, resized_cond, x_in=None, dim: int = 2, only_pose: bool = False, full_pose=None):
@@ -1039,8 +1258,10 @@ def inject_anchor_conds(window, resized_cond, x_in=None, dim: int = 2, only_pose
     """
     if resized_cond is None or not _anchor_on(window) or not anchor_active():
         if _DEBUG and getattr(window, "_anchor_skip", False):
-            _dbg("[ContextAnchor][diag] 窗 %s 已跳过锚定（anchor_scope=fresh_only：含接续帧钉住区）",
-                 _win_range(window))
+            # 默认档：该跳过是"本片段的属性" ⇒ 只打一次（旧实现每步重复两遍）
+            _dbg_once(("anchor_skip", _win_range(window)),
+                      "[ContextAnchor][diag] 窗 %s 已跳过锚定（anchor_scope=fresh_only：含接续帧钉住区）",
+                      _win_range(window))
         return resized_cond
     slice_len, frames_len = _window_lengths(window, dim)
     prefix_len = int(getattr(window, "prefix_length", 0) or 0)
@@ -1139,26 +1360,64 @@ def prepend_anchor_mask(window, tensor, t_dim: int, insert_at=None, is_driving_m
     plan = getattr(window, "_anchor_plan", None) or {}
     head_n = int(plan.get("head", 0) or 0)
     out = tensor
-    if head_n > 0:
-        extra = _mask_pool_frames(tensor, t_dim, head_n)
+    # ★ 2026-10-11：与 x 对齐的那路（is_driving_mask=False）必须跟随 x_prefix（none => 不插）
+    _xhead = head_n if is_driving_mask else (0 if _X_PREFIX == "none" else head_n)
+    if head_n > 0 and _xhead > 0:
+        extra = _mask_pool_frames(tensor, t_dim, _xhead)
         if extra is not None:
             pos = 0 if insert_at is None else int(insert_at)
             out = _insert_at(out, extra, int(t_dim), pos)
+    # ★ 2026-10-11 x_prefix=anchor_memory：x 侧的记忆空白槽 ⇒ 掩码必须同位置补 0（逐 token 对齐）
+    _xmemo = _x_memory_slots(window)
+    if _xmemo > 0 and not is_driving_mask:
+        _zs = list(out.shape)
+        _zs[int(t_dim)] = _xmemo
+        out = _insert_at(out, torch.zeros(_zs, device=out.device, dtype=out.dtype),
+                         int(t_dim), (0 if insert_at is None else int(insert_at)) + head_n)
     # 尾部额外 token 只属于「驱动流」（与驱动 token 一一对应）；
     # ref 掩码是与视频帧对齐的流，不能带尾部历史帧（否则长度对不上会崩）。
     tail = _tail_mask_extra(window, out, t_dim) if is_driving_mask else None
     if tail is not None:
         out = _insert_at(out, tail, int(t_dim), int(out.shape[t_dim]))
+    # ★ 记忆帧的 0 遮罩与驱动流【同序】（必须与 _prepend_one_cond 的顺序一致）：
+    #   context = [记忆][锚][本窗] ⇒ 0 遮罩插在最前 (pos 0)
+    #   leading = [锚][记忆][本窗] ⇒ 0 遮罩插在锚之后 (pos = head_n)
+    head_zero = int(plan.get("head_zero", 0) or 0)
+    if head_zero > 0 and is_driving_mask:
+        _zpos = int(head_n) if str(getattr(window, "anchor_slot", "context")) != "context" else 0
+        zshape = list(out.shape)
+        zshape[int(t_dim)] = head_zero
+        out = _insert_at(out, torch.zeros(zshape, device=out.device, dtype=out.dtype),
+                         int(t_dim), _zpos)
     if out is not tensor:
         pool = _get_pool("mask", tensor.shape[-2], tensor.shape[-1],
                          device=tensor.device, dtype=tensor.dtype)
         if pool is not None:
             window.anchor_mask_latent = pool
-        _log_once(("mask_inject", int(t_dim)),
-                  "[ContextAnchor] 掩码流已按方案扩流（dim=%d, 前插=%d, 尾部锚=%d, 尾部历史=%d）：%s → %s",
-                  int(t_dim), head_n,
-                  int(plan.get("tail_pool", 0) or 0), int(plan.get("tail_zero", 0) or 0),
+        # ★ 日志 key 必须带上「哪一路流」：t_dim 相同的两路（sam_latents / ref_mask_latents）此前会互相吞日志，
+        #   排查时必然漏看一路（而且旧文案会把"被跳过的尾部历史"也打出来，容易误判"插了"）。
+        _log_once(("mask_inject", int(t_dim), bool(is_driving_mask),
+                   -1 if insert_at is None else int(insert_at)),
+                  "[ContextAnchor] 掩码流已扩流（dim=%d, 流=%s, 前插锚=%d, 前插历史0=%d, 尾部锚=%d, 尾部历史0=%d）：%s → %s",
+                  int(t_dim), "驱动遮罩" if is_driving_mask else "与视频帧对齐的 ref 掩码",
+                  head_n, (head_zero if is_driving_mask else 0),
+                  (int(plan.get("tail_pool", 0) or 0) if is_driving_mask else 0),
+                  (int(plan.get("tail_zero", 0) or 0) if is_driving_mask else 0),
                   list(tensor.shape), list(out.shape))
+    # ★ 一致性自检（本轮新增）：SCAIL 的驱动遮罩是**逐 token** 加进驱动流的 ⇒ 必须与驱动流**同帧数**。
+    #   不一致 = 静默错位（画面莫名变差却没有任何报错）⇒ 这一条必须吵出来，不能吞。
+    _dtok = int(getattr(window, "_driving_tokens", 0) or 0)
+    if is_driving_mask and _dtok:
+        _cur = int(out.shape[int(t_dim)])
+        if _cur != _dtok:
+            logging.warning(
+                "[ContextAnchor] ! 一致性检查失败：驱动流 token=%d，但驱动遮罩 token=%d"
+                "（SCAIL 要求二者同帧数）=> 驱动遮罩可能与驱动流错位。"
+                "请检查 anchor_scope / overlap_scope / memory_position 与该调度是否匹配。", _dtok, _cur)
+        else:
+            # 默认档：这个等式是"本片段的属性" ⇒ 每路流只打一次
+            _dbg_once(("consist_ok", int(t_dim)),
+                      "[ContextAnchor][diag] 一致性检查通过：驱动流 = 驱动遮罩 = %d token", _cur)
     return out
 
 
@@ -1222,7 +1481,15 @@ def _apply_scail_anchor_rope_patch():
 
     reinstalled = bool(_SCAIL_ANCHOR_ROPE_PATCH_APPLIED)
     try:
-        base_rope = _mod.WanModel.rope_encode            # 基础实现（含 _scail_rope_downsample 支持）
+        # ★★ 绝不"捕获"base：MultiRef 等插件可能在**我们安装之后**才给 `WanModel.rope_encode` 打补丁
+        #    （"pose 分支的空间 RoPE 下采样"恰好在那一层）。一旦捕获成变量，我们就被永久钉在**旧实现**上：
+        #    ⇒ pose 的 RoPE 下采样丢失 ⇒ 姿态条件空间错位 ⇒ **动作连贯性崩掉，且没有任何报错**。
+        #    历史教训：A1 让 MultiRef "跳过 SCAIL 级覆盖"后，不再发生"覆盖→自愈→重新捕获"的循环，
+        #    于是这个过期引用被永久保留 ⇒ 整条链路动作崩掉（换个种子/几何/参数都救不回来）。
+        #    ⇒ 改为**调用时解析**（与 MultiRef 内部写法一致）⇒ 顺序无关、热重载也自愈。
+        def base_rope(*a, **kw):
+            return _mod.WanModel.rope_encode(*a, **kw)
+
         _orig_scail_rope = _mod.SCAILWanModel.rope_encode
 
         def _call_orig(args):
@@ -1238,7 +1505,8 @@ def _apply_scail_anchor_rope_patch():
                                 ref_mask_flag=None, transformer_options={}):
             args = (self, t, h, w, t_start, steps_t, steps_h, steps_w, device, dtype,
                     pose_latents, reference_latent, ref_mask_flag, transformer_options)
-            plan = _window_rope_plan((transformer_options or {}).get("context_window", None))
+            _win = (transformer_options or {}).get("context_window", None)
+            plan = _window_rope_plan(_win)
             if plan is None or pose_latents is None or t_start != 0 \
                     or (ref_mask_flag is not None and not bool(ref_mask_flag)):
                 return _call_orig(args)
@@ -1253,32 +1521,133 @@ def _apply_scail_anchor_rope_patch():
                 if reference_latent is not None:
                     ref_t_patches = (reference_latent.shape[2] + (self.patch_size[0] // 2)) // self.patch_size[0]
 
-                main_freqs = base_rope(self, t, h, w, t_start=t_start, steps_t=steps_t, steps_h=steps_h,
-                                       steps_w=steps_w, device=device, dtype=dtype,
-                                       transformer_options=transformer_options)
+                # ★★ anchor_slot=aligned：x 段必须与 pose 用【同一套时间码】（只改取码，不改 token 数）
+                #   物理：x = [锚][本窗]（与 pose 的 [锚][记忆][窗] 对应）；码：锚紧随窗口之前、宽 S 平移保非负。
+                #   ⇒ 不做这一步，两流相位就错开 —— 这正是「只改顺序、没同步 x」退化的根因。
+                #   ⚠️ 仅在 caller 未传 steps_*（默认）时拆分；传了就保持原样，避免把两张网格混用。
+                _slot = str(getattr(_win, "anchor_slot", _ANCHOR_SLOT) or _ANCHOR_SLOT)
+                _MODE = _slot if _slot in ("leading", "shifted", "aligned") else "context"
+                if _MODE != "context" and (steps_t is not None or pre <= 0):
+                    _log_once(("slot_fallback", _MODE),
+                              "[ContextAnchor] anchor_slot=%s 已退回 context（原因：%s）"
+                              " => 本次档位【未生效】，不要据此下结论",
+                              _MODE, ("调用方传了 steps_t" if steps_t is not None else "本窗无锚帧(pre=0)"))
+                    _MODE = "context"
+                _xk = int(getattr(_win, "anchor_latent_count", 0) or 0)
+                _xm = _x_memory_slots(_win)
+                _fx = int(t) - _xk - _xm
+                _span_x = stride * _xm - (stride - 1) if _xm > 0 else 0
+                _S = 0
+                _xw = t_start + ref_t_patches
+                _p_win = _xw
+                if _MODE in ("shifted", "aligned"):
+                    for _cand in range(0, 8192):        # 求最小非负平移量（暴力，直观不会算错）
+                        if _MODE == "aligned":
+                            _starts = (t_start + pre + _cand - pre,
+                                       t_start + pre + _cand - pre - _span_x,
+                                       t_start + pre + _cand + 1 - pre,
+                                       t_start + pre + _cand + 1 - pre - stride * mem)
+                        else:
+                            _starts = (t_start + ref_t_patches - pre + _cand,
+                                       t_start + ref_t_patches - pre - stride * _xm + _cand,
+                                       t_start + ref_t_patches - pre - stride * mem + _cand)
+                        if min(_starts) >= 0:
+                            break
+                    _S = _cand
+                    _xw = t_start + pre + _S                    # 基线关系：x 窗口紧随锚之后
+                    _p_win = _xw + ref_t_patches                 # 训练约定：pose 比 x 晚 ref_t_patches（切勿写死）
+                _log_once(("slot_mode", _MODE),
+                          "[ContextAnchor] anchor_slot=%s（x 窗口 ts=%d，pose 窗口 ts=%d，非负平移 S=%d）",
+                          _MODE, int(_xw), int(_p_win), int(_S))
+                x_parts = None
+                if _MODE != "context" and _X_PREFIX != "none" and _fx > 0 and (_xk > 0 or _xm > 0):
+                    if True:
+                        x_parts = []
+                        if _xk > 0:
+                            x_parts.append(base_rope(self, _xk, h, w, t_start=_xw - pre,
+                                                     steps_t=_xk, steps_h=steps_h, steps_w=steps_w,
+                                                     device=device, dtype=dtype,
+                                                     transformer_options=transformer_options))
+                        if _xm > 0:
+                            _xspan = _span_x
+                            x_parts.append(base_rope(self, _xspan, h, w,
+                                                     t_start=_xw - pre - _span_x,
+                                                     steps_t=_xm, steps_h=steps_h, steps_w=steps_w,
+                                                     device=device, dtype=dtype,
+                                                     transformer_options=transformer_options))
+                        x_parts.append(base_rope(self, _fx, h, w, t_start=_xw,
+                                                 steps_t=None, steps_h=steps_h, steps_w=steps_w,
+                                                 device=device, dtype=dtype,
+                                                 transformer_options=transformer_options))
+                main_freqs = None
+                if x_parts is None:      # aligned 时由 x_parts 取代（不重复算 x 段）
+                    main_freqs = base_rope(self, t, h, w, t_start=t_start, steps_t=steps_t, steps_h=steps_h,
+                                           steps_w=steps_w, device=device, dtype=dtype,
+                                           transformer_options=transformer_options)
                 pose_tf = {"rope_options": {"shift_y": 0.0, "shift_x": _SCAIL_POSE_SHIFT_X,
                                             "scale_y": 1.0, "scale_x": 1.0},
                            "_scail_rope_downsample": True}
-                parts = [base_rope(self, F_main, H_pose, W_pose, t_start=t_start + ref_t_patches,
-                                   device=device, dtype=dtype, transformer_options=pose_tf)]
+                main_block = base_rope(self, F_main, H_pose, W_pose, t_start=_p_win,
+                                       device=device, dtype=dtype, transformer_options=pose_tf)
+
+                pre_block = None
                 if pre > 0:
                     # 紧邻本窗之前：N_ref-K .. N_ref-1（步长 1）
-                    parts.append(base_rope(self, pre, H_pose, W_pose,
-                                           t_start=t_start + ref_t_patches - pre, steps_t=pre,
-                                           device=device, dtype=dtype, transformer_options=pose_tf))
+                    pre_block = base_rope(self, pre, H_pose, W_pose,
+                                          t_start=_p_win - pre, steps_t=pre,
+                                          device=device, dtype=dtype, transformer_options=pose_tf)
+                mem_block = None
                 if mem > 0:
                     # 更早的低帧率历史：间距 = stride（不占用任何视频帧的位置）
-                    span = stride * mem - (stride - 1)
-                    start = t_start + ref_t_patches - pre - stride * mem
-                    parts.append(base_rope(self, span, H_pose, W_pose, t_start=start, steps_t=mem,
-                                           device=device, dtype=dtype, transformer_options=pose_tf))
+                    # memory_order=contig_mem_anc：记忆做成连续块并置于锚之前（锚仍紧邻窗口）= 合成锚
+                    _mo = str(getattr(_win, "memory_order", _MEMORY_ORDER) or _MEMORY_ORDER)
+                    if _mo == "contig_mem_anc" and _MODE == "aligned":
+                        span = mem
+                        start = _p_win - pre - mem
+                    elif _mo == "contig_anc_mem" and _MODE == "aligned":
+                        span = mem
+                        start = _p_win - mem
+                    elif _mo == "sparse_after_anc" and _MODE == "aligned":
+                        span = stride * mem - (stride - 1)
+                        start = _p_win - span       # 稀疏但紧贴窗口；锚已被后移 span
+                    else:
+                        span = stride * mem - (stride - 1)
+                        start = _p_win - pre - stride * mem
+                    mem_block = base_rope(self, span, H_pose, W_pose, t_start=start, steps_t=mem,
+                                          device=device, dtype=dtype, transformer_options=pose_tf)
+                # ★★ 分块顺序必须与【物理摆放】严格一致（时间码一字不改，只换顺序）：
+                #   tail（默认）：物理 [本窗驱动][锚][历史]          => 频率 [主][锚][历史]
+                #   head        ：物理 [历史][本窗驱动(含锚)]        => 频率 [历史][主][锚]
+                #   若顺序与物理不符 => 每个 token 拿到**别人的时间码** => 静默错位（效果变差且无报错）。
+                mem_at_head = bool(getattr(_win, "anchor_memory_at_head", False))
+                if _MODE != "context" and pre_block is not None:
+                    # ★ anchor_slot=leading：物理 [锚][记忆][本窗] => 频率 [锚(pre)][记忆][主块]
+                    parts = [pre_block]
+                    if mem_block is not None:
+                        parts.append(mem_block)
+                    parts.append(main_block)
+                elif mem_at_head and mem_block is not None:
+                    # context 档：物理 [记忆][锚+窗] => 频率 [历史][主块(含锚)]
+                    parts = [mem_block, main_block]
+                    if pre_block is not None:
+                        parts.append(pre_block)
+                else:
+                    parts = [main_block]
+                    if pre_block is not None:
+                        parts.append(pre_block)
+                    if mem_block is not None:
+                        parts.append(mem_block)
                 _log_once(("rope_slots",),
-                          "[ContextAnchor] RoPE 位置补丁生效：本窗驱动 %d 帧同位配对；"
+                          "[ContextAnchor] RoPE 位置补丁生效（摆放=%s，slot=%s%s）：本窗驱动 %d 帧同位配对；"
                           "锚帧 %d 帧放在窗口之前（t=%d..%d）；低帧率历史 %d 帧（间距 %d，t=%d..%d）",
+                          "记忆在最前" if mem_at_head else "记忆在尾部", _slot,
+                          "，x 段已同步（[x锚][x记忆][x窗]）" if x_parts is not None else "",
                           F_main, pre,
                           ref_t_patches - pre, ref_t_patches - 1,
                           mem, stride,
                           ref_t_patches - pre - stride * mem, ref_t_patches - pre - stride)
+                if x_parts is not None:
+                    return torch.cat(x_parts + parts, dim=1)
                 return torch.cat([main_freqs] + parts, dim=1)
             except Exception:
                 logging.exception("[ContextAnchor] RoPE 位置补丁失败，本窗口回退为默认位置")
@@ -1288,10 +1657,28 @@ def _apply_scail_anchor_rope_patch():
         _patched_scail_rope._cwa_rope_patch = True       # 自愈标记：识别「这就是本补丁」
         _SCAIL_ANCHOR_ROPE_PATCH_APPLIED = True
         if reinstalled:
+            # ★ 把「被顶掉时的所有者」直接写进日志：本轮排查花了很久才确认凶手是 MultiRef，
+            #   以后一眼可见（`_orig_scail_rope` 正是"当时覆盖我们的那个函数"）。
+            _owner = "%s.%s" % (getattr(_orig_scail_rope, "__module__", "?"),
+                                getattr(_orig_scail_rope, "__qualname__",
+                                        getattr(_orig_scail_rope, "__name__", "?")))
             logging.warning("[ContextAnchor] RoPE 位置补丁此前被覆盖/丢失，现已重新安装。"
-                            "（如非预期，建议重启 ComfyUI 排除其它补丁干扰）")
+                            "（被顶掉时的所有者 = %s => 若来自其它插件，请检查它与 anchor 的补丁顺序："
+                            "本补丁会被静默顶掉，导致额外 token 被当成「窗口之后的未来驱动」而位置错、无报错）",
+                            _owner)
         else:
             logging.info("[ContextAnchor] SCAIL RoPE 位置补丁已应用（额外驱动 token 放在「窗口之前」）")
+        # ★ 指纹：把「base / SCAIL 各自由谁实现」打出来 ⇒ 顺序类问题一眼可见（含"谁最后打的补丁"）。
+        try:
+            _b = getattr(_mod.WanModel, "rope_encode", None)
+            _s = getattr(_mod.SCAILWanModel, "rope_encode", None)
+            logging.info("[ContextAnchor] RoPE 补丁指纹：base=%s.%s ｜ SCAIL=%s（本补丁=%s）"
+                         "；base 是【调用时解析】的 => 之后谁再给 base 打补丁也照样生效",
+                         getattr(_b, "__module__", "?"), getattr(_b, "__qualname__", "?"),
+                         getattr(_s, "__qualname__", "?"),
+                         bool(getattr(_s, "_cwa_rope_patch", False)))
+        except Exception:
+            pass
     except Exception as e:
         logging.warning("[ContextAnchor] 无法应用 RoPE 位置补丁：%s", e)
 
@@ -1362,7 +1749,7 @@ def apply_window_extras(handler, windows, cfg: AnchorConfig) -> None:
             else:
                 if read_only_overlap:
                     logging.warning("[ContextAnchor] overlap_scope=single：窗 %s 的只读重叠段不连续"
-                                    "（%s…）⇒ 本窗保持共写（保守回退）",
+                                    "（%s…）=> 本窗保持共写（保守回退）",
                                     _win_range(window), read_only_overlap[:8])
                 read_only_overlap = []
 
@@ -1394,11 +1781,12 @@ def apply_window_extras(handler, windows, cfg: AnchorConfig) -> None:
             claimed |= set(original) | set(read_only_overlap)
 
         if cfg.log_debug:
-            logging.info(
-                "[ContextAnchor] 窗口帧 %d..%d → 写入 %s（切片 %s）| 前缀=%d 只读前文=%d 后延伸=%d",
-                lo, hi, f"{min(original)}..{max(original)}",
-                f"{window.index_list[0]}..{window.index_list[-1]}",
-                len(prefix), len(window.head_extra_indices), len(tail_halo))
+            # 几何是固定的 ⇒ 每个片段只打一次（旧实现每步重打 4 行，纯重复）
+            _dbg_once(("winextra", min(original), max(original)),
+                      "[ContextAnchor] 窗口帧 %d..%d → 写入 %d..%d（切片 %d..%d）| 前缀=%d 只读前文=%d 后延伸=%d",
+                      lo, hi, min(original), max(original),
+                      window.index_list[0], window.index_list[-1],
+                      len(prefix), len(window.head_extra_indices), len(tail_halo))
 
     # 安全网：single 模式下「被写入的帧」必须与改写前被拥有的帧**不重不漏**
     if single:
@@ -1410,7 +1798,7 @@ def apply_window_extras(handler, windows, cfg: AnchorConfig) -> None:
                 covered_new.add(i)
         if dup or covered_new != covered_old:
             logging.warning("[ContextAnchor] overlap_scope=single 写入范围校验失败"
-                            "（漏=%s 多=%s 重复=%s）⇒ 本步回退为 average（重叠共写）",
+                            "（漏=%s 多=%s 重复=%s）=> 本步回退为 average（重叠共写）",
                             sorted(covered_old - covered_new)[:8],
                             sorted(covered_new - covered_old)[:8], dup)
             for window, idx, head, tail, orig, clen in snapshot:
@@ -1456,7 +1844,7 @@ def _diag_combine(handler, x_in, sub_conds_out, sub_conds, window, window_idx,
 
     `overlap_scope=single` 时，后一窗对这些帧是"只读前文"⇒ 同一比较就是**续写一致性**。
 
-    位置映射：模型输出长度 = 锚帧数 + len(window.index_list)（锚帧前插在最前）⇒
+    位置映射：模型输出长度 = 锚帧数 + x 侧记忆空白槽数 M + len(window.index_list)⇒
     `pos(f) = k_anchor + index_list.index(f)`（对「共写」与「只读」两种模式都成立）。
     """
     if not _DEBUG:
@@ -1471,12 +1859,14 @@ def _diag_combine(handler, x_in, sub_conds_out, sub_conds, window, window_idx,
             return
         k_anchor = int(getattr(window, "anchor_latent_count", 0) or 0)
         total = int(out.shape[dim])
-        if total != k_anchor + len(idx_list):
+        k_xmem = _x_memory_slots(window)          # x_prefix=anchor_memory 时 x 侧还有 M 个记忆空白槽
+        base = k_anchor + k_xmem
+        if total != base + len(idx_list):
             _dbg("[ContextAnchor][diag] 窗#%d 输出长度 %d ≠ 锚%d+切片%d，跳过分歧审计",
-                 window_idx, total, k_anchor, len(idx_list))
+                 window_idx, total, k_anchor, k_xmem, len(idx_list))
             return
         cur = out.detach().float().cpu()
-        pos = {f: k_anchor + i for i, f in enumerate(idx_list)}
+        pos = {f: base + i for i, f in enumerate(idx_list)}
         prev = _DIAG.get("prev_out")
         _DIAG["prev_out"] = (window_idx, pos, cur)
         if prev is None:
@@ -1517,14 +1907,14 @@ def _diag_combine(handler, x_in, sub_conds_out, sub_conds, window, window_idx,
             mb_all = torch.cat(v_prev, dim=dim)
             dm = float((ma_all - mb_all).abs().mean())
             mref = 0.5 * (float(ma_all.abs().mean()) + float(mb_all.abs().mean())) + 1e-6
-            motion_txt = (f"动作:|Δ动作|均={dm:.4f}（每帧动作量={mref:.4f}，比值={dm / mref:.3f}）"
-                          f" 逐帧={[round(v, 3) for v in per_frame_mot]}")
+            motion_txt = (f"动作比值={dm / mref:.3f}（|Δ动作|均={dm:.4f} / 每帧动作量={mref:.4f}）")
         mode = "只读前文→续写一致性" if _OVERLAP_SCOPE == "single" else "重叠区共写"
-        _dbg("[ContextAnchor][diag] σ=%.3f 窗#%d↔#%d 共 %d 帧（%s）%d..%d："
-             "level:|Δ|均=%.4f p95=%.4f 相对=%.3f 逐帧=%s | %s",
+        # 默认档：**每步×每缝一行**（只留关键比率，便于整段复制）；逐帧列表进详细档
+        _dbg("[ContextAnchor][diag] σ=%.3f 窗#%d↔#%d %d 帧（%s）%d..%d：level 相对=%.3f ｜ %s",
              sigma, p_idx, window_idx, len(shared), mode, shared[0], shared[-1],
-             level_mean, level_p95, level_mean / ref_val,
-             [round(v, 3) for v in per_frame], motion_txt)
+             level_mean / ref_val, motion_txt)
+        _dbg_v("[ContextAnchor][diag]   （详细）σ=%.3f 窗#%d↔#%d：level |Δ|均=%.4f p95=%.4f 逐帧=%s",
+               sigma, p_idx, window_idx, level_mean, level_p95, [round(v, 3) for v in per_frame])
     except Exception:
         logging.debug("[ContextAnchor] 重叠区诊断失败（忽略）", exc_info=True)
 
@@ -1568,8 +1958,11 @@ def _make_get_context_windows(handler, cfg: AnchorConfig):
                 for w in windows:
                     w._anchor_active = True    # 运行期标记：绕过本节点时窗口上没有该标记
                 apply_window_extras(handler, windows, cfg)
-                logging.info("[ContextAnchor] %s｜窗口边界: %s",
-                             _sigma_step_str(handler, model_options), describe_windows(windows))
+                # 2026-10-15 降噪：窗口几何每步都一样（实测这一条重复行占全日志 2%）
+                #   => info 只打一次（每片段一次）；需要逐步的 σ 对照时开诊断档（debug_log / CWA_DEBUG=1）
+                _log_once(("bounds",), "[ContextAnchor] 窗口边界: %s", describe_windows(windows))
+                _dbg("[ContextAnchor] %s｜窗口边界: %s",
+                     _sigma_step_str(handler, model_options), describe_windows(windows))
             except Exception:
                 logging.exception("[ContextAnchor] 窗口改写失败，本步回退为原始窗口")
             return windows
@@ -1607,6 +2000,18 @@ def _make_execute(cfg: AnchorConfig, dim: int):
     """
     def factory(next_call):
         def execute(calc_cond_batch, model, conds, x_in, timestep, model_options):
+            # ★★ 每个采样步开头做两件事（与"是否有锚帧/是否 driving_only"无关，必须先做）：
+            #   1) 从 per-model cfg 刷新模块全局 —— 免疫「节点被缓存 ⇒ reset_pools 不执行 ⇒ 读到上一次的残留值」
+            #   2) 确保 RoPE 补丁在最外层 —— 被别的插件（如 MultiRef）顶掉时立刻重装 + 告警
+            #      （静默失效会让额外 token 被当成「窗口之后的未来驱动」⇒ 位置错却无报错）
+            try:
+                _apply_cfg_to_globals(cfg)
+            except Exception:
+                logging.exception("[ContextAnchor] 每步刷新参数失败（忽略，沿用当前值）")
+            try:
+                _apply_scail_anchor_rope_patch()
+            except Exception:
+                logging.exception("[ContextAnchor] 每步检查 RoPE 补丁失败（忽略）")
             if cfg.anchor_frames is None or cfg.driving_only:
                 return next_call(calc_cond_batch, model, conds, x_in, timestep, model_options)
             try:
@@ -1615,6 +2020,9 @@ def _make_execute(cfg: AnchorConfig, dim: int):
                 sigma = 0.0
 
             def calc_cond_batch_wrapped(m, c, sub_x, ts, mo, **kw):
+                # ⚠️ 历史教训（2026-10-12）：任何「整步跳过锚定」的开关都不能加在这一层 ——
+                #    这里只覆盖 x 侧，挡不住【更早发生的条件流注入】⇒ 两流长度不一致 ⇒ 崩（当时已回退）。
+                #    （该实验开关 anchor_curve 已于 2026-10-13 移除：两轮实测"任何少锚"都更差。）
                 extended = inject_anchor_x(mo, sub_x, dim=dim, sigma=sigma)
                 out = calc_cond_batch(m, c, extended, ts, mo, **kw)
                 _capture_anchor_x0(mo, extended, sub_x, out, dim)
@@ -1623,6 +2031,59 @@ def _make_execute(cfg: AnchorConfig, dim: int):
             return next_call(calc_cond_batch_wrapped, model, conds, x_in, timestep, model_options)
         return execute
     return factory
+
+
+def _apply_cfg_to_globals(cfg) -> None:
+    """把 per-model 的 `AnchorConfig` 刷进模块级参数 —— **每个采样步开头调用**。
+
+    为什么必须这样做（本轮发现的结构性隐患）：
+      这些参数原先只存在**模块全局**里，而 ComfyUI 会**缓存节点** ⇒ 节点被缓存时
+      `apply_anchor`/`reset_pools` 都不执行 ⇒ 采样期读到的是**上一次执行残留的值**。
+      最危险的是四个「只存在全局」的开关（anchor_scope / shared_head / overlap_scope /
+      memory_position）：换工作流/换运行就可能串味，而且**在元数据里完全看不出来**。
+      现在它们也进了 cfg，并在每步开头刷新 ⇒ 免疫缓存与执行顺序。
+    """
+    global _ANCHOR_COUNT, _DRIVING_ONLY, _MEMORY_FRAMES, _MEMORY_STRIDE, _MEMORY_POSITION
+    global _ANCHOR_FIXED, _ANCHOR_IMAGE_BLANK, _ANCHOR_SCOPE, _SHARED_HEAD_MODE, _OVERLAP_SCOPE
+    global _X_PREFIX, _DRIVE_MEMORY, _ANCHOR_SLOT, _MEMORY_ORDER
+    if cfg is None:
+        return
+    _DRIVING_ONLY = bool(cfg.driving_only)
+    _MEMORY_FRAMES = max(0, int(cfg.memory_frames or 0))
+    _MEMORY_STRIDE = max(0, int(cfg.memory_stride if cfg.memory_stride is not None else 0))
+    _MEMORY_POSITION = (str(cfg.memory_position) if str(cfg.memory_position) in ("tail", "head") else "tail")
+    _ANCHOR_FIXED = bool(cfg.anchor_fixed)
+    _ANCHOR_IMAGE_BLANK = bool(cfg.anchor_image_blank)
+    _ANCHOR_SCOPE = (str(cfg.anchor_scope) if str(cfg.anchor_scope) in ("fresh_only", "all") else "fresh_only")
+    _SHARED_HEAD_MODE = (str(cfg.shared_head) if str(cfg.shared_head) in ("off", "leader", "consensus") else "off")
+    _OVERLAP_SCOPE = "average"      # 2026-10-12：single 实测会跳 ⇒ 控件已移除、固定 average
+    _X_PREFIX = (str(getattr(cfg, "x_prefix", "anchor_only"))
+                if str(getattr(cfg, "x_prefix", "anchor_only")) in ("anchor_only", "anchor_memory", "none") else "anchor_only")
+    # A/B 开关：16ch 驱动流是否接收记忆帧（环境变量 CWA_DRIVE_MEMORY=0 可强制关，用于旧行为对照）
+    _DRIVE_MEMORY = (str(getattr(cfg, "drive_memory", "on"))
+                     if str(getattr(cfg, "drive_memory", "on")) in ("on", "off") else "on")
+    _ANCHOR_SLOT = (str(getattr(cfg, "anchor_slot", "context"))
+                    if str(getattr(cfg, "anchor_slot", "context")) in ("context", "aligned") else "context")
+    _MEMORY_ORDER = (str(getattr(cfg, "memory_order", "sparse"))
+                     if str(getattr(cfg, "memory_order", "sparse")) in ("sparse",) else "sparse")
+    # 池源若**不是同一个对象**（= 换了一次运行/被缓存复用到了别的素材）⇒ 必须清缓存，否则会用错锚帧
+    if _POOL_SOURCE.get("frames") is not cfg.anchor_frames or _POOL_SOURCE.get("vae") is not cfg.vae:
+        _POOL_CACHE.clear()
+        _POOL_SOURCE.update(frames=cfg.anchor_frames, mask_frames=cfg.anchor_mask_frames, vae=cfg.vae)
+    _ANCHOR_COUNT = latent_frames_of(cfg.anchor_frames.shape[0]) if cfg.anchor_frames is not None else 0
+
+
+def _record_driving_tokens(window, tensor, t_dim: int) -> None:
+    """记录「驱动流」的 token 数（时间维长度），供掩码侧做一致性自检（见 `prepend_anchor_mask`）。
+
+    SCAIL 的驱动遮罩是**逐 token** 加进驱动流的 ⇒ 二者**必须同帧数**；不一致就是静默错位。
+    """
+    try:
+        n = int(tensor.shape[int(t_dim)])
+    except Exception:
+        return
+    if n > int(getattr(window, "_driving_tokens", 0) or 0):
+        setattr(window, "_driving_tokens", n)
 
 
 def _install(handler, cfg: AnchorConfig):
@@ -1672,12 +2133,7 @@ class WanContextWindowAnchorNode:
             "required": {
                 "model": ("MODEL", {"tooltip": "已接入上下文窗口节点的模型（`Custom Context Windows (Manual)` 或 `Wan SCAIL-2 Context Windows` 的 model 输出）。Model that already has a context windows node applied."}),
                 "enabled": ("BOOLEAN", {"default": True,
-                    "tooltip": "总开关；关闭时模型直接透传。Master switch."}),
-                "driving_only": ("BOOLEAN", {"default": True,
-                    "tooltip": "只把锚帧接到【驱动流 + 驱动遮罩】，不注入待生成序列（不会渗出锚帧画面、不会有伪影）。\n"
-                               "开=锚帧作为「额外的驱动 token」追加在驱动流尾部，并由 RoPE 放在【本窗口之前】(不产生帧错位)；\n"
-                               "关=锚帧前插到驱动流与待生成序列（与视频帧逐帧配对，最接近训练语义，采样后裁掉）。\n"
-                               "animate2 会因模型硬校验自动改回「否」。\nTrue = anchors are extra driving tokens placed *before* the window (no frame shift). animate2 forces this to False."}),
+                    "tooltip": "总开关；关闭时模型直接透传（等价于不装本节点，并清空锚定池）。Master switch: off = exactly like not installing this node."}),
                 "head_context_frames": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1,
                     "tooltip": "每个窗口头部纳入几帧「只读前文」（单位 = **latent 帧**）：参与注意力、不参与融合。\n"
                                "内容 = 共享 latent `x` 上那几帧：在 overlap=0（单作者）下其作者就是相邻窗口。\n"
@@ -1686,7 +2142,7 @@ class WanContextWindowAnchorNode:
                                "How many read-only preceding frames each window may see, in LATENT frames. 0=off."}),
                 "memory_stride": ("INT", {"default": 0, "min": 0, "max": 16, "step": 1,
                     "tooltip": "【长程记忆组的抽样间距】(单位 = latent 帧)\n"
-                               "0 = 自动（推荐）：让 memory_frames 个点刚好覆盖「片段开头 → 本窗口之前」的全部历史\n"
+                               "0 = 自动（推荐）= **两段式**：先取【窗口开头 + head】的连续帧（贴窗口 ✓），多出的帧再均匀铺在更早的空白区（必含第 0 帧 ⇒ 覆盖片段开头 ✓）；例：窗口起点 15、head=2、memory=4 => [0, 6, 13, 14]。head=0 时全部走远端 ⇒ 退化为旧的等间隔\n"
                                "     => 片段/窗口再长也覆盖得到开头（间隔自动变大、分辨率变粗）。\n"
                                ">0 = 固定间距（4 ≈ 每 4 latent / 约 16 像素帧取 1 帧）。\n"
                                "Sampling stride (latent frames) for the memory group. 0 = auto (spread over the whole history)."}),
@@ -1695,39 +2151,20 @@ class WanContextWindowAnchorNode:
                                "作为额外驱动 token 追加，由 RoPE 放在「窗口之前」并按真实间距编码（不与任何视频帧配对）。\n"
                                "0=关闭；间距见 memory_stride（默认 0=自动覆盖全部历史）。\n"
                                "How many low-frame-rate history LATENT frames to append. 0=off."}),
-                "anchor_fixed": ("BOOLEAN", {"default": False,
-                    "tooltip": "仅 driving_only=关 时有效。开=锚帧 latent 在所有窗口/所有步上都是同一个值（真正的「恒定共同基准」）；"
-                               "关=锚帧走自己的生成轨迹（用上一步模型对这几帧的预测继续演化，与其他帧同构）。\n"
-                               "Only for driving_only=False. True = identical anchor latent across all windows."}),
-                "anchor_image_blank": ("BOOLEAN", {"default": False,
-                    "tooltip": "【仅 driving_only=关 时有意义】待生成序列里那几帧锚帧要不要写入 anchor_frames 的画面内容。\n"
-                               "开 = 只放【纯噪声占位】（不写锚帧画面）：锚帧素材来自驱动视频=源人物画面，写进画面侧会泄漏源形象；\n"
-                               "     开这个可避免，同时仍保留那几帧的位置（模型自己在那 K 帧里完成「参考图 → 当前姿态」的迁移）。\n"
-                               "关 = 保持现状（锚帧画面内容会被写入）。开时 anchor_fixed 失去意义（会被忽略）。\n"
-                               "Blank the anchor frames inside the generation sequence (noise placeholder only)."}),
                 "debug_log": ("BOOLEAN", {"default": False,
                     "tooltip": "【诊断日志】开 = 打印「锚定池空间 / 每窗条件流布局 / 锚段自检 / 跨窗共享头 / "
                                "两窗重叠区预测分歧（= 重影的直接量纲）」；\n"
                                "关 = 由哨兵文件 CWA_DEBUG.on 或环境变量 CWA_DEBUG 决定（默认全关，零影响）。\n"
                                "⇒ 做开/关 A/B 时直接切这个开关即可，**不用重启 ComfyUI**。\n"
                                "Diagnostic logs (pool space / per-window layout / shared head / overlap divergence)."}),
-                "anchor_scope": (["fresh_only", "all"], {"default": "fresh_only",
-                    "tooltip": "【锚定范围】fresh_only（默认）= **跳过含「接续帧钉住区」（全局帧 0）的窗口**——"
-                               "它已经有真实已知前缀（上一段的尾部），再叠合成头会互相干扰；\n"
-                               "all = 每个窗口都插（旧行为，头会排在接续帧之前）。\n"
-                               "Whether to skip the window that already owns the pinned continuation frames."}),
-                "shared_head": (["off", "leader", "consensus"], {"default": "off",
-                    "tooltip": "【锚帧内容的产生方式】(仅 driving_only=关 有意义)\n"
-                               "off（默认）= **每个窗口各自生成**自己的锚帧内容（= 手动测试里两段各自生成的等价物）；\n"
-                               "leader = 跨窗共享：本步第一个窗口产出的头 → 下一步全员共用；\n"
-                               "consensus = 跨窗共享：各窗头内容取平均（无偏置但是混合值）。\n"
-                               "How the anchor block's content is produced across windows."}),
-                "overlap_scope": (["average", "single"], {"default": "average",
-                    "tooltip": "【重叠帧的写入方式】average（默认）= 现状：重叠帧被相邻两窗**共写**，融合时加权平均；\n"
-                               "single = **重叠只读化**：已被前一个窗口写完的重叠段在本窗改为「只读前文」"
-                               "（仍参与注意力、不写回）⇒ **每帧只有一个作者**，消除「两份动作被平均」；\n"
-                               "切片长度/token 预算不变（那些帧本来就在切片里）。\n"
-                               "average: frames co-written by both windows. single: read-only context only (one author per frame)."}),
+                # 2026-10-15：anchor_scope / drive_memory / anchor_slot 三个实验控件的**控件已移除**，
+                #   值固定在 `apply_anchor` 的签名默认里（fresh_only / off / aligned，均为实测基线档）。
+                #   内部能力（AnchorConfig 字段 + 模块全局 + 每步刷新）全部保留，只是不再暴露到面板。
+                #   需要 A/B 时改签名默认值即可（改完重启 ComfyUI）。
+                # 删掉的三个控件（原值备查）：
+                #   anchor_scope  = ["fresh_only", "all"]，默认 fresh_only
+                #   drive_memory  = ["on", "off"]，默认 off
+                #   anchor_slot   = ["context", "aligned"]，默认 aligned
             },
             "optional": {
                 "anchor_frames": ("IMAGE", {"tooltip": "【基准帧】驱动/pose 视频里你想当统一基准的那几帧（例如整段视频开头几帧）。**给多少就用多少**（没有数量参数）：会 VAE 编码成 latent，给每个窗口一份共同的「前文/基准」运动。不接=不做锚定（仍可使用只读上下文与长程记忆组）。\nAnchor basis frames (driving/pose video): how many you feed is how many are used. Leave unconnected to skip anchoring."}),
@@ -1755,9 +2192,16 @@ class WanContextWindowAnchorNode:
         "Global-basis anchoring + read-only context + long-range motion memory for context windows (experimental)."
     )
 
-    def apply_anchor(self, model, enabled=True, driving_only=True, head_context_frames=0,
-                     memory_stride=0, memory_frames=0, anchor_fixed=False, anchor_image_blank=False,
+    # 2026-10-11：anchor_image_blank 固定为 True（避免把源人物画面写进待生成序列）；控件已从面板移除。
+    # 2026-10-11：driving_only 固定为 False（= 锚帧前插并逐帧配对；用户实测 True 效果差）；控件已移除。
+    # 2026-10-15：anchor_scope / drive_memory / anchor_slot 的控件也已从面板移除（见 INPUT_TYPES 注释）。
+    #   ⚠️ 下面这些默认值**必须**与被删掉的控件默认值一致，否则「藏掉控件」的那一刻行为会静默改变
+    #      （anchor_slot 旧控件默认是 aligned，而这里原先写的是 context —— 已同步为 aligned）。
+    def apply_anchor(self, model, enabled=True, driving_only=False, head_context_frames=0,
+                     memory_stride=0, memory_frames=0, anchor_fixed=False, anchor_image_blank=True,
                      debug_log=False, anchor_scope="fresh_only", shared_head="off", overlap_scope="average",
+                     memory_position="head",   # 2026-10-11 固定：规范顺序 [锚][记忆][本窗]
+                     x_prefix="anchor_only", drive_memory="off", anchor_slot="aligned", memory_order="sparse",
                      anchor_frames=None, anchor_mask_frames=None, vae=None):
         refresh_debug(bool(debug_log))   # 诊断开关：节点参数 > 哨兵文件 > 环境变量（免重启）
         frames = _as_image_batch(anchor_frames)
@@ -1821,7 +2265,8 @@ class WanContextWindowAnchorNode:
                         memory_frames=memory, memory_stride=m_stride,
                         anchor_fixed=bool(anchor_fixed) and not blank_image,
                         anchor_image_blank=blank_image, model=model,
-                        anchor_scope=anchor_scope, shared_head=shared_head, overlap_scope=overlap_scope)
+                        anchor_scope=anchor_scope, shared_head=shared_head, overlap_scope=overlap_scope,
+                        memory_position=memory_position)
 
         # 编码自检（极小尺寸试编）：失败就在采样前给出明确错误，而不是在模型深处以形状不匹配崩掉
         if frames is not None:
@@ -1835,7 +2280,11 @@ class WanContextWindowAnchorNode:
                            anchor_mask_frames=mask_frames, vae=vae, driving_only=use_driving_only,
                            memory_frames=memory, memory_stride=m_stride,
                            anchor_fixed=bool(anchor_fixed) and not blank_image,
-                           anchor_image_blank=blank_image, log_debug=bool(_DEBUG))
+                           anchor_image_blank=blank_image, log_debug=bool(_DEBUG),
+                           anchor_scope=anchor_scope, shared_head=shared_head,
+                           overlap_scope=overlap_scope, memory_position=memory_position,
+                           x_prefix=str(x_prefix), drive_memory=str(drive_memory),
+                            anchor_slot=str(anchor_slot), memory_order=str(memory_order))
 
         model = model.clone()
         new_handler = copy.copy(handler)
@@ -1854,9 +2303,9 @@ class WanContextWindowAnchorNode:
                      "自动（覆盖全历史）" if m_stride == 0 else f"固定 {m_stride} latent",
                      bool(anchor_fixed) and not blank_image,
                      "纯噪声占位（不写锚帧画面）" if blank_image else "写入锚帧画面内容")
-        logging.info("[ContextAnchor] 实验开关：anchor_scope=%s；shared_head=%s；overlap_scope=%s"
-                     "（single=重叠只读化/每帧一个作者；fresh_only=跳过含接续帧的窗口）",
-                     _ANCHOR_SCOPE, _SHARED_HEAD_MODE, _OVERLAP_SCOPE)
+        logging.info("[ContextAnchor] 实验开关：anchor_scope=%s；shared_head=%s；overlap_scope=%s；"
+                     "memory_position=%s（single=重叠只读化/每帧一个作者；fresh_only=跳过含接续帧的窗口）",
+                     _ANCHOR_SCOPE, _SHARED_HEAD_MODE, _OVERLAP_SCOPE, _MEMORY_POSITION)
         logging.info("[ContextAnchor] 锚帧占位噪声：种子=%s（固定值 => 跨窗口/跨运行逐位一致；"
                      "可用环境变量 CWA_ANCHOR_NOISE_SEED 覆盖后重启，做「换一块噪声是否影响结果」的对比实验）",
                      hex(_ANCHOR_NOISE_SEED))
@@ -1868,7 +2317,7 @@ NODE_CLASS_MAPPINGS = {
     "WanContextWindowAnchorNode": WanContextWindowAnchorNode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "WanContextWindowAnchorNode": "Context Window Anchor + Halo (窗口锚定/双侧延伸)",
+    "WanContextWindowAnchorNode": "窗口锚定",
 }
 
 
