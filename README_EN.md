@@ -2,7 +2,7 @@
 
 A set of custom nodes for ComfyUI, covering video generation, pose processing, interactive image operations, and common workflow utilities.
 
-Current version: **1.8.0** — Added the WanAnimate2ToVideoCustom node (Wan2.1-I2V base + second-gen pose branch K/V injection, multi-reference image support); reworked WanUni3CApply to accept render_video with built-in VAE encoding and reference-frame offset (fixing the render_latent normalization bias); removed the retired WanSCAILSparseAttention node (its dense O(S²) attention masks blew up memory on long sequences and gave no measurable benefit on SCAIL); plus one **experimental / test-only node, Context Window Anchor (unified-basis anchoring)** — its effectiveness and side effects have not been fully validated, so it is kept for testing reference only; without `anchor_frames` connected it is exactly equivalent to not installing it (see [Context Window Anchor](#context-window-anchor-unified-basis-anchoring)).
+Current version: **1.9.0** (2026-10-16) — adds the one-switch **Anchor + In-step Rolling** node, the **In-step Rolling** node and **Detect Edges (Canny) Chunked** (chunked Canny edge detection), which fixes the official Detect Edges (Canny) freezing (silently spilling VRAM) on 200+ frame batches; 200 frames @1024² drops from ~29.7GB extrapolated peak VRAM to 1.31GB (see [Changelog](#changelog)); prior 1.8.0 introduction below: **1.8.0** — Added the WanAnimate2ToVideoCustom node (Wan2.1-I2V base + second-gen pose branch K/V injection, multi-reference image support); reworked WanUni3CApply to accept render_video with built-in VAE encoding and reference-frame offset (fixing the render_latent normalization bias); removed the retired WanSCAILSparseAttention node (its dense O(S²) attention masks blew up memory on long sequences and gave no measurable benefit on SCAIL); plus one **experimental / test-only node, Context Window Anchor (unified-basis anchoring)** — its effectiveness and side effects have not been fully validated, so it is kept for testing reference only; without `anchor_frames` connected it is exactly equivalent to not installing it (see [Context Window Anchor](#context-window-anchor-unified-basis-anchoring)).
 
 This release also fixes a crash in the SDPose yaw nodes on short segments, the BatchImageReplace `repeat_end` padding logic (3 replacement images for 4 slots: `0,2,2,2` → `0,1,2,2`), and brings memory/performance improvements to SmartVideoCrop and InteractiveBatchCrop (the latter's preview cache drops from ~12.5GB to ~48MB for 2600 frames). **Please read the [Changelog](#changelog) at the end before upgrading** — it lists the breaking changes.
 
@@ -139,6 +139,7 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 | Node | Category | Description |
 |------|----------|-------------|
 | **Folder Image Loader** | `image` | Loads images from a folder sorted by filename; outputs a same-size batch `images`, a `count`, and a per-image list `images_list` (list semantics; with `size_mode=no_resize` the list keeps original sizes). Supports skip, count limits, and size handling |
+| **Detect Edges (Canny) Chunked** | `image` | Chunked Canny edge detection that fixes the official node’s "no error, no progress, hang" behaviour on 200+ frame batches: same operator chain, same results (0 pixel difference on real images), peak VRAM ~25GB to ~1GB; progress bar, cancellable, `auto_chunk` sizing from free VRAM. |
 | **Image Batch Concat** | `image` | Concatenates two image batches. Passes through the non-empty input if only one is connected |
 | **Image Batch Resize** | `image` | Resizes image batches to specified dimensions. Optional directional cropping to maintain aspect ratio |
 | **Batch Image Replace** | `image` | Batch image replacement node. Replaces images at specified positions in a batch by start index and count. Supports overflow modes and underflow mode, with optional replacement source |
@@ -147,6 +148,7 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 | **Image List Replace** | `image` | Overwrites a run of a target image list starting at `start_index` with the replacement list; the length is decided by the replacement list and **never exceeds the original list length** (extra replacement items are dropped). Whole items are swapped, **no resizing**, list length unchanged; the output is a list (downstream runs per element) |
 | **Image List To Batch** | `image` | Converts an image list with **mixed sizes** into a single-size batch (**never crops or stretches**): the reference is the item with the longest short side (= largest area × squareness), **its own size becomes the output size** (zero resampling for it), every other item is padded on **one axis only** (symmetric) and scaled proportionally. `output_mode` defaults to `RGB` (3ch, black padding, most compatible with VL/VAE) and can be switched to `RGBA` (4ch, alpha=0 padding, for compositing) |
 | **MaskCompositeRef** | `image` | Mask batch compositing node — reference_image preprocessing for WanSCAILToVideo. Supports replacement mode and animation mode, auto-filters fully black mask frames, background compositing |
+
 
 ### Context Tools
 
@@ -157,6 +159,22 @@ Nodes are organized by functional category. Hover over any node parameter in Com
 | **Context Window Anchor (unified-basis anchoring)** | `context` | [Experimental / test-only] Prepends your anchor frames to every window's **driving video (plus SCAIL-2's driving mask)** and puts the same frames — **noised to the current σ**, as **ordinary frames** — at the front of the generation sequence, then trims them after sampling (equivalent to doing "prepend the video opening to a segment, generate, then crop" by hand). Minimal interface: `anchor_frames`(IMAGE) + `vae` (same Wan VAE) + SCAIL-2's `anchor_mask_frames`; **how many you feed is how many are used**. Without `anchor_frames` it is exactly equivalent to not installing the node. Must be placed after a context windows node |
 
 ---
+
+### Supplementary list (synced with code, 2026-10-15)
+
+> Nodes that had no row in the original tables.
+
+| Node | Category | Description |
+|------|----------|-------------|
+| **锚定+步内滚动（极简）** | `context` | 「窗口锚定 + 步内滚动」的一键整合节点（面板只有 enabled 一个设置项） |
+| **索引选择器** | `Custom Nodes` |  |
+| **路径验证器** | `Custom Nodes` |  |
+| **文件夹图像载入器** | `image` | 从文件夹按文件名升序载入图片：images 为同尺寸批次；images_list 为逐张列表（元素 [1,H,W,C]，尺寸可互不相同，下游按元素逐个执行） |
+| **图像批次合并** | `image` |  |
+| **图像批次缩放** | `image` |  |
+| **逐帧独立 VAE 编码** | `WanLoop/工具节点` |  |
+| **图像批次指定帧复制 (Frame Replicate)** | `image` |  |
+| **步内滚动** | `context` | SCAIL-2 滚动窗口：在同一步内让后面的窗口看到前面窗口【本步】刚产出的 x0 |
 
 ## Complex Node Details
 
@@ -321,12 +339,12 @@ A context window scheduling node for WAN-type video generation models. When vide
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `model` | MODEL | — | Model that already has a context windows node applied |
+> Since 2026-10-15 the controls `driving_only` / `anchor_fixed` / `anchor_image_blank` / `anchor_scope` / `shared_head` / `overlap_scope` / `memory_position` were removed from the panel (values are fixed to the measured profile).
+
 | `enabled` | BOOLEAN | true | Master switch; when off the model passes through |
-| `driving_only` | BOOLEAN | **true** | true = anchors act as extra driving tokens placed *before* this window (nothing injected into the generation sequence, no frame shift); false = prepend to driving stream + generation sequence (1:1 pairing, closest to training). animate2 is forced to false (log note) |
 | `head_context_frames` | INT | 0 | Read-only preceding frames per window (attended, not fused); use with `overlap=0` |
 | `memory_stride` | INT | 0 | **Sampling stride for the long-range memory group** (latent frames): `0` = auto (recommended) — spread the `memory_frames` points over the whole history from the clip start to this window; `>0` = fixed stride (`4` ≈ one sample per 16 pixel frames). ⚠️ This parameter **takes over the old `tail_context_frames` slot**, so legacy workflows (whose value there was almost always 0) map onto `0` = auto — semantically compatible |
 | `memory_frames` | INT | 0 | Long-range memory: take **N history latent frames** before this window as extra driving tokens (0=off, SCAIL only); stride via `memory_stride`. In auto mode `N` is the **budget** (N=4 = summarise the whole preceding history with 4 points) |
-| `anchor_fixed` | BOOLEAN | false | Only for `driving_only=false`. true = identical anchor latent across all windows/steps (a truly constant basis); false = the anchor follows its own generation trajectory (re-noise the x0 the model predicted for those frames) |
 | `anchor_frames` | IMAGE (optional) | unconnected = no anchoring | **Basis frames**: driving/pose frames you want as the shared basis (e.g. the first frames of the video). Feed as many as you want |
 | `anchor_mask_frames` | IMAGE (optional, SCAIL-2 only) | unconnected | Colored mask frames with the **same frame numbers** as `anchor_frames` (converted to 28 channels internally, no VAE) |
 | `vae` | VAE (required when anchoring) | unconnected | The **same** Wan VAE as the conditioning node; connecting `anchor_frames` without `vae` raises an explicit error |
@@ -848,7 +866,31 @@ alignment is required before VAE encoding).
 
 ---
 
-## Workflows
+### In-step Rolling
+> Used together with the context windows node: later windows see what the earlier windows produced **in the same denoise step**, which reduces ghosting / soft motion at the seams.
+
+**Wiring**: `context windows node → In-step Rolling → sampler`
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `enabled` | on | off = exactly like not installing this node |
+| `roll_beta` | 0.45 | Commit strength (main knob): 0 = passthrough, 1 = fully adopt the previous window’s current-step result; 0.45~0.50 measured best |
+| `roll_beta_inherited` | 0.6 | Separate strength for read-only preceding frames; -1 = follow `roll_beta` |
+
+> Removed controls (fixed): `roll_scope=both`, `roll_beta_curve=late`. One log line per denoise step; use `--verbose` for details.
+
+### Anchor + In-step Rolling (minimal)
+> A **single-switch** node that chains “Context Window Anchor” and “In-step Rolling” with the measured baseline profile — for people who just want it to work.
+
+**Wiring**: `context windows node → Anchor + In-step Rolling → sampler`; optional inputs `anchor_frames` / `anchor_mask_frames` / `vae` (same as the anchor node).
+
+| Setting | Value | Notes |
+|---------|-------|-------|
+| `enabled` | on | The only setting; off = both features off (and the anchor pool is cleared) |
+
+The fixed profile lives in `FIXED_ANCHOR` / `FIXED_ROLL` at the top of `context_anchor_rolling.py`. To tune those values, use the two dedicated nodes instead (they keep all controls).
+
+
 
 The `workflow/` directory contains complete ComfyUI workflow JSON files that can be loaded directly in the ComfyUI interface.
 
@@ -951,7 +993,45 @@ The `workflow/` directory contains complete ComfyUI workflow JSON files that can
 
 ## Changelog
 
-### v1.8.1 (Context Window Anchor revision)
+### v1.9.0 (2026-10-16)
+
+**Added**
+- **Detect Edges (Canny) Chunked** (`CannyChunked`, category `image`): chunked Canny edge detection that fixes the official `Detect Edges (Canny)` hanging (with no error and no progress) on 200+ frame batches.
+
+  Root cause (measured): the official node hands the **whole batch** to `kornia.filters.canny`, whose hysteresis stage is a Python-level `while` loop that grows strong edges by one pixel per iteration (~96 iterations at 512², ~190 at 1024²). Each iteration's `F.conv2d(edges, hysteresis_kernels)` returns `(B, 8, H, W)` — 8× the input volume — and the loop condition is **shared by the whole batch** (one unconverged frame forces all 200 frames to pay another iteration). That makes the peak for 200 frames @1024² roughly 29.7GB; on a 24GB card Windows WDDM silently spills to system RAM, which looks like a freeze — and a node in execution cannot be cancelled.
+
+  This node calls **the exact same line** per chunk (only "whole batch" → "chunk by chunk"):
+
+  | Scenario (RTX 4090, real frames) | Official Canny | CannyChunked |
+  |---|---|---|
+  | 200 frames @1024² peak VRAM | ~29.7GB (over 24GB → spill/freeze) | **1.31GB** |
+  | 200 frames @1024² runtime | frozen (no response for tens of minutes) | **~5.7s** |
+  | Interrupt | impossible inside the node | checked per chunk, cancellable anytime |
+  | Progress | none | front-end progress bar + console tqdm |
+
+  Parameters and equivalence: `low_threshold` / `high_threshold` keep the official names and semantics (drop-in replacement); a single chunk (`chunk_size` ≥ frame count) is **bit-exact** vs official; real-image chunking measured **0 differing pixels** (256²/512²/1024²) and the CPU path is bit-exact for any chunk size. `auto_chunk` shrinks the chunk size according to `model_management.get_free_memory()` (never grows it), and `use_gpu=off` runs entirely on CPU (zero VRAM, for when a big model occupies the card).
+  Equivalence note: CUDA conv picks a cuDNN algorithm by batch shape, so on worst-case input (uniform random noise) chunking can differ from the whole batch by up to ~0.003% of pixels — **the official node deviates in exactly the same way when you split the batch yourself**, so it is not introduced by this node.
+  The self-test `md/canny_chunked_selftest.py` (40 assertions) runs without starting ComfyUI.
+
+#### Also added in this release (since 2026-10-15)
+
+**Added**
+- **Anchor + In-step Rolling (minimal)**: a one-switch node that chains “Context Window Anchor” and “In-step Rolling” with the measured baseline profile (read-only head 2 / memory 4 / commit strength 0.45 / inherited 0.6 / `curve=late` …). All fixed values live in `FIXED_ANCHOR` / `FIXED_ROLL` at the top of `context_anchor_rolling.py`.
+- **In-step Rolling** (`Wan SCAIL-2 Rolling Windows`): later windows see what the earlier windows produced **in the same denoise step**.
+
+**Slimmer panels**
+- Anchor **8 → 5 controls**: removed `anchor_scope` / `drive_memory` / `anchor_slot` (fixed to `fresh_only` / `off` / `aligned`).
+  ⚠️ **Compatibility note**: the default of `anchor_slot` changed from `context` to **`aligned`** — re-save that node in old workflows (or check the values).
+- Rolling **5 → 3 controls**: removed `roll_scope` / `roll_beta_curve` (fixed to `both` / `late`).
+
+**Other**
+- The rolling commit formula is back to the re-noise form (`content_delta` measured worse and was removed):
+  `x = (1-β)·x + β·[(1-σ)·prev-window x0 + σ·ε]` (ε is seed-deterministic ⇒ both windows share the same noise).
+- **Quieter logs**: per-step / per-window messages (`SCAILContext sam_latents`, window bounds, FreeNoise, …) moved to `debug` (~12% fewer log lines in a real run). Start ComfyUI with `--verbose` to see them all again.
+- **GBK-safe log/print text** (avoids `UnicodeEncodeError` on cp936 consoles); all `print` calls replaced with `logging.*`; `FolderImageLoader` per-file warnings are aggregated into one line.
+- Fixed the misleading “last-seam overlap” warning (it no longer suggests `standard_even` when you already use it).
+
+#### v1.8.1 content (never released separately; included here)
 
 **Fixed**
 - **`anchor_fixed` never worked (real bug)**: the "previous-step x0" cache was stored on the **window object**, and window objects are **rebuilt every sampling step** (`Custom_context.get_context_windows` allocates new ones each step) ⇒ the cache was lost every step and the code always fell back to the clean anchor frame. Two consequences: (1) `anchor_fixed` on/off produced **bit-identical** results; (2) late in sampling (σ→0) the anchor became almost a **clean driver frame** that the model continued from ⇒ the **"driver-identity artifact"** (the one v1.8.0 claimed to have fixed).
@@ -966,7 +1046,32 @@ The `workflow/` directory contains complete ComfyUI workflow JSON files that can
 - **Docs now follow the code**: corrected stale entries such as "`c_concat` = 1" (belonging to withdrawn experiments) and documented the frame units (`anchor_frames` = pixel frames; `head_context_frames` / `memory_frames` / `memory_stride` = latent frames).
 
 **Self-test**
-- `md/context_window_anchor_selftest.py`: **16/16 pass** (new/updated: cross-step x0 cache, auto & fixed memory stride, memory/head decoupling, RoPE patch hot-reload self-healing, interface contains `memory_stride` and no `tail_context_frames`); the script is now GBK-safe and runs on a cp936 console.
+- `md/context_window_anchor_selftest.py`: **19/19 pass** (new/updated: cross-step x0 cache, auto & fixed memory stride, memory/head decoupling, RoPE patch hot-reload self-healing, interface contains `memory_stride` and no `tail_context_frames`, **`memory_position` (tail/head + driving-stream/mask sync)**, **RoPE patch ownership & per-step self-heal + per-step global refresh from cfg (immune to node caching)**, **driving-stream vs driving-mask token-count consistency self-check**); the script is now GBK-safe and runs on a cp936 console.
+
+### 2026-10-10 fixes & additions (silent failures first)
+
+| Item | What |
+|---|---|
+| **RoPE patch contention** | Both the anchor node and `WanSCAIL_MultiRef` assign to `SCAILWanModel.rope_encode` (plain assignment ⇒ last writer wins). If our patch gets displaced, extra tokens are read as "future driving" ⇒ **wrong positions, zero errors** (and whether it happens depends on node execution order / cache hits ⇒ **intermittent**). Now: ① MultiRef skips the SCAIL-level overwrite when the anchor patch is present; ② the anchor side **checks & reinstalls every sampling step**; ③ the warning prints **who owned the displaced patch** |
+| **Module globals + node caching** | Four switches (`anchor_scope` / `shared_head` / `overlap_scope` / `memory_position`) previously lived **only in module globals**; when ComfyUI caches the node, `reset_pools` never runs ⇒ sampling reads the **previous run's leftovers**. Now they are part of `AnchorConfig` and **refreshed from cfg at the start of every sampling step** (pool cache is cleared when the source object changes) |
+| **`memory_position` default → `head`** | `tail` is only correct while the RoPE patch is alive; `head` is **immune to patch loss**. With a healthy patch the two are **bit-identical** |
+| **Driving-stream/mask consistency self-check** | SCAIL adds the driving mask token-by-token ⇒ token counts must match; a mismatch now **warns** (it used to be a silent misalignment) |
+| **FreeNoise stride assumption** | Overwrite blocks now use the **real window starts** (the old code assumed a uniform stride ⇒ blocks did not coincide with the true window boundaries under `standard_even`) |
+| **Mask log de-dup key** | `sam_latents` / `ref_mask_latents` (both `t_dim=2`) used to **swallow each other's logs**; the key now names the stream |
+| **`roll_beta_inherited`** (rolling node) | Splits the commit strength by frame ownership: **only "read-only preceding frames" are made single-author; the window's own frames are untouched** (default -1 = follow `roll_beta` = bit-identical regression) |
+| ~~**`roll_w_content` / `roll_w_noise`**~~ **removed (2026-10-11 cleanup)** | Measured: `w_noise<1` degrades the seam hop from 11.4px to 31~40px with ground loss (ratio 0.47); `w_content` showed no monotone effect => both removed, the commit formula is fixed to the legacy re-noise form, widgets 11 -> 5 |
+| ~~**`roll_noise_seed`**~~ **hidden (2026-10-11)** | epsilon (commit noise seed) is now **fixed to 0 internally**: any value is statistically equivalent, and changing it was measured to swing the seam hop between 11.4 and 23.3 px (a lottery) => no longer exposed. **Anchor node slimmed too**: removed `anchor_fixed` (node comment: "on/off are fully equivalent, user confirmed") and `shared_head` (documented as a small lever); anchor placeholder noise seed default 0x5EED -> 0 |
+| **Anchor node cleanup (2026-10-11)** | 4 widgets removed and their values frozen to the measured-best / your habit: `driving_only` -> **False** (you measured True as clearly worse; anchors are prepended and frame-paired), `anchor_image_blank` -> **True** (anchor slots in the to-be-generated sequence hold noise only, avoiding source-person leakage; same-seed A/B: 19.9 -> 15.7px), `anchor_fixed` (node comment: "on/off fully equivalent, user-confirmed"), `shared_head` (documented as a small lever) | anchor widgets 12 -> **8** |
+| **〔rolled back — see "Ordering normalization rolled back" above〕 Anchor ordering normalized (2026-10-11)** | Unified to **`[anchor][memory][window]`** with the **stream / mask / RoPE blocks all in the same order** (guarded by a selftest assertion): anchor = the contiguous `pre` block just before the window; memory = the sparser `mem` block further back. `memory_position` widget removed (frozen to head); `prehistory` is now K (the anchor count) - previously 0, which let the RoPE treat the anchor as the *start of the sequence* (a silent-misalignment risk) | `context_window_anchor.py` |
+| **New-slot safety gate + observability (2026-10-11)** | (1) the x-segment split of `shifted`/`aligned` now **passes `steps_h`/`steps_w` through** (previously only the window part got them, so the anchor/memory parts used default grids); (2) when a slot falls back to `context` (because the caller passed `steps_t`, or the window has no anchor) a **explicit log line** is emitted (it used to be silent, so an experiment could silently be a no-op) | `context_window_anchor.py` |
+| **Crop offset missed the x-side memory blanks (2026-10-11 fix)** | With `x_prefix=anchor_memory` the x side carries M extra memory-blank slots, but the pre-fusion crop only accounted for prefix + anchor + head ⇒ every window output was **shifted by M frames** (symptom: scrambled, repeating motion; log `窗口N 裁剪后长度 21 != 窗口帧数 17`). Fix: new single source `Custom_context._x_prefix_mem_slots(window)` (reusing `_x_memory_slots`) added to `front_trim`, and the divergence-audit position mapping corrected (`base = anchor + M`) so the ghosting audit works again. Regression case 24 | `Custom_context.py`、`context_window_anchor.py`、`md/context_window_anchor_selftest.py` |
+| **FreeNoise implementation (2026-10-11 audit: code-level facts)** | Same semantics as comfy's official `apply_freenoise` (noise pool / randperm / overwrite positions), plus two official fixes: (1) it uses the **real window starts** (upstream assumes a uniform step ⇒ overwrite blocks misalign under non-uniform schedules such as `even_standard`; guarded by selftest case 7); (2) `dynamic_seed` is pinned to `seed` (upstream's leftover `seed + _step*997` is a no-op there). **Scope: each `sample()` shuffles the initial noise once only** (the wrapper is on `SAMPLER_SAMPLE`, not per denoising step) ⇒ inherently limited effect on single-frame seam jumps. Known limits: **no multi-modality noise support** (upstream scales C/OV per modality); the wrapper key is identical to upstream's (when both are present only the last one applies, silently) | `Custom_context.py`, `md/context_windows_schedule_selftest.py` |
+| **`anchor_slot` (2026-10-11, new widget)** | Two anchor time-code semantics: `context` (default) = physical `[memory][anchor][window]` + `prehistory=0`; `leading` = physical `[anchor][memory][window]` + `prehistory=K`, and the x segment is split **inside the same RoPE function** into `[x-anchor][x-memory][x-window]` (anchor = `ref−K..ref−1`, memory by stride, window = `ref..`). Never touches the `WanModel` base class ⇒ no impact on other models. Switch + re-run, no restart. Tests: case 3 (widget order/defaults), case 13b (`prehistory=K`, total token count unchanged, base calls ≥ 5). ❓**Not yet measured**: `leading` vs `context` same-seed comparison (2 seeds each) | `context_window_anchor.py`, `md/context_window_anchor_selftest.py` |
+| **`drive_memory` widget (2026-10-11)** | Whether the 16ch driving stream (`pose_video_latent`) also receives memory frames: default `off` = old behaviour (no 20ch→16ch trim ⇒ that stream gets no memory frames) / `on` = fill them in. Switch + re-run, no restart; env var `CWA_DRIVE_MEMORY=0` as a fallback. **Measured (1 sample each — direction only, magnitude not reliable)**: bad seed off 23.9 / on 28.8; good seed on 17.3 / off 18.0. `x_prefix=none` is now marked "experimental / not recommended" | `context_window_anchor.py`, `md/context_window_anchor_selftest.py` |
+| **Ordering normalization rolled back (2026-10-11)** | Observed (1 sample per config): after unifying the physical order to `[anchor][memory][window]` + `prehistory=K`, max jumped from 12.4–18.1 (median 13.8, old) to **22.4px**; with FreeNoise on, 11.4 → 17.4. **Rolled back** to `[memory][anchor][window]` + `prehistory=0`. ⚠️ The "K out of phase is the main cause" explanation is an **inference, not verified**; if this order is revisited, the x segment must be synchronised at the same time (see `anchor_slot`) | `context_window_anchor.py` |
+| **`x_prefix` ordering bug (2026-10-11 fix)** | Root cause of the `anchor_memory` crash (code-level): condition streams (`c_concat` …) are injected **first**, the x side (`inject_anchor_x`) **later**, and both computed the "memory blank slot" count themselves ⇒ the streams read the not-yet-written `window._x_prefix_mem_count` (=0) ⇒ only +K, while the x side added +K+M ⇒ off by M=4 ⇒ comfy crashed (`Expected size 25 but got size 21`). Fix: single source of truth **`_x_memory_slots(window)`** (derived from `original_indices`, order-independent) used in all four places; logs now print the actual inserted count. Regression test 23 | `context_window_anchor.py`, `md/context_window_anchor_selftest.py` |
+| **B + `x_prefix` (2026-10-11)** | (1) **B**: `_match_channels` now supports the **20->16 down-conversion** => `pose_video_latent` (16ch) previously could **never receive the memory frames** (the 20ch memory was dropped when matching 16ch); the two pose streams now have identical structure. (2) **`x_prefix`** (new widget, default `anchor_only` = zero regression): `anchor_memory` => x mirrors the driving stream `[anchor][memory-blank][window]` (mask zero-padded in sync); `none` => no prefix on x. Known limitation: x-side extra tokens still get the base-RoPE sequential numbering, so an x-side time-code patch would be the next step if this proves useful | `context_window_anchor.py` |
+| **`md/frame_metrics.py`** (local tool, `md/` is gitignored) | Frame-level metrics: **teleport** (max px / pop ratio / landing author-band / ground-crossing ratio) + **residual** (ghosting) + **per-band** (sharpness/saturation); uses **content hashes** to detect the same segment saved by several preview nodes and align the offset => `--seedtab` prints a same-seed parameter table |
 
 ### Errata & withdrawn experiments (do not re-introduce historical records as "bugs")
 

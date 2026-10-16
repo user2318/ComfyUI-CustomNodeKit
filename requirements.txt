@@ -3,6 +3,7 @@ torch>=2.0.0
 numpy>=1.24.0
 Pillow>=10.0.0
 aiohttp>=3.9.0
+kornia          # canny_chunked.py 用；ComfyUI 核心（comfy_extras 的 Canny 节点）已依赖并安装
 # 本工具包直接依赖
 tqdm>=4.65.0
 opencv-python>=4.5.0

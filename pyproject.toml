@@ -2,9 +2,12 @@
 [project]
 name = "comfyui-customnodekit" # Unique identifier for your node. Immutable after creation.
 description = "A custom node toolkit for ComfyUI covering video generation, pose processing, interactive image operations and common workflow needs."
-version = "1.8.0" # Custom Node version. Must be semantically versioned.
+version = "1.9.0" # Custom Node version. Must be semantically versioned.
 license = { text = "MIT" }
-dependencies = ["tqdm>=4.65.0", "imageio-ffmpeg>=0.5.0"]
+dependencies = ["tqdm>=4.65.0", "imageio-ffmpeg>=0.5.0", "opencv-python>=4.5.0"]
+# 可选依赖（只有 GroundingDINO / SDPose 相关节点需要）：groundingdino-py, transformers
+# kornia（canny_chunked.py 用）由 ComfyUI 核心提供，故不在这里重复声明
+# 完整清单见 requirements.txt
 
 [project.urls]
 Repository = "https://github.com/user2318/ComfyUI-CustomNodeKit"

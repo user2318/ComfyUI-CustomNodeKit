@@ -2,7 +2,7 @@
 
 一套为 ComfyUI 设计的自定义节点工具集，涵盖视频生成、姿态处理、图像交互操作等常见工作流需求。
 
-当前版本：**1.8.0** — 新增 WanAnimate2ToVideoCustom 节点（Wan2.1-I2V 底座 + 二代 pose 分支 K/V 注入，支持多参考图）；WanUni3CApply 重构为 render_video 输入（内置 VAE 编码 + 参考帧偏移，修复 render_latent 归一化偏差问题）；移除已退役的 WanSCAILSparseAttention 节点（长序列下掩码为 O(S²) 稠密矩阵，导致内存爆掉，实测在 SCAIL 上无收益）；另外还有一个**实验性 / 测试性节点 Context Window Anchor（上下文窗口锚定）——其有效性与副作用尚未充分验证，仅供测试参考；不接 `anchor_frames` 时既有行为完全不变**（详见 [Context Window Anchor](#context-window-anchor-上下文窗口锚定)）。
+当前版本：**1.9.0**（2026-10-16）— 新增 **锚定 + 步内滚动（极简）**、**步内滚动** 与 **Detect Edges (Canny) Chunked**（分块版 Canny 边缘检测）：修复官方 Detect Edges (Canny) 在 200+ 帧批次上显存溢出导致「不报错、彻底卡死」的问题，实测 200 帧 1024² 峰值显存由约 29.7GB（外推）降到 1.31GB（详见 [更新日志](#更新日志)）；以下是 1.8.0 起的既有简介：**1.8.0** — 新增 WanAnimate2ToVideoCustom 节点（Wan2.1-I2V 底座 + 二代 pose 分支 K/V 注入，支持多参考图）；WanUni3CApply 重构为 render_video 输入（内置 VAE 编码 + 参考帧偏移，修复 render_latent 归一化偏差问题）；移除已退役的 WanSCAILSparseAttention 节点（长序列下掩码为 O(S²) 稠密矩阵，导致内存爆掉，实测在 SCAIL 上无收益）；另外还有一个**实验性 / 测试性节点 Context Window Anchor（上下文窗口锚定）——其有效性与副作用尚未充分验证，仅供测试参考；不接 `anchor_frames` 时既有行为完全不变**（详见 [Context Window Anchor](#context-window-anchor-上下文窗口锚定)）。
 
 本版另修复了 SDPose 偏航角在短片段素材下的必崩问题、BatchImageReplace 的 repeat_end 填充逻辑（3 张替换 4 张由 `0,2,2,2` 修正为 `0,1,2,2`），并对智能视频裁剪、交互式批量裁剪等节点做了内存/性能优化（后者预览缓存从 2600 帧约 12.5GB 降到约 48MB）。**升级前请先阅读文末的 [更新日志](#更新日志)**（其中含不兼容变更说明）。
 
@@ -81,21 +81,21 @@ pip install -r requirements.txt
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
-| **WanAnimateToVideoCustom** | `WanLoop/整合节点` | WanAnimate 视频生成核心节点，支持 pose/face 控制、尾帧分段掩码、中性灰混合、上下文模式、prev_latent 潜变量接续等完整参数 |
-| **WanAnimate2ToVideoCustom** | `WanLoop/整合节点` | WanAnimate2（官方二代架构）视频生成核心节点。保留一代多参考图（逐帧独立编码）与 fix/legacy/vanilla 掩码处理、中性灰混合、yaw 角度输出；叠加官方二代 pose_strength / pose_start_percent / pose_end_percent / reference_image_strength / positive_pose / clip_vision_output_pose。已适配二代 pose 分支帧数校验（多参考前补 latent 帧） |
+| **WanAnimate To Video (自定义)** | `WanLoop/整合节点` | WanAnimate 视频生成核心节点，支持 pose/face 控制、尾帧分段掩码、中性灰混合、上下文模式、prev_latent 潜变量接续等完整参数 |
+| **WanAnimate2 To Video (自定义)** | `WanLoop/整合节点` | WanAnimate2（官方二代架构）视频生成核心节点。保留一代多参考图（逐帧独立编码）与 fix/legacy/vanilla 掩码处理、中性灰混合、yaw 角度输出；叠加官方二代 pose_strength / pose_start_percent / pose_end_percent / reference_image_strength / positive_pose / clip_vision_output_pose。已适配二代 pose 分支帧数校验（多参考前补 latent 帧） |
 | **单帧独立 VAE 编码** | `WanLoop/工具节点` | 将 N 张图片逐帧独立 VAE 编码后在时间维度拼接为 latent，为 ComfyUI-EverAnimate 项目提供锚点 latent |
-| **WanUni3CLoader** | `WanVideo/Control` | 加载 Uni3C ControlNet 模型，支持 fp32/bf16/fp16 精度选择（可选） |
-| **WanUni3CApply** | `WanVideo/Control` | 在 KSampler 中注入 Uni3C 运镜控制，支持 strength/start_percent/end_percent 等参数（可选） |
+| **WanVideo Uni3C ControlNet Loader (Custom)** | `WanVideo/Control` | 加载 Uni3C ControlNet 模型，支持 fp32/bf16/fp16 精度选择（可选） |
+| **WanVideo Uni3C Apply (for KSampler)** | `WanVideo/Control` | 在 KSampler 中注入 Uni3C 运镜控制，支持 strength/start_percent/end_percent 等参数（可选） |
 
 ### SCAIL/SCAIL-2 多参考图生成
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
 | **Wan SCAIL To Video (Multi Ref)** | `model/conditioning/video_models` | SCAIL/SCAIL-2 多参考图视频生成 conditioning 节点。支持多张参考图自动编码、SCAIL-2 多身份 colored mask 注入、pose 视频引导、运动接续（prev_latent）等 |
-| **Create SCAIL-2 Colored Mask (Multi Ref)** | `conditioning/video_models/scail` | 渲染 SAM3 追踪数据为 SCAIL-2 使用的 colored mask。支持参考图和驱动视频的共享调色板排序（left_to_right/area），确保多人物场景下同一身份颜色一致 |
+| **Create SCAIL-2 Colored Mask (MultiRef)** | `conditioning/video_models/scail` | 渲染 SAM3 追踪数据为 SCAIL-2 使用的 colored mask。支持参考图和驱动视频的共享调色板排序（left_to_right/area），确保多人物场景下同一身份颜色一致 |
 | **Wan SCAIL-2 Phase Sampler** | `sampling` | 独立两阶段采样节点。完整复刻 SCAIL2LoopSampler 的两阶段采样核心逻辑。用像素帧（IMAGE）作为锚定输入，内部完成 VAE 编码、锚定帧回写、noise_mask 管理 |
 | **CLIP Vision Multi-Ref Switch** | `conditioning/video_models/scail` | 多参考图 CLIP 特征合并节点。将批次中 N 张图的 CLIP Vision 特征拼接到 token 维度，使所有参考图都参与 conditioning |
-| **Auto Color Drift Correction V4.3** | `CustomNodes/Video` | 自对齐色彩漂移校正节点 V4.3。两遍校正：① 第一遍全局偏移——多帧均值检测段间跳变后统一校正所有新帧；② 第二遍残余微调——在钳制上限内逐帧向基准靠拢。支持 standard/auto/off 三种模式，`max_offset` 控制单通道偏移上限 |
+| **Auto Color Drift Correction V4.3 (两遍校正)** | `CustomNodes/Video` | 自对齐色彩漂移校正节点 V4.3。两遍校正：① 第一遍全局偏移——多帧均值检测段间跳变后统一校正所有新帧；② 第二遍残余微调——在钳制上限内逐帧向基准靠拢。支持 standard/auto/off 三种模式，`max_offset` 控制单通道偏移上限 |
 
 ### SDPose 姿态系统
 
@@ -112,16 +112,16 @@ pip install -r requirements.txt
 | **Resample SDPose Keypoints** | `SDPose` | 对姿态关键点序列进行帧率重采样（抽帧/补帧），独立于 JSON 载入逻辑，支持空帧自动修复 |
 | **Load GroundingDINO Model** | `SDPose/GD` | 加载 GroundingDINO 模型（全局缓存，常驻 GPU），为官方 SDPose 提供 bbox 检测基础 |
 | **GD BBox Detect** | `SDPose/GD` | GroundingDINO 一站式检测：文本检测 → 多模式筛选 → 输出 bbox 给官方 SDPoseOODProcessor |
-| **Reference Image Selector** | `CustomNodes/SDPose` | 参考图选择器：根据偏航角范围自动筛选和排序参考图批次 |
+| **Reference Image Selector (参考图选择器)** | `CustomNodes/SDPose` | 参考图选择器：根据偏航角范围自动筛选和排序参考图批次 |
 
 ### 视频工具
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
-| **VideoFrameCounter** | `video` | 获取输入视频/图像序列的帧数统计信息与帧率 |
-| **ImageSequenceToVideo** | `video` | 使用 ffmpeg 将图片序列合成为视频文件，支持 CRF、音频合成、帧偏移等参数 |
-| **SmartVideoCrop** | `video` | 基于 SAM3 追踪数据的智能视频裁剪：按人物质心做水平跟随裁剪（EMA 平滑 + 切镜检测），固定保留全高后按输出宽高比缩放。支持多 ID 追踪、空 mask 回退策略（保持最后位置/回到中心）、可选第二路图像同步裁剪 |
-| **VideoGridCompose** | `video` | 把 1~4 路视频/图片按布局拼成网格（水平排列 / 垂直排列 / 田字格2×2 / 左一右N / 上一+下N），支持自适应填满或保持比例、时长对齐（超长截断、不足冻结补帧）、音频来源选择；全程 ffmpeg 流式处理，不占内存 |
+| **视频帧数统计** | `video` | 获取输入视频/图像序列的帧数统计信息与帧率 |
+| **图片序列合成视频** | `video` | 使用 ffmpeg 将图片序列合成为视频文件，支持 CRF、音频合成、帧偏移等参数 |
+| **智能视频裁剪 (Smart Video Crop)** | `video` | 基于 SAM3 追踪数据的智能视频裁剪：按人物质心做水平跟随裁剪（EMA 平滑 + 切镜检测），固定保留全高后按输出宽高比缩放。支持多 ID 追踪、空 mask 回退策略（保持最后位置/回到中心）、可选第二路图像同步裁剪 |
+| **视频网格拼接** | `video` | 把 1~4 路视频/图片按布局拼成网格（水平排列 / 垂直排列 / 田字格2×2 / 左一右N / 上一+下N），支持自适应填满或保持比例、时长对齐（超长截断、不足冻结补帧）、音频来源选择；全程 ffmpeg 流式处理，不占内存 |
 
 ### 交互式工具
 
@@ -143,6 +143,7 @@ pip install -r requirements.txt
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
 | **Folder Image Loader** | `image` | 从文件夹按文件名升序载入图片；输出同尺寸批次 `images` + 张数 `count` + 逐张列表 `images_list`（列表语义，`size_mode=no_resize` 时列表保持原尺寸）。支持跳过、数量限制与尺寸处理 |
+| **Detect Edges (Canny) Chunked** | `image` | 分块版 Canny 边缘检测（解决官方 Detect Edges (Canny) 在 200+ 帧批次上「不报错、无进度、卡死」的问题）：逐块调用同一算子链，结果一致（真实图像 0 像素差异），峰值显存从约 25GB 降到约 1GB；带进度条、可随时中断，`auto_chunk` 按空闲显存自动收缩。 |
 | **Image Batch Concat** | `image` | 将两个图像批次拼接，任意一路无输入时透传另一路 |
 | **Image Batch Resize** | `image` | 缩放图像批次到指定宽高，可选按方向裁剪保持宽高比 |
 | **Batch Image Replace** | `image` | 批量图像替换节点。在图像批次中按起始索引和数量替换指定位置的图像。支持溢出模式和下溢模式，替换源可选连接 |
@@ -150,17 +151,32 @@ pip install -r requirements.txt
 | **Image List Split (图像列表分路输出)** | `image` | 把**图像列表**按指定路数（1~16，界面输出口随该值即时增减）拆成多个独立输出。从 `start_index` 开始依次输出，不足的路为空（返回 `None`，**效果等同该路未接线**：下游 optional 输入按"没有这一路"处理），输入未连接时同样不报错也不输出。列表元素尺寸可互不相同；接普通批次会自动拆成单张 |
 | **Image List Replace (图像列表位置替换)** | `image` | 用替换列表从 `start_index` 开始覆盖目标图像列表的一段，长度由替换列表决定且**绝不超过原列表长度**（多余的替换图丢弃）；逐元素整体替换、**不缩放**、长度不变，输出为列表（下游按元素逐个执行） |
 | **Image List To Batch (图像列表转批次)** | `image` | 把尺寸不同的图像列表转成同尺寸批次（**绝不裁剪/拉伸**）：基准取「短边最长（＝面积×方正度最大）」的那张，**其原始尺寸即输出尺寸**（零重采样），其余图**只在一个轴上对称补边**后等比缩放。`output_mode` 默认 `RGB`（3 通道、补边纯黑、最兼容 VL/VAE），可切 `RGBA`（4 通道、补边 alpha=0、适合合成） |
-| **MaskCompositeRef** | `image` | 遮罩批次合成节点 — 用于 WanSCAILToVideo 的 reference_image 预处理。支持替换模式和动作迁移模式，自动剔除全黑遮罩帧、背景合成 |
+| **遮罩批次合成 (Ref)** | `image` | 遮罩批次合成节点 — 用于 WanSCAILToVideo 的 reference_image 预处理。支持替换模式和动作迁移模式，自动剔除全黑遮罩帧、背景合成 |
+
 
 ### 上下文工具
 
 | 节点名 | 类别 | 说明 |
 |--------|------|------|
-| **Custom Context Windows (Manual)** | `context` | 通用上下文窗口调度节点。将长序列拆分为滑动窗口逐段处理，支持参考帧前缀、噪声混洗、多种调度策略（均匀/静态/循环/批处理）与融合模式（金字塔/线性叠加/相对加权） |
-| **Wan SCAIL-2 Context Windows** | `context` | SCAIL-2 专用上下文窗口节点。自动处理 SCAIL-2 的特殊 conditioning 字段（ref_mask_28ch、driving_mask_28ch、pose_video_latent），无需前缀参考帧。与 WanSCAILToVideoMultiRef 配合使用 |
-| **Context Window Anchor (上下文窗口锚定)** | `context` | 【实验性·测试性】给每个窗口的**驱动视频（含 SCAIL-2 驱动遮罩）开头接一段全局锚定帧**，并把同样的帧按当前 σ 加噪后放到待生成序列最前（当普通帧），采样后裁掉——等价于手动「把整段视频开头拼到片段开头再生成」。接口极简：`anchor_frames`(IMAGE) + `vae`（同一个 Wan VAE）+ SCAIL-2 的 `anchor_mask_frames`；**给多少用多少**。不接 `anchor_frames` 即等价于不装本节点。必须接在上下文窗口节点之后 |
+| **WAN Context Windows (Manual Custom)** | `context` | 通用上下文窗口调度节点。将长序列拆分为滑动窗口逐段处理，支持参考帧前缀、噪声混洗、多种调度策略（均匀/静态/循环/批处理）与融合模式（金字塔/线性叠加/相对加权） |
+| **Wan SCAIL Context Windows** | `context` | SCAIL-2 专用上下文窗口节点。自动处理 SCAIL-2 的特殊 conditioning 字段（ref_mask_28ch、driving_mask_28ch、pose_video_latent），无需前缀参考帧。与 WanSCAILToVideoMultiRef 配合使用 |
+| **窗口锚定** | `context` | 【实验性·测试性】给每个窗口的**驱动视频（含 SCAIL-2 驱动遮罩）开头接一段全局锚定帧**，并把同样的帧按当前 σ 加噪后放到待生成序列最前（当普通帧），采样后裁掉——等价于手动「把整段视频开头拼到片段开头再生成」。接口极简：`anchor_frames`(IMAGE) + `vae`（同一个 Wan VAE）+ SCAIL-2 的 `anchor_mask_frames`；**给多少用多少**。不接 `anchor_frames` 即等价于不装本节点。必须接在上下文窗口节点之后 |
 
 ---
+
+### 补充列表（2026-10-15 按代码校对）
+
+> 下面这些节点在原表里没有单列，按代码现状补齐（顺序/归类可自行调整）。
+
+| 节点名 | 类别 | 说明 |
+|--------|------|------|
+| **锚定+步内滚动（极简）** | `context` | 「窗口锚定 + 步内滚动」的一键整合节点（面板只有 enabled 一个设置项） |
+| **索引选择器** | `Custom Nodes` |  |
+| **路径验证器** | `Custom Nodes` |  |
+| **文件夹图像载入器** | `image` | 从文件夹按文件名升序载入图片：images 为同尺寸批次；images_list 为逐张列表（元素 [1,H,W,C]，尺寸可互不相同，下游按元素逐个执行） |
+| **图像批次合并** | `image` |  |
+| **图像批次指定帧复制 (Frame Replicate)** | `image` |  |
+| **步内滚动** | `context` | SCAIL-2 滚动窗口：在同一步内让后面的窗口看到前面窗口【本步】刚产出的 x0 |
 
 ## 复杂节点详解
 
@@ -257,7 +273,7 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | `context_stride` | INT | 均匀调度策略中的步长指数上限（1-10） |
 | `closed_loop` | BOOLEAN | 是否闭合窗口循环（仅循环调度有效） |
 | `fuse_method` | 枚举 | 窗口融合方式（见下文） |
-| `freenoise` | BOOLEAN | 是否启用 FreeNoise 噪声混洗（改善窗口间连续性） |
+| `freenoise` | BOOLEAN | 是否启用 FreeNoise 噪声混洗（改善窗口间连续性）。⚠️ **2026-10 修复**：覆写块现在按**真实窗口起点**对齐（旧实现假定步长均匀 `delta=C−OV`，在 `standard_even` 这类**非均匀起点**的调度下会错位 ⇒「噪声池→新帧」的对应关系碎掉）；等步长调度下与旧实现**逐位一致** |
 | `prefix_latent_num` | INT | 前缀参考帧的 latent 数量。接参考图选择器 raw_reference_images 的图片数量即可（每张图片编码为1个 latent）。这些帧会作为稳定参考拼接到每个窗口前 |
 | `split_conds_to_windows` | BOOLEAN | 是否将多个 conditioning 按区域索引分配给各窗口 |
 | `fuse_sharpen` | FLOAT | **融合权重锐化（幂次）**，默认 1.0=不锐化（历史行为）。设 3~6 可把重叠区的交叉淡化带压窄：任一瞬间基本只取「更靠窗中心」的那一方 ⇒ **既保留连续性（仍是渐变）又不出现两个角色叠在一起的重影**。窗口重叠越大、两窗分歧越大时越有用 |
@@ -324,17 +340,13 @@ WanAnimate 视频生成的核心整合节点，将参考图、姿视频、面部
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `model` | MODEL | — | 已接入上下文窗口节点的模型（`Custom Context Windows (Manual)` 或 `Wan SCAIL-2 Context Windows` 的输出） |
+> 2026-10-15 起 `driving_only` / `anchor_fixed` / `anchor_image_blank` / `anchor_scope` / `shared_head` / `overlap_scope` / `memory_position` 已从面板移除（值固定为实测档）；需要 A/B 时改代码里的签名默认即可。
+
 | `enabled` | BOOLEAN | true | 总开关；关闭时模型直接透传 |
-| `driving_only` | BOOLEAN | **开** | 开=锚帧只作「本窗口之前的额外驱动 token」（不注入待生成序列、不产生帧错位）；关=前插到驱动流+待生成序列（逐帧配对，最接近训练语义）；animate2 会自动强制为「否」并在日志说明 |
 | `head_context_frames` | INT | 0 | 每窗头部纳入 N 帧「只读前文」（参与注意力、不参与融合）；配 `overlap=0` 用 |
 | `memory_stride` | INT | 0 | **长程记忆组的抽样间距**（latent 帧）：`0`=自动（推荐）——让 `memory_frames` 个点覆盖「片段开头 → 本窗口之前」的全部历史；`>0`=固定间距（`4` ≈ 每 16 像素帧取 1 帧）。⚠️ 本参数**占用原 `tail_context_frames` 的槽位**：老工作流该位置的值（通常是 0）会落到这里，而 `0` 恰好 = 自动，语义兼容 |
 | `memory_frames` | INT | 0 | 长程记忆组：取本窗之前 **N 个历史 latent 帧**作为额外驱动 token（0=关闭，仅 SCAIL 有效）；间距见 `memory_stride`。自动模式下 `N` 就是**覆盖预算**（`N=4` = 用 4 个点概括本窗之前的全部历史） |
-| `anchor_fixed` | BOOLEAN | false | 仅 `driving_only=关` 时有效。开=锚帧 latent 在所有窗口/所有步都是同一个值（真正的「恒定共同基准」）；关=锚帧走自己的生成轨迹（用上一步模型对这几帧的预测继续演化，与其他帧同构） |
-| `anchor_image_blank` | BOOLEAN | false | 仅 `driving_only=关` 时有意义。开=待生成序列里的锚帧只放**纯噪声占位**（不写锚帧画面内容，避免泄漏源/驱动者形象，但仍保留那几帧的位置）；开时 `anchor_fixed` 失去意义 |
-| `debug_log` | BOOLEAN | false | **诊断日志**（默认关，对结果零影响）：开=打印「锚定池空间 / 每窗条件流布局 / 锚段自检 / 跨窗共享头 / **两窗一致性（level + 动作）**」；关=由哨兵文件 `CWA_DEBUG.on` 或环境变量 `CWA_DEBUG` 决定。**切它无需重启 ComfyUI**，适合做开/关 A/B |
-| `anchor_scope` | fresh_only / all | **fresh_only** | `fresh_only` = **跳过含「接续帧钉住区」（全局帧 0）的窗口**——它已有真实已知前缀（上一段尾部），再叠合成头会互相干扰；`all` = 每个窗口都插（旧行为） |
-| `shared_head` | off / leader / consensus | **off** | 锚帧内容的产生方式（仅 `driving_only=关` 有意义）：`off`=**每个窗口各自生成**（= 手动测试里两段各自生成的等价物）；`leader`=跨窗共享 leader 产出的那份；`consensus`=各窗取平均 |
-| `overlap_scope` | average / single | **average** | `average`=现状：重叠帧被相邻两窗**共写**、融合时加权平均（**动作被平均抵消/发软**的根源）；`single`=**重叠只读化**：已被前窗写完的重叠段在本窗只读（参与注意力、不写回）⇒ **每帧只有一个作者**；切片长度/显存/token 预算都不变，下一窗仍看得到前窗真实输出 |
+| `debug_log` | BOOLEAN | false | **诊断日志**（默认关，对结果零影响）：开=打印「锚定池空间 / 每窗条件流布局 / 锚段自检 / 跨窗共享头 / **两窗一致性（level + 动作）**」；关=由哨兵文件 `CWA_DEBUG.on` 或环境变量 `CWA_DEBUG` 决定。**切它无需重启 ComfyUI**，适合做开/关 A/B。🆕 **2026-10 日志分级**：默认档已大幅精简（几何 / 流布局 **每个片段只打一次**；每步只留「每缝一行」的关键比率）；**逐流统计 / 逐帧列表**移入详细档 —— 设环境变量 **`CWA_DEBUG_VERBOSE=1`**（重启生效）才输出 |
 | `anchor_frames` | IMAGE（可选） | 不接=不做锚定 | **基准帧**：驱动/pose 视频里你想当统一基准的那几帧（例如整段视频开头几帧）。**给多少用多少** |
 | `anchor_mask_frames` | IMAGE（可选，仅 SCAIL-2） | 不接 | 与 `anchor_frames` **同帧号**的彩色遮罩帧（内部转 28 通道，不需要 VAE） |
 | `vae` | VAE（接锚帧时必接） | 不接 | 与 conditioning 节点**同一个** Wan VAE；接了 `anchor_frames` 却没接 `vae` 会**直接报错** |
@@ -1172,7 +1184,7 @@ SCAIL-2 专用的上下文窗口节点，与通用的 `Custom Context Windows (M
 | `context_stride` | INT | 窗口步进（仅对 uniform 策略有效） |
 | `closed_loop` | BOOLEAN | 是否闭环窗口（仅 looped 策略有效） |
 | `fuse_method` | 枚举 | 窗口融合方法（金字塔权重推荐） |
-| `freenoise` | BOOLEAN | FreeNoise 噪声混洗，改善窗口间融合 |
+| `freenoise` | BOOLEAN | FreeNoise 噪声混洗，改善窗口间融合。⚠️ 2026-10 修复：覆写块改用**真实窗口起点**（旧实现假定步长均匀，在 `standard_even` 下错位）；等步长时逐位回归 |
 | `fuse_sharpen` | FLOAT | 融合权重锐化（幂次），默认 1.0=不锐化。设 3~6 把重叠区交叉淡化带压窄 ⇒ 任一瞬间基本只取「更靠窗中心」的那一方，**既连续又不出现两个角色叠在一起的重影** |
 
 #### 工作原理
@@ -1193,7 +1205,31 @@ SCAIL-2 专用的上下文窗口节点，与通用的 `Custom Context Windows (M
 
 ---
 
-## 工作流
+### 步内滚动 (In-step Rolling)
+> 配合上下文窗口使用：让**后面的窗口在同一步里就能看到前面窗口刚产出的内容**，减少缝上的重影/动作发软。
+
+**接线**：`上下文窗口节点 → 步内滚动 → 采样器`
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `enabled` | 开 | 关掉 = 等价于不装本节点 |
+| `roll_beta` | 0.45 | 提交强度（主力旋钮）：0 = 透传，1 = 完全采用前窗当前步的结果；实测 0.45~0.50 最健康 |
+| `roll_beta_inherited` | 0.6 | 只对「只读前文」帧单独生效的强度；-1 = 跟随 `roll_beta` |
+
+> 已移除的控件（值固定）：`roll_scope=both`、`roll_beta_curve=late`。日志每个去噪步 1 行摘要，细节用 `--verbose` 查看。
+
+### 锚定+步内滚动（极简）
+> **只有一个开关的整合节点**：把「窗口锚定 + 步内滚动」按实测基线串起来，适合不想调参直接出片的情况。
+
+**接线**：`上下文窗口节点 → 锚定+步内滚动（极简） → 采样器`；可选输入 `anchor_frames` / `anchor_mask_frames` / `vae`（与窗口锚定节点相同）。
+
+| 设置项 | 值 | 说明 |
+|--------|----|------|
+| `enabled` | 开 | **唯一的设置项**；关掉 = 两功能都关（并清空锚定池） |
+
+固定档写在 `context_anchor_rolling.py` 顶部的 `FIXED_ANCHOR` / `FIXED_ROLL`（只读前文 2、记忆组 4、自动间距、提交强度 0.45、继承帧 0.6、`roll_scope=both`、`curve=late`、`anchor_slot=aligned`、`drive_memory=off`、`anchor_scope=fresh_only` …）。需要调这些量时请改用上面两个「老」节点（它们保留全部控件）。
+
+
 
 `workflow/` 目录下提供了多个完整的 ComfyUI 工作流 JSON 文件，可直接拖入 ComfyUI 界面使用。
 
@@ -1296,7 +1332,52 @@ SCAIL-2 专用的上下文窗口节点，与通用的 `Custom Context Windows (M
 
 ## 更新日志
 
-### v1.8.1（锚定节点修订）
+### v1.9.0（2026-10-16）
+
+**新增**
+- **Detect Edges (Canny) Chunked**（`CannyChunked`，类别 `image`）：分块版 Canny 边缘检测，
+  修掉官方 `Detect Edges (Canny)` 在 200+ 帧批次上「不报错、无进度、彻底卡死」的问题。
+
+  根因（实测）：官方把**整批**一次性交给 `kornia.filters.canny`，而 kornia 的迟滞阶段是一个
+  Python 级 `while` 循环（每轮只把强边向外扩张 1 个像素，512² 约 96 轮、1024² 约 190 轮），
+  循环里每轮的 `F.conv2d(edges, hysteresis_kernels)` 输出是 `(B, 8, H, W)`（输入体积的 8 倍），
+  且循环条件是**整批共享**的（只要有 1 帧没收敛，200 帧一起再赔一轮）⇒ 200 帧 1024² 的瞬时峰值
+  约 29.7GB，超过 24GB 显卡后 Windows WDDM 静默溢出到系统内存 ⇒ 表现为卡死，且节点执行中无法取消。
+
+  本节点逐块调用**与官方完全相同的那一行**（只把「整批」换成「逐块」）：
+
+  | 场景（RTX 4090，真实帧） | 官方 Canny | CannyChunked |
+  |---|---|---|
+  | 200 帧 1024² 峰值显存 | ~29.7GB（超 24GB → spill 卡死） | **1.31GB** |
+  | 200 帧 1024² 耗时 | 卡死（数十分钟无响应） | **约 5.7s** |
+  | 中断 | 节点内无法取消 | 每块检查，可随时取消 |
+  | 进度 | 无 | 前端进度条 + 控制台 tqdm |
+
+  参数与一致性：`low_threshold` / `high_threshold` 与官方同名同义（可直接替换节点）；单块
+  （`chunk_size` ≥ 帧数）与官方 **bit-exact**；真实图像分块实测 **0 像素差异**（256²/512²/1024²）；
+  CPU 通路任意分块 bit-exact。`auto_chunk` 依 `model_management.get_free_memory()` 自动收缩块大小
+  （只减不增），`use_gpu` 关掉即走 CPU（零显存，用于显存被大模型占满时）。
+  一致性口径提示：CUDA 卷积会按 batch 尺寸选择 cuDNN 算法，在「均匀随机噪声」这类最坏输入下
+  分块与整批最多约 0.003% 像素翻转（**官方自己分批跑也会同样偏离**，非本节点引入）。
+  自测脚本 `md/canny_chunked_selftest.py`（40 项断言）可脱离 ComfyUI 直接运行。
+
+#### 同版其它新增（2026-10-15 起）
+- **锚定 + 步内滚动（极简）**：面板**只有一个开关**的一键节点，把「窗口锚定 + 步内滚动」按实测基线串起来（只读前文 2 / 记忆组 4 / 提交强度 0.45 / 继承帧 0.6 / `curve=late`…）。设置项集中在 `context_anchor_rolling.py` 顶部的 `FIXED_ANCHOR` / `FIXED_ROLL`，改那里即改行为。
+- **步内滚动**（`Wan SCAIL-2 Rolling Windows`）：同一步内让后面的窗口看到前面窗口**本步**刚产出的结果，减少缝上重影/动作发软。
+
+**精简（面板控件）**
+- 窗口锚定 **8 → 5**：移除 `anchor_scope` / `drive_memory` / `anchor_slot`（值固定为实测档 `fresh_only` / `off` / `aligned`）。
+  ⚠️ **兼容性提示**：`anchor_slot` 的默认值由 `context` 改为 **`aligned`**（与「已移除控件」的原默认一致）；老工作流请重存一次节点，或自行核对这几个值。
+- 步内滚动 **5 → 3**：移除 `roll_scope` / `roll_beta_curve`（值固定 `both` / `late`）。
+
+**其它**
+- 滚动提交公式回退为「再噪」式（此前试过的 `content_delta` 实测更差，已删除）：
+  `x = (1-β)·x + β·[(1-σ)·前窗本步 x0 + σ·ε]`（ε 由种子确定 ⇒ 两窗共享同一份噪声）。
+- **日志降噪**：每步/每窗触发的日志（如 `SCAILContext sam_latents`、`窗口边界`、`FreeNoise`…）降为 `debug` 档（实测省约 12% 日志行）；需要时用 `--verbose` 启动 ComfyUI 即可看全量。`WanUni3C` 的逐步统计改为「首次 info + 之后 debug」。
+- 日志/打印文本 **GBK 安全化**（避免 cp936 控制台抛 `UnicodeEncodeError`）；`print` 全部改为 `logging.*`；`FolderImageLoader` 的逐文件告警改为汇总一行。
+- 修正「末窗重叠」告警文案（在 `standard_even` 下不再自相矛盾地建议改用 `standard_even`，改为建议缩短 `context_length` / 用 `batched`）。
+
+#### v1.8.1 内容（曾未单独发布，并入本版）
 
 **修复**
 - **`anchor_fixed` 之前完全失效（真 bug）**：锚帧「上一步 x0 预测」的缓存被挂在**窗口对象**上，而窗口对象**每个采样步都会重建**（`Custom_context.get_context_windows` 每步 new 一批）⇒ 缓存每步丢失，代码永远退回「干净锚帧」这一条路。后果有两个：
@@ -1314,7 +1395,33 @@ SCAIL-2 专用的上下文窗口节点，与通用的 `Custom Context Windows (M
 - **文档口径以代码为准**：修正「`c_concat` 填 1」等**属于已撤销实验的过时描述**；新增「帧单位」说明（`anchor_frames` = 像素帧；`head_context_frames` / `memory_frames` / `memory_stride` = latent 帧）。
 
 **自测**
-- `md/context_window_anchor_selftest.py`：**16 项全过**（新增/改写：x0 缓存跨步存活、记忆组自动间距与固定间距、记忆组与头段解耦、RoPE 补丁热重载自愈、接口含 `memory_stride` 且不含 `tail_context_frames`）；脚本已 GBK 安全化，可直接在本机 cp936 控制台运行。
+- `md/context_window_anchor_selftest.py`：**19 项全过**（新增/改写：x0 缓存跨步存活、记忆组自动间距与固定间距、记忆组与头段解耦、RoPE 补丁热重载自愈、接口含 `memory_stride` 且不含 `tail_context_frames`、**`memory_position`（tail/head + 驱动流/掩码同步）**、**RoPE 补丁归属与每步自愈 + 每步从 cfg 刷新全局（免疫节点缓存）**、**驱动流/驱动遮罩 token 数一致性自检**）；脚本已 GBK 安全化，可直接在本机 cp936 控制台运行。
+
+### 2026-10-10 修复与新增（按"静默故障"优先）
+
+| 项 | 内容 |
+|---|---|
+| **RoPE 补丁争抢** | `SCAILWanModel.rope_encode` 被 anchor 与 `WanSCAIL_MultiRef` **同时抢**（都是直接赋值 ⇒ 谁最后打谁赢）。后果：anchor 补丁被顶掉时，额外 token 被当成「窗口之后的未来驱动」⇒ **位置错、无报错**（且是否发生取决于节点执行顺序/缓存命中 ⇒ **间歇性**）。现在：① MultiRef 检测到 anchor 补丁在位就**跳过 SCAIL 级覆盖**；② anchor 侧**每个采样步检查并重装**；③ 告警里直接打印**"被顶掉时的所有者"**（一眼看出凶手） |
+| **参数"全局 + 节点缓存"串味** | 4 个开关（`anchor_scope`/`shared_head`/`overlap_scope`/`memory_position`）原先**只存在模块全局**；节点被 ComfyUI 缓存时 `reset_pools` 不执行 ⇒ 采样期读到上一次运行的残留值。现在：这 4 个字段进 `AnchorConfig`，**每个采样步开头从 cfg 刷新全局**（池源变了就清池缓存） |
+| **`memory_position` 默认改 `head`** | `tail` 摆放只有在 RoPE 补丁生效时才正确；`head` 对"补丁失效"**免疫**（最多被当成相邻帧）。补丁正常时两者**逐位相同** |
+| **驱动流/驱动遮罩一致性自检** | SCAIL 的驱动遮罩是**逐 token** 加进驱动流的 ⇒ 必须同帧数；现在不一致会**告警**（以前是静默错位） |
+| **FreeNoise 的 stride 假设** | 覆写块改用**真实窗口起点**（旧实现假定步长均匀 ⇒ 在 `standard_even` 下与真实窗口边界不重合 ⇒ 越往后噪声来源越碎） |
+| **掩码日志去重键** | `sam_latents` / `ref_mask_latents` 两路（同为 `t_dim=2`）此前会**互相吞日志** ⇒ 排查必然漏看一路；现在 key 里带"哪一路流" |
+| **`roll_beta_inherited`**（滚动节点）| 按「帧的归属」分档：**只把"只读前文"单作者化、本窗拥有的帧一字不动**（默认 -1 = 跟随 `roll_beta` = 逐位回归）。用于压低"后两缝"的窗间分歧 |
+| ~~**`roll_w_content` / `roll_w_noise`**~~ **已删除（2026-10-11 精简）** | 实测：`w_noise<1` 把缝上瞬移从 11.4px 恶化到 31~40px 并脱地（接地面比 0.47）；`w_content` 无单调效果 ⇒ 两者删除，提交公式固定为「legacy 再噪」，界面参数 11 -> 5 |
+| ~~**`roll_noise_seed`**~~ **已隐藏（2026-10-11）** | ε（提交帧噪声种子）**内部固定 0**：统计上任意值等价，而实测换 ε 会让缝上瞬移在 11.4~23.3px 之间变化（抽签）⇒ 不再暴露。**同时精简锚定节点**：删掉 `anchor_fixed`（节点自注「开/关完全等价，用户实测确认过」）与 `shared_head`（小杠杆），锚帧占位噪声种子默认 0x5EED -> 0 |
+| **锚定节点精简（2026-10-11）** | 删掉 4 个控件、值锁定为实测最优/你的习惯：`driving_only` → **False**（你实测 True 效果差；锚帧前插并逐帧配对）、`anchor_image_blank` → **True**（锚帧在待生成序列里只放噪声占位，避免源人物画面泄漏；同 seed 对照 19.9 → 15.7px）、`anchor_fixed`（节点自注「开/关完全等价，用户实测确认过」）、`shared_head`（文档记为「小杠杆」）| 锚定控件 12 → **8** |
+| **〔已回退，见上方「顺序规范化回退」〕锚定顺序规范化（2026-10-11）** | 统一为 **`[锚][记忆][本窗]`**，且**条件流 / 掩码 / RoPE 分块三处同序**（自测断言守护）：锚帧 = 「紧邻窗口之前」的 `pre` 块；记忆 = 「更早、按 stride」的 `mem` 块。`memory_position` 控件删除（固定 head）；`prehistory` 改为 = 锚帧数 K（此前是 0 ⇒ RoPE 会把锚帧当成「序列开头」，是**静默错位**风险）| `context_window_anchor.py` |
+| **B + `x_prefix`（2026-10-11）** | ① **B**：`_match_channels` 补齐 **20→16 降通道** ⇒ `pose_video_latent`（16ch）此前**永远拿不到记忆帧**（20ch 记忆转 16ch 被丢弃）；现在两条 pose 流结构一致 ✓ ② **`x_prefix`**（新控件，默认 `anchor_only` = 零回归）：`anchor_memory` ⇒ x 也镜像驱动流 `[锚][记忆空白][本窗]`（掩码同步补 0）；`none` ⇒ x 不加前缀。⚠️ 已知限制：x 侧额外 token 仍走基类 RoPE 的「顺序编号」⇒ 若本项有效，再做 x 侧时间码补丁 | `context_window_anchor.py` |
+| **`x_prefix` 崩溃修复（2026-10-11）** | `anchor_memory` / `none` 一跑就崩（`Sizes of tensors must match... Expected 25 but got 21`）：**与 x 逐帧对齐的流**（`concat_mask` / `denoise_mask` / **`c_concat`** / 1·3·4ch 掩码 / 16ch x 池流）仍在用 `_ANCHOR_COUNT`，没跟随 `x_prefix`。修法：新增唯一事实来源 **`_x_side_prefix_len(window)`**（none=>0 / anchor_only=>K / anchor_memory=>K+M）⇒ 上述流全部改用它（含 `prepend_anchor_mask` 里 ref 掩码那路）；并新增**跨流一致性运行时告警**（x 侧实际额外帧 ≠ 应为值 ⇒ 立刻告警，不再等到 comfy 崩）| `context_window_anchor.py` |
+| **新档安全门 + 观测修复（2026-10-11）** | ① `shifted`/`aligned` 的 x 段拆分现在**透传 `steps_h`/`steps_w`**（此前只有窗口段传，锚/记忆段用默认网格 ⇒ 网格不一致）；② 档位因「调用方传了 `steps_t`」或「本窗无锚帧」而**退回 `context`** 时**打显式日志**（此前静默 ⇒ 实验会白跑且看不出）| `context_window_anchor.py` |
+| **裁剪偏移漏算 x 记忆空白（2026-10-11 修复）** | `x_prefix=anchor_memory` 时 x 侧多插 M 个记忆空白槽，而融合前裁剪只算「前缀+锚+头段」⇒ 每窗输出**错位 M 帧**（症状：动作错乱/反复动作；日志 `窗口N 裁剪后长度 21 != 窗口帧数 17`）。修法：新增唯一来源 `Custom_context._x_prefix_mem_slots(window)`（复用 `_x_memory_slots`）并纳入 `front_trim`；同时修好分歧审计的位置映射（`base = 锚 + M`），重影审计恢复可用。回归用例24 | `Custom_context.py`、`context_window_anchor.py`、`md/context_window_anchor_selftest.py` |
+| **FreeNoise 实现（2026-10-11 审计：代码级事实）** | 与 comfy 官方 `apply_freenoise` 同语义（噪声池 / randperm / 覆写位置一致），另修官方两处：①改用**真实窗口起点**（官方假定均匀步长 ⇒ `even_standard` 这类非均匀起点下覆写块错位；selftest 用例7 守护）；②`dynamic_seed` 固定 = `seed`（官方残留的 `seed + _step*997` 在原 wrapper 里 `_step` 恒 0，无效）。**作用范围：每次 `sample()` 只对初始噪声置换一次**（wrapper 挂在 `SAMPLER_SAMPLE`，非每去噪步）⇒ 对缝合处的单帧跳变作用天然有限。已知限制：**不支持多模态 noise**（官方会按模态缩放 C/OV）；wrapper key 与官方同名（两者同时存在时只有后装者生效，且无告警）| `Custom_context.py`、`md/context_windows_schedule_selftest.py` |
+| **`anchor_slot`（2026-10-11 新增控件）** | 两档锚帧时间码语义：`context`（默认）= 物理 `[记忆][锚][本窗]` + `prehistory=0`；`leading` = 物理 `[锚][记忆][本窗]` + `prehistory=K`，并在**同一个 RoPE 函数内**把 x 段拆成 `[x锚][x记忆][x窗]`（锚 = `ref−K..ref−1`、记忆按 stride、窗本体 = `ref..`）。不改 `WanModel` 基类 ⇒ 对其他模型无影响。切换后重跑即可、无需重启。自测：用例3（控件顺序/默认值）、用例13b（`prehistory=K`、总 token 数不变、base 调用 ≥5）。❓**待测**：`leading` vs `context` 的同 seed 对比（各 2 个种子）尚无数据 | `context_window_anchor.py`、`md/context_window_anchor_selftest.py` |
+| **`drive_memory` 控件（2026-10-11）** | 16ch 驱动流（`pose_video_latent`）是否接收记忆帧：默认 `off` = 旧行为（不把 20ch 裁成 16ch ⇒ 该流不接收记忆帧）/ `on` = 补齐记忆帧。切换后重跑即可、无需重启；环境变量 `CWA_DRIVE_MEMORY=0` 为兜底。**实测（各 1 段，幅度不可信、方向暂取 off）**：坏种子 off 23.9 / on 28.8；好种子 on 17.3 / off 18.0。同时把 `x_prefix=none` 标为「实验/不推荐」| `context_window_anchor.py`、`md/context_window_anchor_selftest.py` |
+| **`x_prefix` 时序 bug（2026-10-11 修复）** | `anchor_memory` 崩溃根因（代码级）：条件流（`c_concat` 等）**先**注入、x 侧（`inject_anchor_x`）**后**注入，两边各自算「记忆空白槽数」⇒ 前者读到尚未写入的 `window._x_prefix_mem_count`=0 ⇒ 只 +K，后者 +K+M ⇒ 差 M=4 ⇒ comfy 崩（`Expected size 25 but got size 21`）。修法：唯一来源 **`_x_memory_slots(window)`**（按 `original_indices` 现算、与调用顺序无关），四处统一调用；日志改为打印实际插入帧数。回归用例23 | `context_window_anchor.py`、`md/context_window_anchor_selftest.py` |
+| **顺序规范化回退（2026-10-11）** | 现象（实测，每档 1 段）：物理顺序统一为 `[锚][记忆][本窗]` + `prehistory=K` 后，max 由 12.4~18.1（中位 13.8，旧）变为 **22.4px**；FreeNoise 开时 11.4 → 17.4。**已回退**为 `[记忆][锚][本窗]` + `prehistory=0`。⚠️「相位错开 K 是主因」为**推断，未验证**；若再改该顺序，须同时同步 x 段（见 `anchor_slot`）| `context_window_anchor.py` |
+| **`md/frame_metrics.py`**（本地工具，`md/` 已 gitignore）| 帧级客观指标：**瞬移**（max px / pop比 / 落点作者带 / 接地面跨越比）+ **残差**（重影）+ **逐带**（锐度/饱和）；用**内容哈希**识别「同一段被多个 preview 节点重复保存」并自动对齐偏移 ⇒ `--seedtab` 一条命令出同 seed 参数对照表 |
 
 ### 勘误与「已撤销的实验」（勿把历史记录当缺陷重新引入）
 
