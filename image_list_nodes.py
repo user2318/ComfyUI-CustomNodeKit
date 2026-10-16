@@ -16,6 +16,7 @@
   再往下游全部停摆，界面上毫无提示），与"这一路没接"的直觉不符。
 """
 
+import logging
 import math
 
 import numpy as np
@@ -266,7 +267,7 @@ class ImageListSplitOutputs:
         available = max(0, len(items) - start)
 
         if len(items) > 0 and available == 0:
-            print(f"[ImageListSplitOutputs] Warning: start_index={start} >= 列表长度={len(items)}，"
+            logging.warning(f"[ImageListSplitOutputs] Warning: start_index={start} >= 列表长度={len(items)}，"
                   f"所有输出为空 / no valid range, all outputs are empty.")
 
         outputs = []
@@ -354,7 +355,7 @@ class ImageListReplaceAt:
 
         remaining = len(target) - start
         if remaining <= 0:
-            print(f"[ImageListReplaceAt] Warning: start_index={start} >= 列表长度={len(target)}，"
+            logging.warning(f"[ImageListReplaceAt] Warning: start_index={start} >= 列表长度={len(target)}，"
                   f"原样返回 / no valid range, returning original list.")
             return (target,)
 
@@ -444,21 +445,21 @@ class ImageListToBatch:
         aligned = (Rw % 8 == 0 and Rh % 8 == 0)
 
         if len(items) <= 12:
-            print("[ImageListToBatch] 基准候选: " + " | ".join(
+            logging.debug("[ImageListToBatch] 基准候选: " + " | ".join(
                 f"#{i} {int(it.shape[1])}×{int(it.shape[0])} min={min(int(it.shape[1]), int(it.shape[0]))}"
                 for i, it in enumerate(items)) + f"  -> 选定 #{ref}")
         else:
-            print(f"[ImageListToBatch] 基准候选: 共 {len(items)} 张（略），"
+            logging.info(f"[ImageListToBatch] 基准候选: 共 {len(items)} 张（略），"
                   f"选定 #{ref} {Rw}×{Rh} min={min(Rw, Rh)}")
-        print(f"[ImageListToBatch] 输出尺寸 = {Rw}×{Rh}"
+        logging.info(f"[ImageListToBatch] 输出尺寸 = {Rw}×{Rh}"
               f"（基准 #{ref}，比例 {Rw // divisor}:{Rh // divisor}），共 {len(items)} 张，"
               f"通道 = {'RGBA(4)' if use_alpha else 'RGB(3)'}")
         if use_alpha:
-            print("[ImageListToBatch] 提示：RGBA(4 通道) 只适合支持 alpha 的下游（合成 / 存 PNG）。"
+            logging.info("[ImageListToBatch] 提示：RGBA(4 通道) 只适合支持 alpha 的下游（合成 / 存 PNG）。"
                   "若下游只吃 3 通道（如 Qwen VL 视觉编码器），请改用 RGB，"
                   "或在中间接 Split Image with Alpha（IMAGE 输出即 3 通道），否则会报 token 数不匹配。")
         if not aligned:
-            print(f"[ImageListToBatch] 提示：输出尺寸 {Rw}×{Rh} 不是 8 的倍数，"
+            logging.warning(f"[ImageListToBatch] 提示：输出尺寸 {Rw}×{Rh} 不是 8 的倍数，"
                   "若下游要过 VAE 编码（下采样 8/16），请改用 8/16 倍数尺寸或先做对齐。")
 
         batch = torch.zeros((len(items), Rh, Rw, channels), dtype=torch.float32)

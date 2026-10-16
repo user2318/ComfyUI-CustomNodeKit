@@ -23,6 +23,83 @@ import logging
 logger = logging.getLogger("WanSCAIL2PhaseSampler")
 
 
+# ==================== σ 阶梯工具（外部 SIGMAS 支持） ====================
+
+def _fmt_sigmas(sigmas, max_items=24):
+    """把 σ 阶梯打成紧凑字符串，便于日志核对 / 手填比对。"""
+    vals = [float(v) for v in sigmas.reshape(-1).tolist()]
+    if len(vals) <= max_items:
+        return ", ".join("%g" % v for v in vals)
+    half = max_items // 2
+    return "%s, ... , %s" % (", ".join("%g" % v for v in vals[:half]),
+                             ", ".join("%g" % v for v in vals[-half:]))
+
+
+def _external_sigmas(sigmas, steps, denoise):
+    """校验并规整外部 SIGMAS（可来自 ManualSigmas / BasicScheduler / SplitSigmas 等）。
+
+    约定（与 comfy 官方一致）：len(sigmas) = 步数 + 1，末尾元素为 0。
+    返回 (CPU float tensor, 实际步数)；未提供或不可用时返回 None（回退到 steps/scheduler）。
+    """
+    if sigmas is None:
+        return None
+    try:
+        t = sigmas.detach().to("cpu").float().reshape(-1)
+    except AttributeError:
+        try:
+            t = torch.as_tensor(sigmas, dtype=torch.float32).reshape(-1)
+        except Exception as exc:
+            logger.warning("[WanSCAIL2PhaseSampler] 外部 SIGMAS 无法解析（%s）=> 已忽略，改用 steps/scheduler", exc)
+            return None
+    if int(t.numel()) < 2:
+        logger.warning("[WanSCAIL2PhaseSampler] 外部 SIGMAS 只有 %d 个值（至少 2 个）=> 已忽略，改用 steps/scheduler",
+                       int(t.numel()))
+        return None
+
+    vals = [float(v) for v in t.tolist()]
+    if abs(vals[-1]) > 1e-6:
+        logger.warning("[WanSCAIL2PhaseSampler] 外部 SIGMAS 末尾 %.6g ≠ 0 => 已自动补 0"
+                       "（否则最后一步不会完全去噪）", vals[-1])
+        t = torch.cat([t, torch.zeros(1, dtype=t.dtype)])
+        vals.append(0.0)
+    if min(vals) < 0.0:
+        logger.warning("[WanSCAIL2PhaseSampler] 外部 SIGMAS 含负值（最小 %.6g）=> 结果不可预期，请检查输入", min(vals))
+    rises = [(i, vals[i], vals[i + 1]) for i in range(len(vals) - 1) if vals[i + 1] > vals[i] + 1e-9]
+    if rises:
+        i, a, b = rises[0]
+        logger.warning("[WanSCAIL2PhaseSampler] 外部 SIGMAS 不是单调递减：第 %d→%d 个 %g → %g"
+                       "（共 %d 处上升）=> 建议按 1 → 0 递减", i + 1, i + 2, a, b, len(rises))
+    if max(vals) > 1.5:
+        logger.warning("[WanSCAIL2PhaseSampler] 外部 SIGMAS 最大 %.6g > 1.5 => 看起来是 SD/SVD 的 σ"
+                       "（本模型是 flow，σ 通常在 0~1）=> 已按原样使用，请确认", max(vals))
+    if abs(vals[0] - 1.0) > 1e-3:
+        logger.info("[WanSCAIL2PhaseSampler] 外部 SIGMAS 首项 σ=%.4g（≠1.0 => 起点不是纯噪声，"
+                    "等价于降低了最大去噪强度）", vals[0])
+
+    n_steps = int(t.numel()) - 1
+    if int(steps) != n_steps:
+        logger.warning("[WanSCAIL2PhaseSampler] 控件 steps=%s 与外部 SIGMAS 不符 => steps 已忽略，实际按 %d 步执行",
+                       steps, n_steps)
+    if float(denoise) < 0.9999:
+        logger.warning("[WanSCAIL2PhaseSampler] 控件 denoise=%.3f 已忽略（外部 SIGMAS 已含起点；"
+                       "如需截断请在阶梯里截）", float(denoise))
+    logger.info("[WanSCAIL2PhaseSampler] 使用外部 SIGMAS：%d 步，σ = %s", n_steps, _fmt_sigmas(t))
+    return t, n_steps
+
+
+def _build_ladder(model1, steps, sampler_name, scheduler, denoise):
+    """按官方 KSampler 生成 σ 阶梯（CPU tensor，len = 步数 + 1），并打进日志便于事后核对。"""
+    s = comfy.samplers.KSampler(
+        model1, steps=int(steps), device=model1.load_device,
+        sampler=sampler_name, scheduler=scheduler,
+        denoise=denoise, model_options=model1.model_options)
+    t = s.sigmas.detach().to("cpu").float()
+    del s
+    logger.info("[WanSCAIL2PhaseSampler] σ 阶梯（%d 步，scheduler=%s，denoise=%.2f）：%s",
+                int(t.numel()) - 1, scheduler, float(denoise), _fmt_sigmas(t))
+    return t
+
+
 class WanSCAIL2PhaseSampler:
     """
     两阶段采样节点。
@@ -31,6 +108,10 @@ class WanSCAIL2PhaseSampler:
     previous_frames 是上一个 chunk 解码后的尾部像素帧。
     
     两阶段条件：split_step > 0 AND split_step < steps AND 有 previous_frames。
+
+    可选输入 sigmas（SIGMAS）：接上外部 σ 阶梯后 steps/scheduler/denoise 被旁路，
+    实际步数 = len(sigmas) - 1（末尾元素应为 0，缺失会自动补 0）；其余机制
+    （锚定回写 / phase_schedule / color_align）完全不变。
     
     流程：
     1. 将 previous_frames 尾部 previous_frame_count 帧 VAE 编码，写入 latent 前段作锚定
@@ -73,6 +154,8 @@ class WanSCAIL2PhaseSampler:
                     "tooltip": "mask 插值曲线形状：s=t^exponent。<1=先陡后缓（前几步高自由度，随后强锚定）；1.0=线性；>1=先缓后陡。Mask interpolation curve shape: s=t^exponent. <1=steep first then flat; 1.0=linear; >1=flat first then steep."}),
             },
             "optional": {
+                "sigmas": ("SIGMAS", {"optional": True,
+                    "tooltip": "可选：外部 σ 阶梯（SIGMAS，如 ManualSigmas / BasicScheduler / SplitSigmas）。接上后 steps/scheduler/denoise 被忽略，实际步数=长度-1，末尾元素应为 0（缺则自动补 0）。Optional external sigma ladder; steps/scheduler/denoise are bypassed."}),
                 "model2": ("MODEL", {"optional": True,
                     "tooltip": "Phase 2 使用的模型，不提供时使用 model1。Model used for Phase 2; falls back to model1 if not provided."}),
                 "previous_frames": ("IMAGE", {"optional": True,
@@ -94,7 +177,7 @@ class WanSCAIL2PhaseSampler:
                split_step=0, phase1_noise=0.5, phase2_noise=0.1,
                previous_frame_count=5, model2=None, previous_frames=None,
                color_align=True,
-               phase_schedule=False, schedule_exponent=1.0):
+               phase_schedule=False, schedule_exponent=1.0, sigmas=None):
 
         samples = latent["samples"]
         B, C, T, Hl, Wl = samples.shape
@@ -130,6 +213,18 @@ class WanSCAIL2PhaseSampler:
         # ----- 噪声生成（GPU）-----
         noise = comfy.sample.prepare_noise(samples, seed)
 
+        # ----- σ 阶梯：外部 SIGMAS 优先（接上后 steps/scheduler/denoise 被旁路）-----
+        ext = _external_sigmas(sigmas, steps, denoise)
+        if ext is not None:
+            full_sigmas_cpu, steps = ext
+            if split_step > 0 and split_step >= steps:
+                logger.warning(
+                    "[WanSCAIL2PhaseSampler] split_step=%d >= 实际步数 %d => 不满足两阶段条件，本次按单阶段执行",
+                    split_step, steps)
+        else:
+            full_sigmas_cpu = _build_ladder(model1, steps, sampler_name, scheduler, denoise)
+        sampling_sigmas = None if ext is None else full_sigmas_cpu.to(model1.load_device)
+
         pbar = comfy.utils.ProgressBar(steps)
 
         def _mk_cb(offset=0):
@@ -145,7 +240,7 @@ class WanSCAIL2PhaseSampler:
                 model1, model2, positive, negative, samples, prev_latent_frames,
                 encoded_prev, noise, steps, cfg, sampler_name, scheduler,
                 denoise, seed, phase1_noise, phase2_noise,
-                schedule_exponent, make_cb=_mk_cb)
+                schedule_exponent, make_cb=_mk_cb, full_sigmas=full_sigmas_cpu)
             out_noise_mask = torch.ones((1, 1, T, Hl, Wl), device=samples.device, dtype=samples.dtype)
             out_noise_mask[:, :, :prev_latent_frames] = phase2_noise
 
@@ -164,7 +259,7 @@ class WanSCAIL2PhaseSampler:
                 model1, steps=steps, device=model1.load_device,
                 sampler=sampler_name, scheduler=scheduler,
                 denoise=denoise, model_options=model1.model_options)
-            full_sigmas = s1.sigmas.to(model1.load_device)
+            full_sigmas = full_sigmas_cpu.to(model1.load_device)
             high_sigmas = full_sigmas[:split_step + 1]
             low_sigmas = full_sigmas[split_step:]
 
@@ -210,7 +305,7 @@ class WanSCAIL2PhaseSampler:
                 sampler_name=sampler_name, scheduler=scheduler,
                 positive=positive, negative=negative,
                 latent_image=samples, denoise=denoise,
-                noise_mask=noise_mask, seed=seed,
+                noise_mask=noise_mask, seed=seed, sigmas=sampling_sigmas,
                 callback=_mk_cb())
             out_noise_mask = noise_mask
 
@@ -221,7 +316,7 @@ class WanSCAIL2PhaseSampler:
                 sampler_name=sampler_name, scheduler=scheduler,
                 positive=positive, negative=negative,
                 latent_image=samples, denoise=denoise,
-                noise_mask=None, seed=seed,
+                noise_mask=None, seed=seed, sigmas=sampling_sigmas,
                 callback=_mk_cb())
             out_noise_mask = None
 
@@ -236,7 +331,17 @@ class WanSCAIL2PhaseSampler:
             scale = p_std / (c_std + 1e-5)
             shift = p_mean - scale * c_mean
             samples_out = samples_out * scale + shift
-            logger.info("[WanSCAIL2PhaseSampler] color_align: per-channel scale=%s shift=%s", scale.squeeze().tolist(), shift.squeeze().tolist())
+            # ★ 紧凑：默认只报"有没有实质校正"（旧实现打两串 16 个浮点 ⇒ 一行很长、还常被截断）
+            _sc = [float(v) for v in scale.reshape(-1).tolist()]
+            _sh = [float(v) for v in shift.reshape(-1).tolist()]
+            _dev = max([abs(v - 1.0) for v in _sc] + [0.0])
+            _shmax = max([abs(v) for v in _sh] + [0.0])
+            if _dev < 1e-4 and _shmax < 1e-4:
+                logger.info("[WanSCAIL2PhaseSampler] color_align：≈恒等（max|scale-1|=%.1e，max|shift|=%.1e）"
+                            " => 接续帧与本段输出本就一致，未做实质校正", _dev, _shmax)
+            else:
+                logger.info("[WanSCAIL2PhaseSampler] color_align：已校正（前 4 通道 scale=%s shift=%s）",
+                            ["%.4f" % v for v in _sc[:4]], ["%+.4f" % v for v in _sh[:4]])
 
         out = {"samples": samples_out}
         if out_noise_mask is not None:
@@ -249,7 +354,7 @@ class WanSCAIL2PhaseSampler:
                                anchor_len, anchor_content, noise, steps, cfg,
                                sampler_name, scheduler, denoise, seed,
                                phase1_noise, phase2_noise,
-                                schedule_exponent, make_cb):
+                                schedule_exponent, make_cb, full_sigmas=None):
         """Extend two-phase to N stages (one stage per sampling step).
 
         Continuity mechanism is identical to the two-phase mode:
@@ -266,13 +371,11 @@ class WanSCAIL2PhaseSampler:
         B, C, T, Hl, Wl = latent.shape
         device = model1.load_device
 
-        # full sigma sequence (from model1; explicit sigmas means denoise is not applied twice)
-        s_ref = comfy.samplers.KSampler(
-            model1, steps=steps, device=device,
-            sampler=sampler_name, scheduler=scheduler,
-            denoise=denoise, model_options=model1.model_options)
-        full_sigmas = s_ref.sigmas.to(device)
-        del s_ref
+        # σ 阶梯由调用方（sample）解析：外部 SIGMAS 优先，否则官方 KSampler 生成
+        # （显式 sigmas ⇒ denoise 不会被应用两次）
+        if full_sigmas is None:
+            full_sigmas = _build_ladder(model1, steps, sampler_name, scheduler, denoise)
+        full_sigmas = full_sigmas.to(device)
 
         n_stages = len(full_sigmas) - 1  # number of stages = number of steps
         out = latent

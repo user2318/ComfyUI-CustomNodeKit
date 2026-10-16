@@ -26,6 +26,20 @@ import numpy as np
 from comfy.ldm.wan.model import sinusoidal_embedding_1d
 
 
+# 2026-10-15：per-step 日志降噪 —— 同一个 tag 只 info 一次，之后降为 debug
+# （默认控制台是 INFO 级 => 那些「每步都一样」的行不再刷屏；要看全程用 --verbose 开 DEBUG）
+_LOGGED_ONCE: set = set()
+
+
+def _log_once(tag, msg, *args):
+    """同 tag 只 info 一次，之后 debug。"""
+    if tag in _LOGGED_ONCE:
+        logging.debug(msg, *args)
+    else:
+        _LOGGED_ONCE.add(tag)
+        logging.info(msg, *args)
+
+
 # ============================================================
 # 内联的 WanControlNet 相关类（从 uni3c/controlnet.py 移植）
 # ============================================================
@@ -510,7 +524,7 @@ class WanUni3CApply:
                                                        cn_data.get("latent_format"), target_shape, device)
                         cn_data["prepared_render"] = rl
                         cn_data["prepared_render_shape"] = target_shape
-                        logging.info(f"[Uni3C] render_video 已编码: {tuple(rl.shape)}")
+                        _log_once(("render_encoded",), "[Uni3C] render_video 已编码: %s", tuple(rl.shape))
                     rl_slice = rl[0:1, :16].to(device=device, dtype=cn_data["dtype"])
 
                     # ===== 参考帧 token 偏移（仅 WanAnimate concat 路径；SCAIL 走 ref_token_len 逻辑） =====
@@ -521,7 +535,7 @@ class WanUni3CApply:
                             inferred = int(x_orig_for_noise.shape[2]) - int(rl.shape[2])
                             if inferred > 0:
                                 trim_frames = inferred
-                                logging.info(f"[Uni3C] 自动推断参考帧数 = {inferred}")
+                                _log_once(("infer_ref",), "[Uni3C] 自动推断参考帧数 = %d", inferred)
                         ref_frames_in_window = trim_frames
                         if window is not None and hasattr(window, "index_list") and len(window.index_list) > 0:
                             first_global = int(window.index_list[0])
@@ -529,11 +543,13 @@ class WanUni3CApply:
                                 ref_frames_in_window = 0
                             else:
                                 ref_frames_in_window = min(trim_frames - first_global, len(window.index_list))
-                            logging.info(f"[Uni3C] 窗口首帧索引={first_global}, trim={trim_frames}, 窗口内参考帧={ref_frames_in_window}")
+                            _log_once(("win_ref",), "[Uni3C] 窗口首帧索引=%d, trim=%d, 窗口内参考帧=%d",
+                                      first_global, trim_frames, ref_frames_in_window)
                         if ref_frames_in_window > 0:
                             tokens_per_frame = (x_orig_for_noise.shape[3] // 2) * (x_orig_for_noise.shape[4] // 2)
                             cn_data["ref_offset"] = ref_frames_in_window * tokens_per_frame
-                            logging.info(f"[Uni3C] WanAnimate 参考帧偏移 = {ref_frames_in_window}帧 x {tokens_per_frame} token/帧 = {cn_data['ref_offset']}")
+                            _log_once(("ref_offset",), "[Uni3C] WanAnimate 参考帧偏移 = %d帧 x %d token/帧 = %d",
+                                      ref_frames_in_window, tokens_per_frame, cn_data["ref_offset"])
                         else:
                             cn_data["ref_offset"] = 0
                     elif full_ref is not None:
@@ -556,10 +572,11 @@ class WanUni3CApply:
                     if uni3c_controlnet_states is not None:
                         cs_means = [cs.mean().item() for cs in uni3c_controlnet_states if cs is not None]
                         cs_stds = [cs.std().item() for cs in uni3c_controlnet_states if cs is not None]
-                        logging.info(f"[Uni3C] 步骤 {step_pct:.2f}: "
-                                    f"已计算 {len(uni3c_controlnet_states)} 个控制信号, "
-                                    f"mean={sum(cs_means)/len(cs_means):.6f}, "
-                                    f"std={sum(cs_stds)/len(cs_stds):.6f}")
+                        # 2026-10-15 降噪：每步都会打 => 首次 info，之后 debug（要看逐步统计请用 --verbose）
+                        _log_once(("step_stats",),
+                                  "[Uni3C] 步骤 %.2f: 已计算 %d 个控制信号, mean=%.6f, std=%.6f",
+                                  step_pct, len(uni3c_controlnet_states),
+                                  sum(cs_means) / len(cs_means), sum(cs_stds) / len(cs_stds))
                     
                 except Exception as ex:
                     logging.error(f"[Uni3C] ControlNet 推理失败: {ex}")

@@ -10,6 +10,7 @@
 #
 # 依赖安装: pip install groundingdino-py transformers
 
+import logging
 import os
 import json
 import math
@@ -57,7 +58,7 @@ def _get_local_filepath(url: str, subdir: str) -> str:
     dest_path = os.path.join(dest_dir, filename)
     if os.path.exists(dest_path):
         return dest_path
-    print(f"[GD Nodes] Downloading {filename} from {url} ...")
+    logging.info(f"[GD Nodes] Downloading {filename} from {url} ...")
     from torch.hub import download_url_to_file
     download_url_to_file(url, dest_path)
     return dest_path
@@ -86,7 +87,7 @@ def _load_gd_model(model_name: str) -> dict:
     config_path = _get_local_filepath(model_info["config_url"], "grounding-dino")
     model_path  = _get_local_filepath(model_info["model_url"], "grounding-dino")
 
-    print(f"[GD Nodes] Building GroundingDINO model: {model_name} ...")
+    logging.info(f"[GD Nodes] Building GroundingDINO model: {model_name} ...")
     args = SLConfig.fromfile(config_path)
     
     if args.text_encoder_type == "bert-base-uncased":
@@ -104,7 +105,7 @@ def _load_gd_model(model_name: str) -> dict:
 
     device = comfy.model_management.get_torch_device()
     model = model.to(device)
-    print(f"[GD Nodes] Model loaded on {device}, will stay resident.")
+    logging.info(f"[GD Nodes] Model loaded on {device}, will stay resident.")
 
     wrapper = {"model": model, "model_name": model_name, "device": device, "unloaded": False}
     _GD_MODEL_CACHE[model_name] = wrapper
@@ -157,7 +158,7 @@ def _gd_predict_batch(model_wrapper: dict, images_batch: torch.Tensor,
         target = model_wrapper.get("device") or next(model.parameters()).device
         model.to(target)
         model_wrapper["unloaded"] = False
-        print(f"[GD Nodes] 模型已移回 {target} 执行推理")
+        logging.info(f"[GD Nodes] 模型已移回 {target} 执行推理")
     device = next(model.parameters()).device
     B, H, W, C = images_batch.shape
 
@@ -457,10 +458,10 @@ class GD_BBoxDetect:
                 gd_model["model"].to("cpu")
                 comfy.model_management.soft_empty_cache()
                 gd_model["unloaded"] = True
-                print(f"[GD Nodes] 已将 {gd_model.get('model_name')} 移回 CPU 并释放显存"
+                logging.info(f"[GD Nodes] 已将 {gd_model.get('model_name')} 移回 CPU 并释放显存"
                       f"（下次检测会自动移回 GPU）")
             except Exception as e:
-                print(f"[GD Nodes] 卸载模型失败（忽略）: {e}")
+                logging.debug(f"[GD Nodes] 卸载模型失败（忽略）: {e}")
 
         return (filtered, preview_tensor, preview_json)
 

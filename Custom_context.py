@@ -147,6 +147,8 @@ ContextResults = collections.namedtuple("ContextResults", ['window_idx', 'sub_co
 
 # 坐标映射告警去重（避免每个采样步/每个窗口刷屏）
 _COND_MAPPING_LOGGED = set()
+# 2026-10-15：裁剪长度不符的告警 —— 每窗 × 每步都会重算 => 同一 (窗, 长度) 只告警一次
+_TRIM_LOGGED = set()
 
 
 def cond_indices_for_window(window, cond_len: int, x_len: int, key: str = "cond") -> list:
@@ -167,7 +169,7 @@ def cond_indices_for_window(window, cond_len: int, x_len: int, key: str = "cond"
         if ("slot_offset", key) not in _COND_MAPPING_LOGGED:
             _COND_MAPPING_LOGGED.add(("slot_offset", key))
             logging.info(
-                "[ContextWindows] %s: cond 长度 %d = x 长度 %d - 1，按「参考槽偏移 1 帧」映射（pose 帧 j ↔ 生成帧 j+1）",
+                "[ContextWindows] %s: cond 长度 %d = x 长度 %d - 1，按「参考槽偏移 1 帧」映射（pose 帧 j <-> 生成帧 j+1）",
                 key, cond_len, x_len)
         return [i - 1 for i in full if 1 <= i <= cond_len]
     if ("mismatch", key, cond_len, x_len) not in _COND_MAPPING_LOGGED:
@@ -208,9 +210,11 @@ class IndexListContextHandler(ContextHandlerABC):
 
     def should_use_context(self, model: BaseModel, conds: list[list[dict]], x_in: torch.Tensor, timestep: torch.Tensor, model_options: dict[str]) -> bool:
         if x_in.size(self.dim) > self.context_length:
-            logging.info(f"Using context windows {self.context_length} with overlap {self.context_overlap} for {x_in.size(self.dim)} frames.")
+            # 2026-10-15 降噪：核心 calc_cond_batch（comfy/samplers.py:210）**每个去噪步**都会调到这里
+            #   => 默认档 INFO 会每步打一行（实测 5/次运行）=> 降到 debug（要看用 --verbose）
+            logging.debug(f"Using context windows {self.context_length} with overlap {self.context_overlap} for {x_in.size(self.dim)} frames.")
             if self.prefix_indices:
-                logging.info(f"Prefixing frames: {self.prefix_indices} to each window.")
+                logging.debug(f"Prefixing frames: {self.prefix_indices} to each window.")
             return True
         return False
 
@@ -225,7 +229,8 @@ class IndexListContextHandler(ContextHandlerABC):
         resized_cond = []
         if self.split_conds_to_windows and len(cond_in) > 1:
             region = window.get_region_index(len(cond_in))
-            logging.info(f"Splitting conds to windows; using region {region} for window (original {window.original_indices[0]}-{window.original_indices[-1]})")
+            # 2026-10-15 降噪：每窗 × 每步都会打 => debug 档
+            logging.debug(f"Splitting conds to windows; using region {region} for window (original {window.original_indices[0]}-{window.original_indices[-1]})")
             cond_in = [cond_in[region]]
         for actual_cond in cond_in:
             resized_actual_cond = actual_cond.copy()
@@ -247,7 +252,8 @@ class IndexListContextHandler(ContextHandlerABC):
                                         actual_cond_item[tuple(slices)] = dynamic_latent.to(
                                             actual_cond_item.device, actual_cond_item.dtype
                                         )[:, :, :pl, :, :].to(actual_cond_item.device, actual_cond_item.dtype)
-                                        logging.info(
+                                        # 2026-10-15 降噪：每窗 × 每步都会打 => debug 档
+                                        logging.debug(
                                             "[ContextWindows] 窗口%d前缀已替换为动态编码prefix",
                                             self._current_window_idx
                                         )
@@ -459,7 +465,8 @@ class IndexListContextHandler(ContextHandlerABC):
         anchor_extra = int(getattr(window, "anchor_latent_count", 0) or 0)
         head_extra = len(getattr(window, "head_extra_indices", None) or [])
         tail_extra = len(getattr(window, "tail_extra_indices", None) or [])
-        front_trim = prefix_len + anchor_extra + head_extra
+        x_mem_extra = _x_prefix_mem_slots(window)   # x_prefix=anchor_memory 时 x 侧还会多 M 个记忆空白槽
+        front_trim = prefix_len + anchor_extra + x_mem_extra + head_extra
         expected_len = len(window.original_indices)
         if front_trim > 0 or tail_extra > 0:
             body_out = []
@@ -470,9 +477,14 @@ class IndexListContextHandler(ContextHandlerABC):
                 slices[self.dim] = slice(front_trim, stop)
                 trimmed = tensor[tuple(slices)]
                 if trimmed.shape[self.dim] != expected_len:
-                    logging.warning(
-                        "[ContextWindows] 窗口%d 裁剪后长度 %d != 窗口帧数 %d（前缀=%d, 锚定=%d, 头段=%d, 尾段=%d）",
-                        window_idx, trimmed.shape[self.dim], expected_len, prefix_len, anchor_extra, head_extra, tail_extra)
+                    # 2026-10-15：每窗 × 每步都会重算 => 同一 (窗, 长度) 只告警一次（否则每步刷一遍）
+                    _trim_key = (window_idx, int(trimmed.shape[self.dim]), int(expected_len))
+                    if _trim_key not in _TRIM_LOGGED:
+                        _TRIM_LOGGED.add(_trim_key)
+                        logging.warning(
+                            "[ContextWindows] 窗口%d 裁剪后长度 %d != 窗口帧数 %d（前缀=%d, 锚定=%d, x记忆=%d, 头段=%d, 尾段=%d）",
+                            window_idx, trimmed.shape[self.dim], expected_len, prefix_len, anchor_extra,
+                            x_mem_extra, head_extra, tail_extra)
                 body_out.append(trimmed)
         else:
             body_out = sub_conds_out
@@ -614,9 +626,30 @@ def _sampler_sample_wrapper(executor, guider, sigmas, extra_args, callback, nois
         context_length=handler.context_length,
         context_overlap=handler.context_overlap,
         seed=dynamic_seed,
-        prefix_len=handler.prefix_latent_len
+        prefix_len=handler.prefix_latent_len,
+        starts=_freenoise_window_starts(handler, noise, model_options),
     )
     return executor(guider, sigmas, extra_args, callback, noise, *args, **kwargs)
+
+
+def _freenoise_window_starts(handler, noise, model_options):
+    """取**真实窗口起点**（用 handler 上挂的 context_schedule 现场算一遍），供 FreeNoise 精确对齐。
+
+    为什么：FreeNoise 的覆写块必须落在「本窗新增段」上；旧实现假定步长均匀，在 `standard_even`
+    这类**非均匀起点**的调度下会错位（F14/F15）。拿不到 / 起点非单调（如 looped 循环窗口）⇒ 返回 None
+    （调用方会退回旧的均匀步长假设，保证行为可预期）。
+    """
+    try:
+        fn = getattr(getattr(handler, "context_schedule", None), "func", None)
+        if fn is None:
+            return None
+        wins = fn(int(noise.shape[handler.dim]), handler, model_options)
+        cand = [int(w[0]) for w in wins if w]
+        if len(cand) > 1 and all(cand[i] < cand[i + 1] for i in range(len(cand) - 1)):
+            return cand
+    except Exception:
+        logging.debug("[ContextWindows] FreeNoise 取真实窗口起点失败（退回均匀步长假设）", exc_info=True)
+    return None
 
 
 def create_sampler_sample_wrapper(model: ModelPatcher):
@@ -661,7 +694,11 @@ _LASTWINDOW_WARNED = set()
 
 
 def _warn_last_window_overlap(windows: list, handler, reason: str = "末窗「回头对齐」") -> None:
-    """末窗与前一窗的重叠远大于 context_overlap 时告警（该处会被加权平均 ⇒ 最容易重影）。"""
+    """末窗与前一窗的重叠远大于 context_overlap 时告警（该处会被加权平均 => 最容易重影）。
+
+    2026-10-15：文案按 reason 分流。`standard_even`（等长窗口）下「末缝重叠大」是**几何必然**
+    （末窗起点被锁在「总帧数 - 窗口长」）=> 不能再建议用户「改用 standard_even」（自相矛盾）。
+    """
     try:
         if len(windows) < 2:
             return
@@ -674,11 +711,20 @@ def _warn_last_window_overlap(windows: list, handler, reason: str = "末窗「�
             return
         _LASTWINDOW_WARNED.add(tag)
         ratio = f"{ov / want:.1f} 倍" if want else "无穷（设定 0 = 无重叠）"
-        logging.warning(
-            "[ContextWindows] %s 使末缝重叠 = %d latent（设定 overlap = %d latent，%s）："
-            "该重叠区会被加权平均，最容易出现重影/动作发软。建议改用 standard_even（等长窗口、末窗不回退）"
-            "或 batched（无重叠、末窗变短），也可以配 Context Window Anchor 的 head/tail 只读上下文。",
-            reason, ov, want, ratio)
+        c_len = int(getattr(handler, "context_length", 0) or 0)
+        total = max(max(w) for w in windows) + 1
+        if str(reason).startswith("等长"):
+            advice = ("建议：缩短 context_length（窗口越短，末缝被迫的重叠越小）、减少窗口数，"
+                      "或改用 batched（无重叠、末窗变短）；也可以配 Context Window Anchor 的 head/tail 只读上下文。")
+        else:
+            advice = ("建议改用 standard_even（等长窗口、末窗不回退）或 batched（无重叠、末窗变短）；"
+                      "也可以配 Context Window Anchor 的 head/tail 只读上下文。")
+        # 2026-10-15：整条消息（含分流的 advice）先拼成一个字符串再交给 logging.warning ——
+        #   这样第 0 个参数（格式串）里就带着「末窗」等关键词，自测的断言（检查格式串）依旧成立。
+        msg = ("[ContextWindows] %s 使末缝重叠 = %d latent（设定 overlap = %d latent，%s；"
+               "窗口 %d 个 / 窗口长 %d / 总 %d latent）=> 该重叠区会被加权平均，最容易出现重影/动作发软。"
+               + advice)
+        logging.warning(msg, reason, ov, want, ratio, len(windows), c_len, total)
     except Exception:
         logging.debug("[ContextWindows] 末窗重叠告警检查失败（忽略）", exc_info=True)
 
@@ -929,19 +975,64 @@ def shift_window_to_end(window: list[int], num_frames: int):
         window[i] = window[i] + end_delta
 
 
-def apply_freenoise(noise: torch.Tensor, dim: int, context_length: int, context_overlap: int, seed: int, prefix_len: int = 0):
-    logging.info("Context windows: Applying FreeNoise" + (f" (prefix_len={prefix_len}, preserved)" if prefix_len > 0 else ""))
+def _x_prefix_mem_slots(window) -> int:
+    """x（待生成序列）侧本窗口的「记忆空白」槽数（2026-10-11）。
+
+    裁剪偏移的**唯一来源**：x_prefix=anchor_memory 时 x 会在锚帧之后多插 M 个噪声占位槽，
+    融合前的裁剪必须一并丢掉，否则每窗输出整体**错位 M 帧**
+    （实测症状：动作错乱 / 反复动作；日志 窗口N 裁剪后长度 21 != 窗口帧数 17）。
+    复用锚定节点的 `_x_memory_slots`（按 original_indices 现算、与调用顺序无关）；
+    拿不到该模块时退回 0（= 老行为，不会比现状更差）。
+    """
+    try:
+        try:
+            from .context_window_anchor import _x_memory_slots
+        except Exception:
+            from context_window_anchor import _x_memory_slots
+        return int(_x_memory_slots(window) or 0)
+    except Exception:
+        return 0
+
+
+def apply_freenoise(noise: torch.Tensor, dim: int, context_length: int, context_overlap: int, seed: int,
+                    prefix_len: int = 0, starts=None):
+    """FreeNoise 噪声重排：让「后一窗新增的那些帧」的噪声，来自「前一窗已经用过的那段噪声池」。
+
+    原理（论文 `2310.15169`）：相邻窗口**共享同一段噪声** ⇒ 内容长程相关 ⇒ 减少跨窗漂移/色差。
+
+    ⚠️ 旧实现假定**窗口步长均匀**（`delta = C - OV`），覆写块落在 `C, C+delta, C+2delta, …`。
+    在 `standard_even`（起点非均匀，如 0/8/17/25）下，这些块与真实的「本窗新增段」边界**不重合**
+    ⇒ 「噪声池 → 新帧」的对应关系错位，越往后越碎（本仓库文档 F14/F15）。
+    ⇒ 现在**优先用真实窗口起点**（由调用方从 `context_schedule` 取）；拿不到或非单调时退回旧的均匀假设
+      （等步长时二者**逐位一致**，保证回归）。
+    """
+    # 2026-10-15 降噪：FreeNoise 每个去噪步都会重排一次 => 每步一行的 INFO 降到 debug
+    logging.debug("Context windows: Applying FreeNoise"
+                  + (f" (prefix_len={prefix_len}, preserved)" if prefix_len > 0 else "")
+                  + ("（用真实窗口起点）" if starts else "（均匀步长假设）"))
     generator = torch.Generator(device='cpu').manual_seed(seed)
     latent_video_length = noise.shape[dim]
     delta = context_length - context_overlap
 
-    for start_idx in range(prefix_len, latent_video_length - context_length, delta):
-        place_idx = start_idx + context_length
-        actual_delta = min(delta, latent_video_length - place_idx)
+    # (源起点, 目标起点, 期望块长)：
+    #   源 = 前一窗的起点（= 那段"已经用过的噪声池"）
+    #   目标 = 前一窗起点 + C（= 本窗新增段的起点）
+    #   块长 = 两窗起点之差（均匀时 = delta；非均匀时用真实步长）
+    pairs = []
+    if starts and len(starts) > 1 and all(int(starts[i]) < int(starts[i + 1]) for i in range(len(starts) - 1)):
+        for i in range(1, len(starts)):
+            pairs.append((int(starts[i - 1]), int(starts[i - 1]) + context_length,
+                          int(starts[i]) - int(starts[i - 1])))
+    else:
+        for s in range(prefix_len, latent_video_length - context_length, delta):
+            pairs.append((int(s), int(s) + context_length, int(delta)))
+
+    for src_start, place_idx, want in pairs:
+        actual_delta = min(want, latent_video_length - place_idx)
         if actual_delta <= 0:
             break
 
-        list_idx = torch.randperm(actual_delta, generator=generator, device='cpu') + start_idx
+        list_idx = torch.randperm(actual_delta, generator=generator, device='cpu') + src_start
 
         source_slice = [slice(None)] * noise.ndim
         source_slice[dim] = list_idx
@@ -1048,13 +1139,13 @@ class CustomWanContextWindowsManualNode:
             vae is not None,
         ])
         if not has_all_inputs:
-            print("[ContextWindows] 动态前缀模式未启用 (缺少 window_reference_images / latent_yaw_angles / vae)")
+            logging.debug("[ContextWindows] 动态前缀模式未启用 (缺少 window_reference_images / latent_yaw_angles / vae)")
         elif ReferenceImageUtils is None:
-            print("[ContextWindows] 动态前缀模式未启用 (ReferenceImageUtils 导入失败)")
+            logging.debug("[ContextWindows] 动态前缀模式未启用 (ReferenceImageUtils 导入失败)")
         elif prefix_latent_len <= 0:
-            print("[ContextWindows] 动态前缀模式未启用 (prefix_latent_num <= 0)")
+            logging.debug("[ContextWindows] 动态前缀模式未启用 (prefix_latent_num <= 0)")
         elif window_reference_images is not None and window_reference_images.shape[0] == 0:
-            print("[ContextWindows] 动态前缀模式未启用 (window_reference_images 为空)")
+            logging.debug("[ContextWindows] 动态前缀模式未启用 (window_reference_images 为空)")
         else:
             handler.use_dynamic_prefix = True
             self._precompute_window_prefixes(
@@ -1085,7 +1176,7 @@ class CustomWanContextWindowsManualNode:
             yaw_list = []
 
         if not yaw_list:
-            print("[ContextWindows] 动态前缀模式未启用 (latent_yaw_angles 为空)")
+            logging.debug("[ContextWindows] 动态前缀模式未启用 (latent_yaw_angles 为空)")
             handler.use_dynamic_prefix = False
             return
 
@@ -1100,7 +1191,7 @@ class CustomWanContextWindowsManualNode:
                 pass
 
         if angle_map_list is None or len(angle_map_list) != window_reference_images.shape[0]:
-            print(
+            logging.warning(
                 "[ContextWindows] 动态前缀模式未启用 "
                 f"(reference_angle_map 解析失败或数量 ({len(angle_map_list) if angle_map_list else 0}) "
                 f"与参考图数量 ({window_reference_images.shape[0]}) 不匹配)"
@@ -1118,7 +1209,7 @@ class CustomWanContextWindowsManualNode:
             delta = handler.context_length - handler.context_overlap
             num_windows = math.ceil((total_latent_frames - handler.context_length) / delta) + 1
 
-        print(f"[ContextWindows] 动态前缀模式已启用，窗口数: {num_windows}")
+        logging.info(f"[ContextWindows] 动态前缀模式已启用，窗口数: {num_windows}")
 
         # 窗口 0 使用原生前缀，从窗口 1 开始计算动态前缀
         for window_idx in range(1, num_windows):
@@ -1137,7 +1228,7 @@ class CustomWanContextWindowsManualNode:
             yaw_max = max(window_yaws)
             target_yaw = window_yaws[0]
 
-            print(
+            logging.debug(
                 f"[ContextWindows] 窗口{window_idx}: yaw_range=[{yaw_min:.1f}, {yaw_max:.1f}], "
                 f"target_yaw={target_yaw:.1f}"
             )
@@ -1155,13 +1246,13 @@ class CustomWanContextWindowsManualNode:
 
             # 打印前几行日志
             for line in info_lines[:5]:
-                print(f"[ContextWindows] 窗口{window_idx}: {line}")
+                logging.debug(f"[ContextWindows] 窗口{window_idx}: {line}")
 
             # 确保有足够的帧数
             if selected_batch.shape[0] < needed_pixel_frames:
                 repeat_times = math.ceil(needed_pixel_frames / selected_batch.shape[0])
                 selected_batch = selected_batch.repeat(repeat_times, 1, 1, 1)[:needed_pixel_frames]
-                print(
+                logging.warning(
                     f"[ContextWindows] 窗口{window_idx}: 候选参考图不足, "
                     f"已重复填充至 {needed_pixel_frames} 帧"
                 )
@@ -1171,7 +1262,7 @@ class CustomWanContextWindowsManualNode:
             # VAE 编码
             encoded = vae.encode(selected_batch[:, :, :, :3])
             handler.per_window_prefix_latents[window_idx] = encoded
-            print(
+            logging.debug(
                 f"[ContextWindows] 窗口{window_idx}: 动态前缀已预计算, "
                 f"latent 形状={list(encoded.shape)}, 帧数={encoded.shape[2]}"
             )

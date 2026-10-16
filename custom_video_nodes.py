@@ -989,7 +989,7 @@ class VideoGridCompose:
         filter_parts.append("[out]pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:color=black[final_out]")
         
         filter_complex = ';'.join(filter_parts)
-        logging.info(f"filter_complex: {filter_complex}")
+        logging.debug(f"filter_complex: {filter_complex}")
         
         # ==============================
         # 10. 构建输出路径
@@ -1041,7 +1041,7 @@ class VideoGridCompose:
             str(final_path)
         ])
         
-        logging.info(f"ffmpeg 命令: {' '.join(cmd)}")
+        logging.debug(f"ffmpeg 命令: {' '.join(cmd)}")
         
         # ==============================
         # 12. 执行

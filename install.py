@@ -286,13 +286,13 @@ def _install_tkinter_from_nuget():
                 capture_output=True, text=True, timeout=30
             )
             if result.returncode == 0:
-                print(f"[ComfyUI-CustomNodeKit] ✓ tkinter 修复成功！")
+                print(f"[ComfyUI-CustomNodeKit] [OK] tkinter 修复成功！")
                 return True
             else:
-                print(f"[ComfyUI-CustomNodeKit] ✗ tkinter 仍然无法导入: {result.stderr}")
+                print(f"[ComfyUI-CustomNodeKit] [X] tkinter 仍然无法导入: {result.stderr}")
                 return False
         except Exception as e:
-            print(f"[ComfyUI-CustomNodeKit] ✗ 验证失败: {e}")
+            print(f"[ComfyUI-CustomNodeKit] [X] 验证失败: {e}")
             return False
 
 
@@ -303,7 +303,7 @@ def _ensure_tkinter():
         print("[ComfyUI-CustomNodeKit] tkinter 已就绪")
         return True
 
-    print("[ComfyUI-CustomNodeKit] ⚠ 检测到 tkinter 缺失")
+    print("[ComfyUI-CustomNodeKit] ! 检测到 tkinter 缺失")
     print(f"[ComfyUI-CustomNodeKit] Python 版本: {sys.version}")
     print(f"[ComfyUI-CustomNodeKit] Python 路径: {sys.executable}")
 
@@ -318,11 +318,11 @@ def _ensure_tkinter():
 
     success = _install_tkinter_from_nuget()
     if success:
-        print("[ComfyUI-CustomNodeKit] ✅ tkinter 自动修复完成！")
+        print("[ComfyUI-CustomNodeKit] [OK] tkinter 自动修复完成！")
         print("[ComfyUI-CustomNodeKit] 部分节点（交互式批量裁剪等）的文件选择功能现已可用。")
         return True
     else:
-        print("[ComfyUI-CustomNodeKit] ❌ tkinter 自动修复失败，请尝试手动解决：")
+        print("[ComfyUI-CustomNodeKit] [FAIL] tkinter 自动修复失败，请尝试手动解决：")
         print(f"[ComfyUI-CustomNodeKit]   1. 下载完整版 Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} 安装包")
         print(f"[ComfyUI-CustomNodeKit]   2. 复制以下文件到 {base_dir}\\DLLs\\ 目录：")
         print(f"      - _tkinter.pyd")

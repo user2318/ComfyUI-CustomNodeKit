@@ -162,10 +162,21 @@ def _apply_rope_downsample_patch():
 
             return main_freqs
 
-        _mod.SCAILWanModel.rope_encode = _patched_scail_rope
+        # ★ 不要与 ContextWindowAnchor 的 RoPE 补丁互相覆盖（两者都抢 SCAILWanModel.rope_encode）。
+        #   anchor 的补丁按块构建 [主][锚][历史]，并对 pose 块传 `_scail_rope_downsample=True`
+        #   ⇒ 只要 anchor 补丁在位，本补丁的 SCAIL 级实现就是冗余的；
+        #   若在此处覆盖，会**静默顶掉** anchor 补丁 ⇒ 额外 token 被当成「窗口之后的未来驱动」⇒
+        #   位置错、效果变差且无任何报错（且是否发生取决于节点执行顺序/缓存命中 => 间歇性故障）。
+        _cur_scail = getattr(_mod.SCAILWanModel, "rope_encode", None)
+        if getattr(_cur_scail, "_cwa_rope_patch", False):
+            logging.info("[WanSCAIL_MultiRef] 检测到 ContextWindowAnchor 的 RoPE 补丁在位"
+                         "（其 pose 分块已传 _scail_rope_downsample=True）=> 跳过 SCAIL 级覆盖，避免互相覆盖")
+        else:
+            _mod.SCAILWanModel.rope_encode = _patched_scail_rope
 
         _SCAIL_ROPE_PATCH_APPLIED = True
-        logging.info("[WanSCAIL_MultiRef] RoPE pose-only downsample patch applied")
+        logging.info("[WanSCAIL_MultiRef] RoPE pose-only downsample patch applied（base=已补，SCAIL级=%s）",
+                     "跳过（anchor 在位）" if getattr(_cur_scail, "_cwa_rope_patch", False) else "已补")
     except Exception as e:
         logging.warning("[WanSCAIL_MultiRef] Failed to patch RoPE downsample: %s", e)
 

@@ -81,8 +81,9 @@ def _apply_scail_model_patch():
             # 串行窗口未切（完整帧数），按窗口索引切。
             if sam_latents is not None and is_plugin_window and hasattr(window, "index_list"):
                 wlen = len(window.index_list)
-                logging.info("[SCAILContext] sam_latents shape=%s, window_idx=%s (wlen=%d)",
-                             list(sam_latents.shape), list(window.index_list), wlen)
+                # 2026-10-15 降噪：每个窗口 × 每个去噪步都会走到这里（实测占全日志 10%+）=> debug 档
+                logging.debug("[SCAILContext] sam_latents shape=%s, window_idx=%s (wlen=%d)",
+                              list(sam_latents.shape), list(window.index_list), wlen)
                 if sam_latents.shape[2] != wlen:
                     indices = window.index_list
                     safe_indices = [i for i in indices if i < sam_latents.shape[2]]
@@ -134,7 +135,8 @@ class SCAILContextHandler(IndexListContextHandler):
         resized_cond = []
         if self.split_conds_to_windows and len(cond_in) > 1:
             region = window.get_region_index(len(cond_in))
-            logging.info(
+            # 2026-10-15 降噪：每窗 × 每步都会打 => debug 档
+            logging.debug(
                 "SCAIL context: splitting conds to windows; using region %d for window "
                 "(original %d-%d)", region, window.original_indices[0], window.original_indices[-1]
             )
@@ -199,7 +201,8 @@ class SCAILContextHandler(IndexListContextHandler):
                                 else:
                                     idx = (slice(None), indices)
                                 sliced = _pose_t[idx]
-                                logging.info(
+                                # 2026-10-15 降噪：每窗 × 每步都会打 => debug 档
+                                logging.debug(
                                     "[SCAILContext] pose_video_latent: input=%s, window=%s..%s (head=%d, tail=%d), result=%s",
                                     list(_pose_t.shape),
                                     indices[0] if indices else None,

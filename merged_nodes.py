@@ -1,3 +1,4 @@
+import logging
 import folder_paths
 from server import PromptServer
 from aiohttp import web
@@ -40,7 +41,7 @@ class PathCollectorNode:
             return (lines[index - 1],)
         else:
             # 超出范围 → 输出最后一行作为兜底（并给出告警，避免索引写错时静默取到错误的路径）
-            print(f"[PathCollectorNode] Warning: index={index} 超出范围 (共 {len(lines)} 行)，"
+            logging.warning(f"[PathCollectorNode] Warning: index={index} 超出范围 (共 {len(lines)} 行)，"
                   f"已回退输出最后一行")
             return (lines[-1],) if lines else ("",)
 
@@ -381,25 +382,25 @@ class FolderImageLoaderNode:
         # [None] 传给下游等价于「这根线没接」，与 image_list_nodes.py 的既有约定一致。
         # ==================== 1. 路径解析与验证 ====================
         if not folder_path or not folder_path.strip():
-            print("[FolderImageLoader] 警告: 未提供文件夹路径")
+            logging.warning("[FolderImageLoader] 警告: 未提供文件夹路径")
             return (None, 0, [None])
 
         actual_path = self._resolve_path(folder_path.strip())
 
         if not os.path.isdir(actual_path):
-            print(f"[FolderImageLoader] 警告: 文件夹不存在或不是有效目录: {actual_path}")
+            logging.warning(f"[FolderImageLoader] 警告: 文件夹不存在或不是有效目录: {actual_path}")
             return (None, 0, [None])
 
         # ==================== 2. 获取图片文件列表 ====================
         image_files = self._get_image_files(actual_path)
 
         if len(image_files) == 0:
-            print(f"[FolderImageLoader] 警告: 文件夹内无图片文件: {actual_path}")
+            logging.warning(f"[FolderImageLoader] 警告: 文件夹内无图片文件: {actual_path}")
             return (None, 0, [None])
 
         # ==================== 3. 跳过前 N 张 ====================
         if skip_first_n >= len(image_files):
-            print(f"[FolderImageLoader] 警告: skip_first_n={skip_first_n} 超出图片总数 {len(image_files)}")
+            logging.warning(f"[FolderImageLoader] 警告: skip_first_n={skip_first_n} 超出图片总数 {len(image_files)}")
             return (None, 0, [None])
 
         if skip_first_n > 0:
@@ -418,7 +419,7 @@ class FolderImageLoaderNode:
             first_file_path = os.path.join(actual_path, image_files[0])
             first_tensor = self._load_image_tensor(first_file_path)
         except Exception as e:
-            print(f"[FolderImageLoader] 警告: 无法读取第一张图片 {image_files[0]}: {e}")
+            logging.warning(f"[FolderImageLoader] 警告: 无法读取第一张图片 {image_files[0]}: {e}")
             return (None, 0, [None])
 
         target_h, target_w = first_tensor.shape[0], first_tensor.shape[1]
@@ -429,12 +430,15 @@ class FolderImageLoaderNode:
         #                      （尺寸一致的原图与批次行逐位相同，列表输出直接用批次行视图，省一份内存）
         batch_tensors = [first_tensor]
         mismatch_originals = {}
+        # 2026-10-15：逐文件告警改为「循环内收集 + 循环后汇总」，避免大文件夹刷屏
+        skipped_read = []
+        skipped_size = []
         for fname in image_files[1:]:
             file_path = os.path.join(actual_path, fname)
             try:
                 img_tensor = self._load_image_tensor(file_path)
             except Exception as e:
-                print(f"[FolderImageLoader] 警告: 无法读取图片 {fname}: {e}，已跳过")
+                skipped_read.append(f"{fname} ({e})")
                 continue
 
             h, w = img_tensor.shape[0], img_tensor.shape[1]
@@ -455,11 +459,20 @@ class FolderImageLoaderNode:
                 if same_size:
                     batch_tensors.append(img_tensor)
                 else:
-                    print(f"[FolderImageLoader] 提示: 跳过尺寸不匹配的图片 {fname} (尺寸: {w}x{h})")
+                    skipped_size.append(f"{fname} ({w}x{h})")
+
+        # 汇总（每类只打 1 行；最多列出前 3 个例子）
+        if skipped_read:
+            logging.warning("[FolderImageLoader] 无法读取 %d 张图片，已跳过（前 3 个：%s）",
+                            len(skipped_read), "；".join(skipped_read[:3]))
+        if skipped_size:
+            logging.info("[FolderImageLoader] 跳过 %d 张尺寸不匹配的图片"
+                         "（size_mode=filter_same_size；前 3 个：%s）",
+                         len(skipped_size), "；".join(skipped_size[:3]))
 
         # ==================== 7. 构建批次 ====================
         if len(batch_tensors) == 0:
-            print("[FolderImageLoader] 警告: 没有有效图片可加载")
+            logging.warning("[FolderImageLoader] 警告: 没有有效图片可加载")
             return (None, 0, [None])
 
         batch = torch.stack(batch_tensors, dim=0)
@@ -480,11 +493,11 @@ class FolderImageLoaderNode:
 
         if keep_original:
             if len(mismatch_originals) > 0:
-                print(f"[FolderImageLoader] 提示: size_mode=no_resize -> 列表输出 {len(images_list)} 张保持原尺寸"
+                logging.info(f"[FolderImageLoader] 提示: size_mode=no_resize -> 列表输出 {len(images_list)} 张保持原尺寸"
                       f"（其中 {len(mismatch_originals)} 张与第一张尺寸不同）；"
                       f"批次输出无法容纳不同尺寸，已回退为 resize_to_first（{target_w}x{target_h}）。")
             else:
-                print(f"[FolderImageLoader] 提示: size_mode=no_resize -> 列表输出 {len(images_list)} 张保持原尺寸"
+                logging.info(f"[FolderImageLoader] 提示: size_mode=no_resize -> 列表输出 {len(images_list)} 张保持原尺寸"
                       f"（本次图片尺寸一致，未发生重采样）；批次输出与列表内容一致（{target_w}x{target_h}）。")
 
         return (batch, batch.shape[0], images_list)
@@ -750,7 +763,7 @@ class BatchImageReplace:
 
     def _warn(self, msg):
         """统一打印带节点标识的警告信息"""
-        print(f"[BatchImageReplace] Warning: {msg}")
+        logging.warning(f"[BatchImageReplace] Warning: {msg}")
 
     def replace(self, images=None, start_index=0, replace_count=-1, overflow_mode="take_front",
                 underflow_mode="as_is", replace_images=None):

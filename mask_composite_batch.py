@@ -1,3 +1,4 @@
+import logging
 import torch
 import numpy as np
 from PIL import Image
@@ -89,7 +90,7 @@ class MaskCompositeRef:
 
     def _warn(self, msg):
         """统一打印带节点标识的警告信息"""
-        print(f"[MaskCompositeBatch] Warning: {msg}")
+        logging.warning(f"[MaskCompositeBatch] Warning: {msg}")
 
     def composite(self, images, replacement_mode, process_first_frame, process_last_frame,
                   remove_background=True, masks=None, backgrounds=None):
